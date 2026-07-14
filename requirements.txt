@@ -3,3 +3,5 @@ uvicorn
 pandas
 sqlalchemy
 pydantic
+psycopg[binary]
+alembic
