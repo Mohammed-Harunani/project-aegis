@@ -22,7 +22,15 @@ def save_manifest(
     db: Session,
     manifest: HealingManifest,
     ticket_id: Optional[str] = None,
+    commit: bool = True,
 ) -> HealingManifestRecord:
+    """
+    commit=True (default): standalone call, e.g. the AUTO_APPROVE path
+    in app.py, where this is the only DB write in the request.
+    commit=False: the caller (e.g. approve_ticket in app.py) is
+    bundling this into a larger transaction alongside the ticket's
+    APPROVED status change, and will commit or roll back both together.
+    """
     record = HealingManifestRecord(
         manifest_id=uuid.uuid4(),
         ticket_id=uuid.UUID(ticket_id) if ticket_id else None,
@@ -48,6 +56,9 @@ def save_manifest(
         risk_level=manifest.risk_level,
     )
     db.add(record)
-    db.commit()
-    db.refresh(record)
+    if commit:
+        db.commit()
+        db.refresh(record)
+    else:
+        db.flush()
     return record

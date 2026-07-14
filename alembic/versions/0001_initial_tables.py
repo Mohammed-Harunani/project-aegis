@@ -51,6 +51,7 @@ def upgrade() -> None:
         sa.Column("final_row_count", sa.Integer, nullable=False),
         sa.Column("integrity_status", sa.Text, nullable=False),
         sa.Column("risk_level", sa.Text, nullable=False),
+        sa.UniqueConstraint("ticket_id", name="uq_healing_manifests_ticket_id"),
     )
 
 

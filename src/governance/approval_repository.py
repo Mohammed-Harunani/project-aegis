@@ -48,10 +48,20 @@ def _schema_from_json(data: dict) -> ObservedSchema:
 
 
 def _dataset_to_json(df: pd.DataFrame) -> dict:
-    # Matches the shape of MigrationRequest.sample_data (column -> list
-    # of values), so round-tripping through pd.DataFrame(...) on read
-    # reconstructs the same DataFrame shape Surgeon originally saw.
-    return df.to_dict(orient="list")
+    """
+    Converts NaN/NaT/pd.NA to JSON null and numpy scalar types (int64,
+    float64, ...) to native Python types. Neither survives json.dumps,
+    which SQLAlchemy's JSONB type uses under the hood.
+
+    Verified directly: pd.DataFrame({"amount": [10.5, None]}).to_dict(
+    orient="list") produces float('nan'), and json.dumps on that emits
+    the literal token NaN -- which is not valid JSON and Postgres
+    JSONB rejects it. .astype(object).where(pd.notnull(df), None)
+    fixes both problems at once: it boxes numpy scalars as native
+    Python types AND replaces every null-like value with None.
+    """
+    clean = df.astype(object).where(pd.notnull(df), None)
+    return clean.to_dict(orient="list")
 
 
 def _dataset_from_json(data: dict) -> pd.DataFrame:
@@ -112,6 +122,7 @@ class PostgresApprovalRepository:
         return _record_to_ticket(record)
 
     def _get_record(self, ticket_id: str) -> ApprovalTicketRecord:
+        """Plain read, no lock -- used by get() and list_pending()."""
         try:
             ticket_uuid = uuid.UUID(ticket_id)
         except ValueError:
@@ -120,6 +131,30 @@ class PostgresApprovalRepository:
         record = (
             self.db.query(ApprovalTicketRecord)
             .filter(ApprovalTicketRecord.ticket_id == ticket_uuid)
+            .one_or_none()
+        )
+        if record is None:
+            raise TicketNotFoundError(ticket_id)
+        return record
+
+    def _get_record_for_update(self, ticket_id: str) -> ApprovalTicketRecord:
+        """
+        Row-locked read (SELECT ... FOR UPDATE), used by approve() and
+        reject(). Two concurrent decisions on the same ticket can no
+        longer both read PENDING and both proceed: the second request
+        blocks until the first transaction commits or rolls back, then
+        sees the updated status and raises TicketNotPendingError
+        instead of double-processing.
+        """
+        try:
+            ticket_uuid = uuid.UUID(ticket_id)
+        except ValueError:
+            raise TicketNotFoundError(ticket_id)
+
+        record = (
+            self.db.query(ApprovalTicketRecord)
+            .filter(ApprovalTicketRecord.ticket_id == ticket_uuid)
+            .with_for_update()
             .one_or_none()
         )
         if record is None:
@@ -138,19 +173,28 @@ class PostgresApprovalRepository:
         return [_record_to_ticket(r) for r in records]
 
     def approve(self, ticket_id: str, operator: str, note: str = "") -> ApprovalTicket:
-        record = self._get_record(ticket_id)
+        """
+        Marks the ticket APPROVED but does NOT commit. This is meant
+        to run inside the same transaction as Surgeon execution and
+        manifest persistence (see app.py's approve_ticket endpoint) --
+        if either of those fails, the caller rolls back and this
+        status change is discarded along with them, leaving the
+        ticket PENDING rather than stuck APPROVED with no manifest.
+        The row lock from _get_record_for_update() is held until that
+        transaction commits or rolls back.
+        """
+        record = self._get_record_for_update(ticket_id)
         if record.status != "PENDING":
             raise TicketNotPendingError(f"Ticket {ticket_id} is {record.status}, not PENDING.")
         record.status = "APPROVED"
         record.decided_by = operator
         record.decided_at = datetime.now(UTC)
         record.decision_note = note
-        self.db.commit()
-        self.db.refresh(record)
+        self.db.flush()
         return _record_to_ticket(record)
 
     def reject(self, ticket_id: str, operator: str, note: str = "") -> ApprovalTicket:
-        record = self._get_record(ticket_id)
+        record = self._get_record_for_update(ticket_id)
         if record.status != "PENDING":
             raise TicketNotPendingError(f"Ticket {ticket_id} is {record.status}, not PENDING.")
         record.status = "REJECTED"

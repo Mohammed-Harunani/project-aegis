@@ -11,7 +11,7 @@ models cannot be exercised against SQLite as a stand-in for testing.
 
 import uuid
 
-from sqlalchemy import Column, Text, Numeric, DateTime, Integer, ForeignKey
+from sqlalchemy import Column, Text, Numeric, DateTime, Integer, ForeignKey, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base
 
@@ -39,6 +39,14 @@ class ApprovalTicketRecord(Base):
 
 class HealingManifestRecord(Base):
     __tablename__ = "healing_manifests"
+    __table_args__ = (
+        # Postgres treats NULL != NULL, so this permits unlimited
+        # NULL ticket_id rows (auto-approved executions) while still
+        # blocking a second manifest for the same manually-approved
+        # ticket -- defense-in-depth alongside the row lock in
+        # approval_repository.py's approve().
+        UniqueConstraint("ticket_id", name="uq_healing_manifests_ticket_id"),
+    )
 
     manifest_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 

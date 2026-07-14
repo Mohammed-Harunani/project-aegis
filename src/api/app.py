@@ -204,20 +204,41 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
     try:
         ticket = approvals.approve(ticket_id, operator=request.operator, note=request.note)
     except TicketNotFoundError:
+        db.rollback()
         raise HTTPException(status_code=404, detail="Ticket not found.")
     except TicketNotPendingError as e:
+        db.rollback()
         raise HTTPException(status_code=409, detail=str(e))
 
+    # ticket.status is "APPROVED" here, but NOT YET COMMITTED --
+    # approve() only flushed. If execution or manifest persistence
+    # fails below, we roll back and the ticket goes back to PENDING
+    # in the database (this in-memory `ticket` object is a detached
+    # snapshot and won't reflect that rollback itself, which is why
+    # the error response below doesn't claim any status for it).
     surgeon = AegisSurgeon()
-    execution_result, manifest = surgeon.execute(
-        repair_plan=ticket.repair_plan,
-        observed_schema=ticket.observed_schema,
-        gold_schema=ticket.gold_schema,
-        target_dataset=ticket.target_dataset,
-        operator=request.operator,
-        execution_mode="sandbox",
-    )
-    save_manifest(db, manifest, ticket_id=ticket.ticket_id)
+    try:
+        execution_result, manifest = surgeon.execute(
+            repair_plan=ticket.repair_plan,
+            observed_schema=ticket.observed_schema,
+            gold_schema=ticket.gold_schema,
+            target_dataset=ticket.target_dataset,
+            operator=request.operator,
+            execution_mode="sandbox",
+        )
+        save_manifest(db, manifest, ticket_id=ticket.ticket_id, commit=False)
+    except Exception:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Execution or manifest persistence failed. The approval "
+                "was rolled back -- the ticket remains PENDING. "
+                f"GET /approvals/{ticket_id} to confirm current status."
+            ),
+        )
+
+    db.commit()
 
     return {
         "ticket_id": ticket.ticket_id,
