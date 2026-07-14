@@ -1,0 +1,7 @@
+{
+    "auto_apply_threshold": 0.92,
+    "approval_threshold": 0.80,
+    "execution_mode": "sandbox",
+    "allowed_execution_modes": ["sandbox", "commit"],
+    "log_level": "INFO"
+}

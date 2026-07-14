@@ -48,9 +48,9 @@ def test_surgeon_emits_healing_manifest():
     assert result.validation.success is True
 
     # HealingManifest assertions
-    assert manifest.repair_plan == "RENAME_COLUMN new_name -> old_name"
+    assert manifest.repair_plan.proposed_action == "RENAME_COLUMN new_name -> old_name"
     assert manifest.execution_mode == "sandbox"
     assert manifest.operator == "test_user"
-    assert manifest.inspector_version == "V1"
-    assert manifest.consultant_version == "V1"
-    assert manifest.surgeon_version == "V1"
+    assert manifest.component_versions["inspector"] == "1.0"
+    assert manifest.component_versions["consultant"] == "1.2"
+    assert manifest.component_versions["surgeon"] == "1.7"

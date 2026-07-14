@@ -1,22 +1,24 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Any
 
 
 @dataclass(frozen=True)
 class HealingManifest:
     """
-    HealingManifest (V1)
-    Immutable audit record for a repair execution attempt.
+    Immutable audit record of a healing execution.
     """
 
     timestamp: str
-    repair_plan: str
-    execution_result: str
-    validation_result: str
+    repair_plan: Any
+    execution_result: Any
+    execution_mode: str
+    operator: str
+    component_versions: Dict[str, str]
 
-    inspector_version: str
-    consultant_version: str
-    surgeon_version: str
+    # Phase 4 – Integrity
+    original_row_count: int
+    final_row_count: int
+    integrity_status: str
 
-    execution_mode: str  # sandbox | commit
-    operator: Optional[str]
+    # Phase 5 – Risk Layer
+    risk_level: str
