@@ -104,7 +104,36 @@ resolves inside that network.
 reads `DATABASE_URL` as a fallback, specifically because
 `setup_module`/`teardown_module` call `Base.metadata.create_all()` /
 `drop_all()` -- pointed at the real database, that would destroy
-production/dev data.
+production/dev data. It also sets `os.environ["DATABASE_URL"] =
+TEST_DATABASE_URL` itself, before importing `src.api.app` -- that
+import transitively imports `src.db.session`, which builds a
+module-level engine from `DATABASE_URL` and refuses to start without
+it, independently of `TEST_DATABASE_URL`. Only `TEST_DATABASE_URL`
+needs to be exported; the test file handles the rest.
+
+`alembic/env.py` prefers a URL already configured programmatically
+(`config.set_main_option("sqlalchemy.url", ...)`, used by
+`test_alembic_upgrade_and_downgrade`) over the `DATABASE_URL`
+environment variable, only falling back to the environment when
+nothing was set on the `Config` object. This keeps `docker compose
+run --rm api alembic upgrade head` (env-var driven) and the
+programmatic test (config-object driven) both correct without either
+depending on the other.
+
+## Financial datatypes
+
+`Decimal`, `Timestamp`, `datetime`, and `date` are not JSON-
+serializable on their own -- confirmed directly, all four raise
+`TypeError` from `json.dumps`. `_dataset_to_json`/`_dataset_from_json`
+in `approval_repository.py` tag each with `{"__type__": ..., "value":
+...}` so they come back as the exact original Python type, not a
+lossy string and never a `Decimal` silently turned into a `float`
+(floating-point imprecision on money values would be exactly the kind
+of silent corruption this project exists to prevent). These types
+can't arrive via a real HTTP request today (JSON itself has no such
+types), but are what a future SQL-sourced dataset would contain --
+covered by a repository-level test, not an HTTP one, since HTTP can't
+construct them in the first place.
 
 ## Restart-persistence verification
 

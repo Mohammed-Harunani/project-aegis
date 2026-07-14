@@ -32,13 +32,21 @@ config = context.config
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-database_url = os.environ.get("DATABASE_URL")
+configured_url = config.get_main_option("sqlalchemy.url")
+database_url = configured_url or os.environ.get("DATABASE_URL")
+
 if not database_url:
     raise RuntimeError(
-        "DATABASE_URL is not set. Alembic will not guess at database "
-        "credentials -- export it or source your .env first."
+        "DATABASE_URL is not set and no sqlalchemy.url was configured "
+        "programmatically. Alembic will not guess at database "
+        "credentials -- export DATABASE_URL or source your .env first."
     )
-config.set_main_option("sqlalchemy.url", database_url)
+
+# Only overwrite when we fell back to the environment variable --
+# don't clobber a URL a caller (e.g. a test) already set explicitly
+# via config.set_main_option() before invoking alembic.command.
+if not configured_url:
+    config.set_main_option("sqlalchemy.url", database_url)
 
 target_metadata = Base.metadata
 

@@ -12,6 +12,11 @@ against the real application database would be destructive.
     export TEST_DATABASE_URL=postgresql+psycopg://aegis_user:change_me@localhost:5432/aegis_test
     python -m pytest tests/test_api.py -v
 
+Only TEST_DATABASE_URL needs to be set -- this file sets DATABASE_URL
+to the same value itself before importing anything that needs it (see
+below), specifically so it can never end up pointing at a different,
+real database.
+
 Written and syntax-checked but NOT executed: no Docker, Postgres,
 sqlalchemy, or network access in the environment these were written
 in. Treat every assertion here as a draft until you've run it.
@@ -33,6 +38,15 @@ if not TEST_DATABASE_URL:
         allow_module_level=True,
     )
 
+# src.db.session builds a module-level engine from DATABASE_URL the
+# moment it's imported (which src.api.app does transitively) -- and
+# refuses to start at all if DATABASE_URL isn't set, independently of
+# TEST_DATABASE_URL. Setting it here, to the SAME safe value, means
+# that engine (unused during tests -- see override_get_db below) can
+# never end up pointing anywhere but the test database, even if
+# DATABASE_URL happens to be set to something else in this shell.
+os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+
 # Everything below is only imported once TEST_DATABASE_URL is confirmed
 # set. Importing src.api.app (and therefore src.db.session) BEFORE that
 # check would raise RuntimeError immediately -- session.py refuses to
@@ -50,6 +64,7 @@ import threading
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy import inspect as sa_inspect
@@ -61,6 +76,7 @@ from src.db.models import Base, ApprovalTicketRecord, HealingManifestRecord
 from src.consultant.consultant import RepairPlan
 from src.governance.approval import TicketNotPendingError
 from src.governance.approval_repository import PostgresApprovalRepository
+from src.inspector import AegisInspector
 
 
 engine = create_engine(TEST_DATABASE_URL)
@@ -305,6 +321,49 @@ def test_quarantine_when_only_low_confidence_plans_exist():
 
     assert response.status_code == 200
     assert body["message"] == "No repair plan survived governance review; all candidates quarantined."
+
+
+def test_dataset_with_financial_datatypes_persists_and_restores_exactly():
+    """
+    Decimal/Timestamp/date can't arrive via a real HTTP request --
+    JSON has no such types -- but they're exactly what a future
+    SQL-sourced dataset (e.g. a /validate-from-db endpoint) would
+    contain. Tests the repository directly, since that's the only way
+    to construct a DataFrame containing these types in the first
+    place. Confirms the values come back as the exact original Python
+    types, not lossy strings or (worse, for a "Financial Data
+    Integrity Guardian") a Decimal silently turned into a float.
+    """
+    import decimal
+    import datetime as dt
+
+    df = pd.DataFrame({
+        "txn_date": pd.to_datetime(["2026-01-01", None]),
+        "amount": [decimal.Decimal("1050.75"), None],
+        "due_date": [dt.date(2026, 2, 1), dt.date(2026, 2, 2)],
+    })
+    schema = AegisInspector().generate_observed_schema(df)
+
+    with TestSessionLocal() as db:
+        ticket = PostgresApprovalRepository(db).submit(
+            repair_plan=RepairPlan(
+                proposed_action="RENAME_COLUMN x -> y",
+                confidence=0.85,
+                explanation="test fixture",
+            ),
+            observed_schema=schema,
+            gold_schema=schema,
+            target_dataset=df,
+        )
+
+    with TestSessionLocal() as db:
+        fetched = PostgresApprovalRepository(db).get(ticket.ticket_id)
+
+    restored = fetched.target_dataset
+    assert restored["amount"][0] == decimal.Decimal("1050.75")
+    assert restored["amount"][1] is None
+    assert restored["txn_date"][0] == pd.Timestamp("2026-01-01")
+    assert restored["due_date"][0] == dt.date(2026, 2, 1)
 
 
 def test_alembic_upgrade_and_downgrade():

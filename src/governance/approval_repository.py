@@ -12,6 +12,8 @@ underneath changes in this phase.
 """
 
 import uuid
+import decimal
+import datetime as datetime_module
 from datetime import datetime, UTC
 from typing import List
 
@@ -47,25 +49,62 @@ def _schema_from_json(data: dict) -> ObservedSchema:
     return ObservedSchema(columns=columns, column_order=data["column_order"])
 
 
+def _sanitize_value(value):
+    """
+    Tags non-JSON-native types so they survive the round trip through
+    JSONB and back out as the exact original Python type, rather than
+    a lossy string or, worse, a Decimal silently turned into a float
+    (float imprecision is exactly the kind of silent corruption a
+    'Financial Data Integrity Guardian' shouldn't introduce itself).
+    None already covers NaN/NaT/pd.NA by the time this runs -- see
+    _dataset_to_json.
+    """
+    if value is None:
+        return None
+    if isinstance(value, decimal.Decimal):
+        return {"__type__": "decimal", "value": str(value)}
+    # Order matters: pd.Timestamp and datetime.datetime are both
+    # subclasses of datetime.date, so the more specific checks must
+    # come first or they'd never be reached.
+    if isinstance(value, pd.Timestamp):
+        return {"__type__": "timestamp", "value": value.isoformat()}
+    if isinstance(value, datetime_module.datetime):
+        return {"__type__": "timestamp", "value": value.isoformat()}
+    if isinstance(value, datetime_module.date):
+        return {"__type__": "date", "value": value.isoformat()}
+    return value
+
+
+def _restore_value(value):
+    if isinstance(value, dict) and "__type__" in value:
+        kind, raw = value["__type__"], value["value"]
+        if kind == "decimal":
+            return decimal.Decimal(raw)
+        if kind == "timestamp":
+            return pd.Timestamp(raw)
+        if kind == "date":
+            return datetime_module.date.fromisoformat(raw)
+    return value
+
+
 def _dataset_to_json(df: pd.DataFrame) -> dict:
     """
-    Converts NaN/NaT/pd.NA to JSON null and numpy scalar types (int64,
-    float64, ...) to native Python types. Neither survives json.dumps,
-    which SQLAlchemy's JSONB type uses under the hood.
-
-    Verified directly: pd.DataFrame({"amount": [10.5, None]}).to_dict(
-    orient="list") produces float('nan'), and json.dumps on that emits
-    the literal token NaN -- which is not valid JSON and Postgres
-    JSONB rejects it. .astype(object).where(pd.notnull(df), None)
-    fixes both problems at once: it boxes numpy scalars as native
-    Python types AND replaces every null-like value with None.
+    Converts NaN/NaT/pd.NA to JSON null, boxes numpy scalar types
+    (int64, float64, ...) as native Python types, and tags Decimal /
+    Timestamp / datetime / date so _dataset_from_json can reconstruct
+    them exactly. Verified directly (see conversation history): the
+    unsanitized version fails on nulls (NaN is not valid JSON) AND
+    separately on any of these four types (none of them are JSON-
+    serializable at all, with or without nulls present).
     """
     clean = df.astype(object).where(pd.notnull(df), None)
-    return clean.to_dict(orient="list")
+    data = clean.to_dict(orient="list")
+    return {col: [_sanitize_value(v) for v in values] for col, values in data.items()}
 
 
 def _dataset_from_json(data: dict) -> pd.DataFrame:
-    return pd.DataFrame(data)
+    restored = {col: [_restore_value(v) for v in values] for col, values in data.items()}
+    return pd.DataFrame(restored)
 
 
 def _record_to_ticket(record: ApprovalTicketRecord) -> ApprovalTicket:
