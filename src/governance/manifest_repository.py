@@ -22,6 +22,7 @@ def save_manifest(
     db: Session,
     manifest: HealingManifest,
     ticket_id: Optional[str] = None,
+    schema_version_id: Optional[str] = None,
     commit: bool = True,
 ) -> HealingManifestRecord:
     """
@@ -54,6 +55,7 @@ def save_manifest(
         final_row_count=manifest.final_row_count,
         integrity_status=manifest.integrity_status,
         risk_level=manifest.risk_level,
+        schema_version_id=uuid.UUID(schema_version_id) if schema_version_id else None,
     )
     db.add(record)
     if commit:

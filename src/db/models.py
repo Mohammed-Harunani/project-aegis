@@ -1,10 +1,11 @@
 """
 Aegis_DB_Models
 Phase 2.3 -- SQLAlchemy ORM models for durable approval and manifest
-storage.
+storage. Phase 2.4 adds the schema registry (gold_schemas,
+schema_versions) and nullable lineage FKs on the two existing tables.
 
-Postgres-specific types (UUID, JSONB) are used deliberately -- Phase
-2.3 targets PostgreSQL only, not a portable/SQLite-compatible schema.
+Postgres-specific types (UUID, JSONB) are used deliberately -- this
+targets PostgreSQL only, not a portable/SQLite-compatible schema.
 That was an explicit decision, not an oversight: it also means these
 models cannot be exercised against SQLite as a stand-in for testing.
 """
@@ -36,6 +37,15 @@ class ApprovalTicketRecord(Base):
     gold_schema = Column(JSONB, nullable=False)
     target_dataset = Column(JSONB, nullable=False)
 
+    # Phase 2.4 -- nullable so existing rows and legacy direct-schema
+    # requests (which never reference the registry) are unaffected.
+    # The gold_schema JSONB snapshot above is kept regardless: this FK
+    # establishes lineage, the snapshot preserves the exact execution
+    # input for deterministic replay independent of the registry.
+    schema_version_id = Column(
+        UUID(as_uuid=True), ForeignKey("schema_versions.schema_version_id"), nullable=True
+    )
+
 
 class HealingManifestRecord(Base):
     __tablename__ = "healing_manifests"
@@ -64,3 +74,37 @@ class HealingManifestRecord(Base):
     final_row_count = Column(Integer, nullable=False)
     integrity_status = Column(Text, nullable=False)
     risk_level = Column(Text, nullable=False)
+
+    # Phase 2.4 -- nullable independently of ticket_id: an
+    # auto-approved execution has no ticket AT ALL, but may still have
+    # been validated against a registry schema version.
+    schema_version_id = Column(
+        UUID(as_uuid=True), ForeignKey("schema_versions.schema_version_id"), nullable=True
+    )
+
+
+class GoldSchemaRecord(Base):
+    __tablename__ = "gold_schemas"
+
+    schema_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name = Column(Text, unique=True, nullable=False)
+    description = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    created_by = Column(Text, nullable=True)
+
+
+class SchemaVersionRecord(Base):
+    __tablename__ = "schema_versions"
+    __table_args__ = (
+        UniqueConstraint("schema_id", "version_number", name="uq_schema_versions_schema_version_number"),
+        UniqueConstraint("schema_id", "fingerprint", name="uq_schema_versions_schema_fingerprint"),
+    )
+
+    schema_version_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    schema_id = Column(UUID(as_uuid=True), ForeignKey("gold_schemas.schema_id"), nullable=False)
+    version_number = Column(Integer, nullable=False)
+    schema_definition = Column(JSONB, nullable=False)
+    fingerprint = Column(Text, nullable=False)
+    change_summary = Column(Text, nullable=True)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+    created_by = Column(Text, nullable=True)

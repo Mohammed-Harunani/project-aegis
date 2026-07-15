@@ -10,3 +10,50 @@ sys.path.insert(0, str(SRC_DIR))
 # a single test runs. Existing tests are unaffected: they only ever import
 # unqualified (`from inspector import ...`), which still resolves via SRC_DIR.
 sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def get_verified_test_database_url():
+    """
+    Shared guard for any test module that needs a live Postgres test
+    database. Used by tests/test_schema_registry_api.py; test_api.py
+    predates this helper and keeps its own already-verified copy of
+    the same logic rather than being refactored to depend on it.
+
+    - Requires TEST_DATABASE_URL; skips the whole calling module
+      (not just one test) if it isn't set, rather than falling back
+      to DATABASE_URL -- that would point at the real application
+      database, which callers' setup/teardown create/drop tables in.
+    - Requires the target database to be named exactly 'aegis_test',
+      parsed via SQLAlchemy's make_url() -- closes the gap where the
+      variable is set, just to the wrong value.
+    - Sets os.environ["DATABASE_URL"] to the same safe value, since
+      src.db.session builds a module-level engine from DATABASE_URL
+      the moment anything imports src.api.app, independently of
+      TEST_DATABASE_URL, and refuses to start without it.
+
+    Call this before importing src.api.app or anything that imports it.
+    """
+    import os
+    import pytest
+
+    test_url = os.environ.get("TEST_DATABASE_URL")
+    if not test_url:
+        pytest.skip(
+            "TEST_DATABASE_URL is not set. These are Postgres integration "
+            "tests against a dedicated test database and must never fall "
+            "back to DATABASE_URL. See Docs/phase2_3_persistence_spec.md.",
+            allow_module_level=True,
+        )
+
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(test_url)
+    if parsed.database != "aegis_test":
+        raise RuntimeError(
+            f"TEST_DATABASE_URL must point at the dedicated 'aegis_test' "
+            f"database, not {parsed.database!r}. Refusing to run tests "
+            f"that create/drop tables against anything else."
+        )
+
+    os.environ["DATABASE_URL"] = test_url
+    return test_url

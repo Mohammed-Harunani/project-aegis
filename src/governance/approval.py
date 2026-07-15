@@ -54,6 +54,11 @@ class ApprovalTicket:
     decided_at: Optional[str] = None
     decision_note: Optional[str] = None
 
+    # Phase 2.4 -- which immutable registry schema version this ticket
+    # was validated against, if any. None for legacy direct-gold_schema
+    # requests, which never reference the registry at all.
+    schema_version_id: Optional[str] = None
+
 
 class ApprovalQueue:
     """

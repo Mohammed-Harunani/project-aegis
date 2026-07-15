@@ -207,6 +207,7 @@ def _record_to_ticket(record: ApprovalTicketRecord) -> ApprovalTicket:
         decided_by=record.decided_by,
         decided_at=record.decided_at.isoformat() if record.decided_at else None,
         decision_note=record.decision_note,
+        schema_version_id=str(record.schema_version_id) if record.schema_version_id else None,
     )
 
 
@@ -226,6 +227,7 @@ class PostgresApprovalRepository:
         observed_schema: ObservedSchema,
         gold_schema: ObservedSchema,
         target_dataset: pd.DataFrame,
+        schema_version_id: str = None,
     ) -> ApprovalTicket:
         record = ApprovalTicketRecord(
             ticket_id=uuid.uuid4(),
@@ -237,6 +239,7 @@ class PostgresApprovalRepository:
             observed_schema=_schema_to_json(observed_schema),
             gold_schema=_schema_to_json(gold_schema),
             target_dataset=_dataset_to_json(target_dataset),
+            schema_version_id=uuid.UUID(schema_version_id) if schema_version_id else None,
         )
         self.db.add(record)
         self.db.commit()
