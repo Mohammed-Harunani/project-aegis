@@ -279,10 +279,16 @@ def test_concurrent_approval_executes_only_once():
 
 
 def test_dataset_with_null_values_persists_successfully():
+    # gold_schema MUST be float64 here, not int64: a None in sample_data
+    # forces pandas to upcast Customer_ID to float64 (standard behavior --
+    # int64 can't represent a null). If gold_schema declared int64, the
+    # dtypes would never match and Consultant proposes zero repair
+    # plans -- confirmed directly against the real Consultant logic --
+    # meaning this test would never reach a ticket at all.
     response = client.post(
         "/simulate-migration",
         json={
-            "gold_schema": {"customer_id": "int64"},
+            "gold_schema": {"customer_id": "float64"},
             "sample_data": {"Customer_ID": [1, None, 3]},
         },
     )
@@ -446,6 +452,13 @@ def test_alembic_upgrade_and_downgrade():
     Runs last on purpose -- drops and recreates the schema via Alembic
     itself rather than Base.metadata, then restores it afterward so
     any test running after this one still finds tables in place.
+
+    Explicitly checks migration 0002 (gold_schemas, schema_versions,
+    and the schema_version_id lineage columns), not just 0001's two
+    tables -- upgrading to "head" runs both, and the registry
+    integration tests create their schema via Base.metadata directly,
+    bypassing Alembic entirely, so nothing else in this suite would
+    have caught 0002 being broken.
     """
     from alembic.config import Config
     from alembic import command
@@ -458,13 +471,23 @@ def test_alembic_upgrade_and_downgrade():
     Base.metadata.drop_all(bind=engine)
 
     command.upgrade(cfg, "head")
-    tables = sa_inspect(engine).get_table_names()
+    inspector = sa_inspect(engine)
+    tables = inspector.get_table_names()
     assert "approval_tickets" in tables
     assert "healing_manifests" in tables
+    assert "gold_schemas" in tables
+    assert "schema_versions" in tables
+
+    ticket_columns = {c["name"] for c in inspector.get_columns("approval_tickets")}
+    manifest_columns = {c["name"] for c in inspector.get_columns("healing_manifests")}
+    assert "schema_version_id" in ticket_columns
+    assert "schema_version_id" in manifest_columns
 
     command.downgrade(cfg, "base")
     tables_after = sa_inspect(engine).get_table_names()
     assert "approval_tickets" not in tables_after
     assert "healing_manifests" not in tables_after
+    assert "gold_schemas" not in tables_after
+    assert "schema_versions" not in tables_after
 
     Base.metadata.create_all(bind=engine)

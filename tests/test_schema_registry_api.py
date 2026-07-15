@@ -150,6 +150,7 @@ def test_column_order_survives_real_postgres_jsonb_storage():
     """
     non_alphabetical = {
         "format_version": 1,
+        "created_by": "mo",
         "columns": [
             {"name": "zebra_col", "dtype": "int64"},
             {"name": "apple_col", "dtype": "object"},
@@ -184,6 +185,30 @@ def test_unknown_version_returns_404():
     assert client.get("/schemas/customer_master/versions/99").status_code == 404
 
 
+def test_missing_created_by_returns_422():
+    bad = dict(CUSTOMER_MASTER_V1)
+    bad.pop("created_by")
+    assert client.post("/schemas/customer_master/versions", json=bad).status_code == 422
+
+
+def test_schema_family_metadata_is_retrievable():
+    """
+    description/schema_created_by were previously write-only: accepted
+    and persisted at registration, but no retrieval endpoint returned
+    them. Now checked on all three read endpoints.
+    """
+    client.post("/schemas/customer_master/versions", json=CUSTOMER_MASTER_V1)
+
+    exact = client.get("/schemas/customer_master/versions/1").json()
+    latest = client.get("/schemas/customer_master/latest").json()
+    history = client.get("/schemas/customer_master/versions").json()
+
+    for body in (exact, latest, history):
+        assert body["description"] == CUSTOMER_MASTER_V1["description"]
+        assert body["schema_created_by"] == CUSTOMER_MASTER_V1["created_by"]
+        assert body["schema_created_at"] is not None
+
+
 def test_concurrent_version_creation_produces_unique_sequential_versions():
     """
     Two threads, two independent Sessions, both registering a
@@ -203,6 +228,7 @@ def test_concurrent_version_creation_produces_unique_sequential_versions():
                 schema_name="concurrent_test_schema",
                 format_version=1,
                 columns=[{"name": col_name, "dtype": "int64"}],
+                created_by="mo",
             )
             with lock:
                 outcomes.append(version.version_number)
@@ -237,22 +263,83 @@ def test_neither_gold_schema_nor_schema_name_returns_422():
     assert response.status_code == 422
 
 
-def test_registered_schema_simulation_uses_correct_version():
-    client.post("/schemas/customer_master/versions", json=CUSTOMER_MASTER_V1)
-    client.post("/schemas/customer_master/versions", json=CUSTOMER_MASTER_V2)
+def test_schema_version_without_schema_name_returns_422():
+    """
+    Previously silently ignored: schema_version was accepted alongside
+    gold_schema (which has no use for it) and the value just vanished
+    without any error -- confirmed directly against the real
+    validator before this fix.
+    """
+    response = client.post(
+        "/simulate-migration",
+        json={
+            "gold_schema": {"customer_id": "int64"},
+            "schema_version": 2,
+            "sample_data": {"customer_id": [1]},
+        },
+    )
+    assert response.status_code == 422
 
+
+def test_non_positive_schema_version_returns_422():
     response = client.post(
         "/simulate-migration",
         json={
             "schema_name": "customer_master",
-            "schema_version": 1,
-            "sample_data": {"Customer_ID": [1, 2], "customer_name": ["A", "B"]},
+            "schema_version": 0,
+            "sample_data": {"customer_id": [1]},
         },
     )
-    v1 = client.get("/schemas/customer_master/versions/1").json()
+    assert response.status_code == 422
 
-    assert response.status_code == 200
-    assert response.json()["schema_version_id"] == v1["schema_version_id"]
+
+def test_registered_schema_simulation_uses_correct_version_definition():
+    """
+    Registers two MEANINGFULLY different definitions for the same
+    column (int64 vs float64) against data that's naturally int64, so
+    pinning to v1 vs v2 vs omitting the version produces different,
+    directly observable repair behavior -- not just a different ID
+    echoed back in the response. Verified directly against the real
+    Inspector/Consultant logic before writing this: v1 (matching
+    dtype) proposes zero repairs, v2 (mismatched dtype) proposes a
+    real CAST_COLUMN repair.
+    """
+    v1 = {
+        "format_version": 1,
+        "created_by": "mo",
+        "columns": [{"name": "customer_id", "dtype": "int64"}],
+    }
+    v2 = {
+        "format_version": 1,
+        "created_by": "mo",
+        "columns": [{"name": "customer_id", "dtype": "float64"}],
+    }
+    client.post("/schemas/version_resolution_test/versions", json=v1)
+    client.post("/schemas/version_resolution_test/versions", json=v2)
+
+    same_data = {"customer_id": [1, 2, 3]}  # naturally int64, no nulls
+
+    v1_response = client.post(
+        "/simulate-migration",
+        json={"schema_name": "version_resolution_test", "schema_version": 1, "sample_data": same_data},
+    ).json()
+    v2_response = client.post(
+        "/simulate-migration",
+        json={"schema_name": "version_resolution_test", "schema_version": 2, "sample_data": same_data},
+    ).json()
+    latest_response = client.post(
+        "/simulate-migration",
+        json={"schema_name": "version_resolution_test", "sample_data": same_data},
+    ).json()
+
+    # v1: declared dtype matches observed -> no repair needed at all
+    assert v1_response["message"] == "No repair plans proposed."
+    # v2: declared dtype (float64) mismatches observed (int64) -> a real repair IS proposed
+    assert v2_response.get("message") != "No repair plans proposed."
+    assert "customer_id" in v2_response.get("proposed_repair", "")
+    # omitted version resolves latest (v2) -> must behave identically to the explicit v2 call
+    assert latest_response.get("proposed_repair") == v2_response.get("proposed_repair")
+    assert latest_response.get("schema_version_id") == v2_response.get("schema_version_id")
 
 
 def test_omitted_version_resolves_latest():

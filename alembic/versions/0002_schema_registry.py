@@ -22,7 +22,7 @@ def upgrade() -> None:
         sa.Column("name", sa.Text, nullable=False, unique=True),
         sa.Column("description", sa.Text, nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("created_by", sa.Text, nullable=True),
+        sa.Column("created_by", sa.Text, nullable=False),
     )
 
     op.create_table(
@@ -39,7 +39,7 @@ def upgrade() -> None:
         sa.Column("fingerprint", sa.Text, nullable=False),
         sa.Column("change_summary", sa.Text, nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
-        sa.Column("created_by", sa.Text, nullable=True),
+        sa.Column("created_by", sa.Text, nullable=False),
         sa.UniqueConstraint(
             "schema_id", "version_number", name="uq_schema_versions_schema_version_number"
         ),

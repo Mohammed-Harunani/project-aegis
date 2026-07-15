@@ -124,6 +124,38 @@ Legacy direct-`gold_schema` requests always have `schema_version_id =
 null` -- this is expected, not a bug, and is covered by a dedicated
 test.
 
+## Correction pass
+
+A review caught four real gaps in the first version of this phase,
+all fixed:
+
+- `created_by` is now **required, non-empty** on both `gold_schemas`
+  and `schema_versions` (`NOT NULL` in the migration, enforced at the
+  request level too) -- an immutable governance registry shouldn't
+  allow unattributed versions.
+- `schema_version` in `MigrationRequest` now requires `schema_name` to
+  also be present (422 otherwise -- previously silently ignored when
+  only `gold_schema` was given) and must be a positive integer.
+- `description`, `schema_created_at`, and `schema_created_by` (the
+  schema-*family* metadata, as opposed to per-version metadata) are
+  now returned by all three read endpoints (`versions/{n}`, `latest`,
+  `versions`) -- previously accepted and persisted at registration but
+  unreachable through any retrieval endpoint.
+- The Alembic round-trip test now explicitly asserts `gold_schemas`,
+  `schema_versions`, and the `schema_version_id` columns on both
+  existing tables exist after `upgrade` and are gone after
+  `downgrade` -- previously only `0001`'s two original tables were
+  checked, so `0002` could have silently failed to apply correctly
+  without any test catching it (the registry integration tests create
+  their schema via `Base.metadata` directly, bypassing Alembic
+  entirely).
+
+Also strengthened: the "correct version resolves" test now registers
+two *meaningfully different* definitions (matching vs. mismatched
+dtype for the same column) so pinning to v1 vs. v2 vs. omitting the
+version produces different, directly observable repair behavior --
+not just a different ID echoed back in the response.
+
 ## What's verified vs. not
 
 Fingerprint computation, schema-definition validation, and dtype

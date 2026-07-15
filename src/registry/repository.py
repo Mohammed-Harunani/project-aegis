@@ -36,7 +36,7 @@ class SchemaRegistryRepository:
         self.db = db
 
     def _get_or_create_schema_locked(
-        self, schema_name: str, description: Optional[str], created_by: Optional[str]
+        self, schema_name: str, description: Optional[str], created_by: str
     ) -> GoldSchemaRecord:
         """
         Returns the gold_schemas row for schema_name, row-locked for
@@ -86,9 +86,9 @@ class SchemaRegistryRepository:
         schema_name: str,
         format_version: int,
         columns: List[dict],
+        created_by: str,
         description: Optional[str] = None,
         change_summary: Optional[str] = None,
-        created_by: Optional[str] = None,
     ) -> SchemaVersionRecord:
         validate_schema_name(schema_name)
         validate_schema_definition(format_version, columns)
@@ -133,7 +133,7 @@ class SchemaRegistryRepository:
         self.db.refresh(version)
         return version
 
-    def _get_schema(self, schema_name: str) -> GoldSchemaRecord:
+    def get_schema_family(self, schema_name: str) -> GoldSchemaRecord:
         record = (
             self.db.query(GoldSchemaRecord)
             .filter(GoldSchemaRecord.name == schema_name)
@@ -144,7 +144,7 @@ class SchemaRegistryRepository:
         return record
 
     def get_version(self, schema_name: str, version_number: int) -> SchemaVersionRecord:
-        schema = self._get_schema(schema_name)
+        schema = self.get_schema_family(schema_name)
         version = (
             self.db.query(SchemaVersionRecord)
             .filter(
@@ -158,7 +158,7 @@ class SchemaRegistryRepository:
         return version
 
     def get_latest(self, schema_name: str) -> SchemaVersionRecord:
-        schema = self._get_schema(schema_name)
+        schema = self.get_schema_family(schema_name)
         version = (
             self.db.query(SchemaVersionRecord)
             .filter(SchemaVersionRecord.schema_id == schema.schema_id)
@@ -170,7 +170,7 @@ class SchemaRegistryRepository:
         return version
 
     def list_history(self, schema_name: str) -> List[SchemaVersionRecord]:
-        schema = self._get_schema(schema_name)
+        schema = self.get_schema_family(schema_name)
         return (
             self.db.query(SchemaVersionRecord)
             .filter(SchemaVersionRecord.schema_id == schema.schema_id)

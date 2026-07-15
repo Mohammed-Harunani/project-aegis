@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from typing import Dict, List, Optional
 from sqlalchemy.orm import Session
 import pandas as pd
@@ -53,7 +53,7 @@ class MigrationRequest(BaseModel):
     # registry-backed path. New usage should prefer the latter.
     gold_schema: Optional[Dict[str, str]] = None
     schema_name: Optional[str] = None
-    schema_version: Optional[int] = None
+    schema_version: Optional[int] = Field(default=None, gt=0)
     sample_data: Dict[str, list]
 
     @model_validator(mode="after")
@@ -64,6 +64,8 @@ class MigrationRequest(BaseModel):
             raise ValueError("Provide either gold_schema or schema_name, never both.")
         if not has_gold_schema and not has_schema_name:
             raise ValueError("Provide either gold_schema or schema_name.")
+        if self.schema_version is not None and not has_schema_name:
+            raise ValueError("schema_version requires schema_name -- it has no meaning without it.")
         return self
 
 
@@ -75,9 +77,9 @@ class ApprovalDecisionRequest(BaseModel):
 class RegisterSchemaVersionRequest(BaseModel):
     format_version: int = 1
     columns: List[SchemaColumnDef]
+    created_by: str = Field(min_length=1)
     description: Optional[str] = None
     change_summary: Optional[str] = None
-    created_by: Optional[str] = None
 
 
 def _build_gold_schema(gold_schema: Dict[str, str]) -> ObservedSchema:
@@ -386,6 +388,7 @@ def get_schema_version(schema_name: str, version_number: int, db: Session = Depe
     registry = SchemaRegistryRepository(db)
     try:
         version = registry.get_version(schema_name, version_number)
+        family = registry.get_schema_family(schema_name)
     except SchemaNotFoundError:
         raise HTTPException(status_code=404, detail=f"Schema {schema_name!r} not found.")
     except SchemaVersionNotFoundError as e:
@@ -393,6 +396,9 @@ def get_schema_version(schema_name: str, version_number: int, db: Session = Depe
 
     return {
         "schema_name": schema_name,
+        "description": family.description,
+        "schema_created_at": family.created_at.isoformat(),
+        "schema_created_by": family.created_by,
         "version_number": version.version_number,
         "schema_version_id": str(version.schema_version_id),
         "schema_definition": version.schema_definition,
@@ -408,11 +414,15 @@ def list_schema_versions(schema_name: str, db: Session = Depends(get_db)):
     registry = SchemaRegistryRepository(db)
     try:
         versions = registry.list_history(schema_name)
+        family = registry.get_schema_family(schema_name)
     except SchemaNotFoundError:
         raise HTTPException(status_code=404, detail=f"Schema {schema_name!r} not found.")
 
     return {
         "schema_name": schema_name,
+        "description": family.description,
+        "schema_created_at": family.created_at.isoformat(),
+        "schema_created_by": family.created_by,
         "versions": [
             {
                 "version_number": v.version_number,
@@ -432,6 +442,7 @@ def get_latest_schema_version(schema_name: str, db: Session = Depends(get_db)):
     registry = SchemaRegistryRepository(db)
     try:
         version = registry.get_latest(schema_name)
+        family = registry.get_schema_family(schema_name)
     except SchemaNotFoundError:
         raise HTTPException(status_code=404, detail=f"Schema {schema_name!r} not found.")
     except SchemaVersionNotFoundError as e:
@@ -439,6 +450,9 @@ def get_latest_schema_version(schema_name: str, db: Session = Depends(get_db)):
 
     return {
         "schema_name": schema_name,
+        "description": family.description,
+        "schema_created_at": family.created_at.isoformat(),
+        "schema_created_by": family.created_by,
         "version_number": version.version_number,
         "schema_version_id": str(version.schema_version_id),
         "schema_definition": version.schema_definition,

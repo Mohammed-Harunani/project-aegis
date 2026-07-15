@@ -90,7 +90,7 @@ class GoldSchemaRecord(Base):
     name = Column(Text, unique=True, nullable=False)
     description = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
-    created_by = Column(Text, nullable=True)
+    created_by = Column(Text, nullable=False)
 
 
 class SchemaVersionRecord(Base):
@@ -107,4 +107,4 @@ class SchemaVersionRecord(Base):
     fingerprint = Column(Text, nullable=False)
     change_summary = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
-    created_by = Column(Text, nullable=True)
+    created_by = Column(Text, nullable=False)
