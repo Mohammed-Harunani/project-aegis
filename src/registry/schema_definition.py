@@ -32,6 +32,22 @@ class SchemaColumn:
     dtype: str
 
 
+def validate_and_normalize_created_by(created_by: str) -> str:
+    """
+    Strips surrounding whitespace and rejects an empty or
+    whitespace-only result. Pydantic's Field(min_length=1) alone does
+    NOT catch "   " -- min_length is a plain character-count check
+    that runs before any stripping, confirmed directly: a 1-character
+    string of just a space satisfies min_length=1. For an immutable
+    governance registry, an unattributed (or whitespace-attributed)
+    version defeats the point of requiring created_by at all.
+    """
+    stripped = (created_by or "").strip()
+    if not stripped:
+        raise InvalidSchemaDefinitionError("created_by must not be empty or whitespace-only.")
+    return stripped
+
+
 def validate_schema_name(name: str) -> None:
     if not SCHEMA_NAME_PATTERN.match(name or ""):
         raise InvalidSchemaDefinitionError(

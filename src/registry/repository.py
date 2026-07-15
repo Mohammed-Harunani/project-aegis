@@ -15,6 +15,7 @@ from src.db.models import GoldSchemaRecord, SchemaVersionRecord
 from src.registry.schema_definition import (
     validate_schema_name,
     validate_schema_definition,
+    validate_and_normalize_created_by,
     compute_fingerprint,
 )
 
@@ -92,6 +93,7 @@ class SchemaRegistryRepository:
     ) -> SchemaVersionRecord:
         validate_schema_name(schema_name)
         validate_schema_definition(format_version, columns)
+        created_by = validate_and_normalize_created_by(created_by)
         fingerprint = compute_fingerprint(format_version, columns)
 
         schema = self._get_or_create_schema_locked(schema_name, description, created_by)

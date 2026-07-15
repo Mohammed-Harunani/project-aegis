@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, model_validator, field_validator
 from typing import Dict, List, Optional
 from sqlalchemy.orm import Session
 import pandas as pd
@@ -16,6 +16,7 @@ from src.governance.manifest_repository import save_manifest
 from src.db.session import get_db
 from src.registry.schema_definition import (
     InvalidSchemaDefinitionError,
+    validate_and_normalize_created_by,
     to_gold_schema_dict,
 )
 from src.registry.repository import (
@@ -80,6 +81,19 @@ class RegisterSchemaVersionRequest(BaseModel):
     created_by: str = Field(min_length=1)
     description: Optional[str] = None
     change_summary: Optional[str] = None
+
+    @field_validator("created_by")
+    @classmethod
+    def _created_by_must_be_meaningful(cls, value: str) -> str:
+        # Field(min_length=1) alone lets "   " through -- it's a plain
+        # character-count check, not a meaningful-content check.
+        # Reuses the same strip-and-check logic the repository applies
+        # independently, so "  mohammed  " is stored as "mohammed" and
+        # "   " is rejected here rather than reaching the database.
+        try:
+            return validate_and_normalize_created_by(value)
+        except InvalidSchemaDefinitionError as e:
+            raise ValueError(str(e))
 
 
 def _build_gold_schema(gold_schema: Dict[str, str]) -> ObservedSchema:

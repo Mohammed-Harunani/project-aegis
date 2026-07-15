@@ -8,6 +8,7 @@ from registry.schema_definition import (
     InvalidSchemaDefinitionError,
     validate_schema_name,
     validate_schema_definition,
+    validate_and_normalize_created_by,
     compute_fingerprint,
     to_gold_schema_dict,
 )
@@ -85,3 +86,38 @@ def test_fingerprint_ignores_metadata_keys_on_columns():
 def test_to_gold_schema_dict_conversion():
     cols = [{"name": "customer_id", "dtype": "int64"}, {"name": "customer_name", "dtype": "object"}]
     assert to_gold_schema_dict(cols) == {"customer_id": "int64", "customer_name": "object"}
+
+
+def test_created_by_is_stripped_of_surrounding_whitespace():
+    assert validate_and_normalize_created_by("  mohammed  ") == "mohammed"
+    assert validate_and_normalize_created_by("mohammed") == "mohammed"
+
+
+def test_empty_created_by_rejected():
+    try:
+        validate_and_normalize_created_by("")
+        assert False, "expected InvalidSchemaDefinitionError"
+    except InvalidSchemaDefinitionError:
+        pass
+
+
+def test_whitespace_only_created_by_rejected():
+    """
+    The specific gap: Pydantic's Field(min_length=1) alone does not
+    catch this -- min_length is a plain character-count check on the
+    string as given, run before any stripping. Confirmed directly.
+    """
+    for bad in ["   ", "\t", "\n  \t"]:
+        try:
+            validate_and_normalize_created_by(bad)
+            assert False, f"expected rejection for {bad!r}"
+        except InvalidSchemaDefinitionError:
+            pass
+
+
+def test_none_created_by_rejected():
+    try:
+        validate_and_normalize_created_by(None)
+        assert False, "expected InvalidSchemaDefinitionError"
+    except InvalidSchemaDefinitionError:
+        pass

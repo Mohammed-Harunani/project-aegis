@@ -191,6 +191,30 @@ def test_missing_created_by_returns_422():
     assert client.post("/schemas/customer_master/versions", json=bad).status_code == 422
 
 
+def test_empty_created_by_returns_422():
+    bad = dict(CUSTOMER_MASTER_V1, created_by="")
+    assert client.post("/schemas/customer_master/versions", json=bad).status_code == 422
+
+
+def test_whitespace_only_created_by_returns_422():
+    """
+    The specific gap: Field(min_length=1) alone lets "   " through --
+    it's a character-count check, not a meaningful-content check.
+    Confirmed directly against the real validation function before
+    this fix existed.
+    """
+    bad = dict(CUSTOMER_MASTER_V1, created_by="   ")
+    assert client.post("/schemas/customer_master/versions", json=bad).status_code == 422
+
+
+def test_created_by_is_stored_stripped_of_whitespace():
+    padded = dict(CUSTOMER_MASTER_V1, created_by="  mohammed  ")
+    client.post("/schemas/customer_master/versions", json=padded)
+
+    body = client.get("/schemas/customer_master/versions/1").json()
+    assert body["schema_created_by"] == "mohammed"
+
+
 def test_schema_family_metadata_is_retrievable():
     """
     description/schema_created_by were previously write-only: accepted

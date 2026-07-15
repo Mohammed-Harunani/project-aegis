@@ -156,6 +156,29 @@ dtype for the same column) so pinning to v1 vs. v2 vs. omitting the
 version produces different, directly observable repair behavior --
 not just a different ID echoed back in the response.
 
+A second, smaller correction pass followed: `Field(min_length=1)`
+alone does not reject a whitespace-only `created_by` like `"   "` --
+confirmed against Pydantic's actual documented behavior (`min_length`
+is a plain character-count check, run before any stripping). Fixed
+with `validate_and_normalize_created_by()` in
+`schema_definition.py`, applied both as a Pydantic `field_validator`
+(API layer) and directly inside `SchemaRegistryRepository.register_version()`
+(defense in depth, for any caller that bypasses the API). A valid
+value like `"  mohammed  "` is now stored stripped, as `"mohammed"`.
+
+**Docker rebuild note:** if the `api` image was already built for an
+earlier phase, `docker compose run --rm api alembic upgrade head`
+will run against whatever code was baked into that image at its last
+build -- not whatever is currently on disk. Since this phase adds a
+new file (`alembic/versions/0002_schema_registry.py`), the image
+needs rebuilding first:
+
+```powershell
+docker compose build api
+docker compose run --rm api alembic upgrade head
+docker compose up -d --force-recreate api
+```
+
 ## What's verified vs. not
 
 Fingerprint computation, schema-definition validation, and dtype
