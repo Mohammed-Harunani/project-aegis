@@ -57,3 +57,36 @@ def get_verified_test_database_url():
 
     os.environ["DATABASE_URL"] = test_url
     return test_url
+
+
+def get_verified_live_test_database_url():
+    """
+    Same shape as get_verified_test_database_url(), for Phase 2.5's
+    live-execution tests. The live target must be a THIRD database,
+    distinct from both aegis and aegis_test -- the live writer itself
+    refuses those two as targets, so testing live writes needs
+    aegis_live_test (or equivalent) instead.
+    """
+    import os
+    import pytest
+
+    live_test_url = os.environ.get("LIVE_TEST_DATABASE_URL")
+    if not live_test_url:
+        pytest.skip(
+            "LIVE_TEST_DATABASE_URL is not set. Live-execution tests need "
+            "a real, disposable target database distinct from aegis and "
+            "aegis_test. See Docs/phase2_5_live_execution_spec.md.",
+            allow_module_level=True,
+        )
+
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(live_test_url)
+    if parsed.database in ("aegis", "aegis_test"):
+        raise RuntimeError(
+            f"LIVE_TEST_DATABASE_URL must not be {parsed.database!r} -- "
+            f"use a distinct database (e.g. aegis_live_test)."
+        )
+
+    os.environ["LIVE_DATABASE_URL"] = live_test_url
+    return live_test_url

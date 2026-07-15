@@ -12,7 +12,7 @@ models cannot be exercised against SQLite as a stand-in for testing.
 
 import uuid
 
-from sqlalchemy import Column, Text, Numeric, DateTime, Integer, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, Text, Numeric, DateTime, Integer, ForeignKey, UniqueConstraint, Index, text
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base
 
@@ -108,3 +108,40 @@ class SchemaVersionRecord(Base):
     change_summary = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), nullable=False)
     created_by = Column(Text, nullable=False)
+
+
+class LiveExecutionRecord(Base):
+    __tablename__ = "live_executions"
+    __table_args__ = (
+        # Only one COMPLETED execution per ticket -- a failed attempt
+        # doesn't block a later retry, only a second success would.
+        Index(
+            "uq_live_executions_ticket_completed",
+            "ticket_id",
+            unique=True,
+            postgresql_where=text("status = 'COMPLETED'"),
+        ),
+    )
+
+    live_execution_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    ticket_id = Column(UUID(as_uuid=True), ForeignKey("approval_tickets.ticket_id"), nullable=False)
+    sandbox_manifest_id = Column(
+        UUID(as_uuid=True), ForeignKey("healing_manifests.manifest_id"), nullable=False
+    )
+    schema_version_id = Column(
+        UUID(as_uuid=True), ForeignKey("schema_versions.schema_version_id"), nullable=False
+    )
+    target_schema = Column(Text, nullable=False)
+    target_table = Column(Text, nullable=False)
+    backup_table = Column(Text, nullable=True)
+    status = Column(Text, nullable=False)
+    requested_by = Column(Text, nullable=False)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    rolled_back_by = Column(Text, nullable=True)
+    rolled_back_at = Column(DateTime(timezone=True), nullable=True)
+    failure_reason = Column(Text, nullable=True)
+    original_row_count = Column(Integer, nullable=False)
+    final_row_count = Column(Integer, nullable=False)
+    risk_level = Column(Text, nullable=False)
+    integrity_status = Column(Text, nullable=False)
