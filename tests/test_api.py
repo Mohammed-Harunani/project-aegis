@@ -38,6 +38,21 @@ if not TEST_DATABASE_URL:
         allow_module_level=True,
     )
 
+# Not falling back to DATABASE_URL isn't enough on its own -- a typo'd
+# or copy-pasted TEST_DATABASE_URL could still point at the real
+# `aegis` database, and setup/teardown below would drop its tables.
+# Parsing the URL and requiring the database name specifically closes
+# that gap regardless of what value someone puts in the variable.
+from sqlalchemy.engine import make_url
+
+_parsed_test_url = make_url(TEST_DATABASE_URL)
+if _parsed_test_url.database != "aegis_test":
+    raise RuntimeError(
+        f"TEST_DATABASE_URL must point at the dedicated 'aegis_test' "
+        f"database, not {_parsed_test_url.database!r}. Refusing to run "
+        f"tests that create/drop tables against anything else."
+    )
+
 # src.db.session builds a module-level engine from DATABASE_URL the
 # moment it's imported (which src.api.app does transitively) -- and
 # refuses to start at all if DATABASE_URL isn't set, independently of
@@ -323,25 +338,45 @@ def test_quarantine_when_only_low_confidence_plans_exist():
     assert body["message"] == "No repair plan survived governance review; all candidates quarantined."
 
 
-def test_dataset_with_financial_datatypes_persists_and_restores_exactly():
+def test_dataset_datatypes_index_and_column_order_persist_and_restore_exactly():
     """
-    Decimal/Timestamp/date can't arrive via a real HTTP request --
-    JSON has no such types -- but they're exactly what a future
-    SQL-sourced dataset (e.g. a /validate-from-db endpoint) would
-    contain. Tests the repository directly, since that's the only way
-    to construct a DataFrame containing these types in the first
-    place. Confirms the values come back as the exact original Python
-    types, not lossy strings or (worse, for a "Financial Data
-    Integrity Guardian") a Decimal silently turned into a float.
+    Covers every item on the required list at once, since they're all
+    exercised by the same submit -> DB -> get round trip:
+      - plain datetime.datetime comes back as datetime.datetime, not
+        silently promoted to pandas.Timestamp
+      - pandas.Timestamp comes back as pandas.Timestamp
+      - Decimal precision survives exactly (not coerced to float)
+      - nullable Int64 stays Int64, not float64/NaN
+      - a custom index (name + values) survives, not reset to 0..n-1
+      - column order survives even when non-alphabetical -- this one
+        specifically depends on NOT trusting JSONB key order, since
+        Postgres's JSONB is a decomposed binary format that does not
+        guarantee round-tripping key order the way plain `json` does
+      - +inf / -inf are handled deliberately, not left as invalid JSON
+
+    Decimal/Timestamp/datetime/Int64 can't arrive via a real HTTP
+    request (JSON has none of these types) -- tests the repository
+    directly, which is the only way to construct a DataFrame containing
+    them in the first place. This is exactly what a future SQL-sourced
+    dataset (e.g. a /validate-from-db endpoint) would contain.
     """
     import decimal
     import datetime as dt
 
     df = pd.DataFrame({
-        "txn_date": pd.to_datetime(["2026-01-01", None]),
-        "amount": [decimal.Decimal("1050.75"), None],
-        "due_date": [dt.date(2026, 2, 1), dt.date(2026, 2, 2)],
+        "name": ["a", "b", "c"],
+        "amount": pd.array([1, None, 3], dtype="Int64"),
+        "price": [10.5, float("inf"), float("-inf")],
+        "processed_at": [pd.Timestamp("2026-01-01"), None, pd.Timestamp("2026-01-03")],
+        "logged_at": pd.Series([dt.datetime(2026, 1, 1, 9, 0), None, None], dtype=object),
+        "due": [dt.date(2026, 2, 1), dt.date(2026, 2, 2), None],
+        "fee": [decimal.Decimal("1050.75"), None, decimal.Decimal("0.00")],
     })
+    df.index = pd.Index([101, 205, 309], name="transaction_id")
+    # Deliberately non-alphabetical -- this is the part JSON key order
+    # alone can't be trusted to preserve through Postgres JSONB.
+    df = df[["fee", "due", "logged_at", "name", "amount", "price", "processed_at"]]
+
     schema = AegisInspector().generate_observed_schema(df)
 
     with TestSessionLocal() as db:
@@ -360,10 +395,50 @@ def test_dataset_with_financial_datatypes_persists_and_restores_exactly():
         fetched = PostgresApprovalRepository(db).get(ticket.ticket_id)
 
     restored = fetched.target_dataset
-    assert restored["amount"][0] == decimal.Decimal("1050.75")
-    assert restored["amount"][1] is None
-    assert restored["txn_date"][0] == pd.Timestamp("2026-01-01")
-    assert restored["due_date"][0] == dt.date(2026, 2, 1)
+
+    assert list(restored.columns) == list(df.columns), (
+        "column order did not survive the real Postgres JSONB round trip"
+    )
+    assert restored.index.tolist() == [101, 205, 309]
+    assert restored.index.name == "transaction_id"
+    assert str(restored["amount"].dtype) == "Int64"
+    assert restored["price"].tolist()[1] == float("inf")
+    assert restored["price"].tolist()[2] == float("-inf")
+    assert type(restored["processed_at"].tolist()[0]).__name__ == "Timestamp"
+    assert type(restored["logged_at"].tolist()[0]).__name__ == "datetime"
+    assert type(restored["due"].tolist()[0]).__name__ == "date"
+    assert restored["fee"].tolist()[0] == decimal.Decimal("1050.75")
+
+
+def test_unsafe_test_database_name_is_rejected():
+    """
+    The database-name guard runs at module import time, before any
+    test in this file can execute -- so proving it actually rejects a
+    bad name means running a fresh subprocess with a deliberately
+    wrong TEST_DATABASE_URL, not calling anything from within this
+    already-validated process. Heavier than the other tests (spawns a
+    subprocess), but there's no in-process way to test import-time
+    failure of the module doing the testing.
+    """
+    import subprocess
+
+    project_root = Path(__file__).resolve().parents[1]
+    bad_url = TEST_DATABASE_URL.rsplit("/", 1)[0] + "/aegis"
+
+    env = dict(os.environ)
+    env["TEST_DATABASE_URL"] = bad_url
+    env.pop("DATABASE_URL", None)
+
+    result = subprocess.run(
+        ["python", "-m", "pytest", "tests/test_api.py", "--collect-only", "-q"],
+        cwd=str(project_root),
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode != 0
+    assert "aegis_test" in (result.stdout + result.stderr)
 
 
 def test_alembic_upgrade_and_downgrade():

@@ -49,62 +49,145 @@ def _schema_from_json(data: dict) -> ObservedSchema:
     return ObservedSchema(columns=columns, column_order=data["column_order"])
 
 
-def _sanitize_value(value):
+# --- Dataset serialization -------------------------------------------
+#
+# A versioned envelope rather than a plain column->list dict, because
+# the plain dict was verified to lose four separate things: (1) column
+# order -- relies on JSON key order, which Postgres JSONB does NOT
+# guarantee survives a round trip, it's a decomposed binary format, not
+# text; (2) per-column dtype -- e.g. a nullable Int64 column with a
+# null silently becomes float64/NaN through a plain dict round-trip;
+# (3) the DataFrame's index -- name, dtype, and values all discarded,
+# which matters because Surgeon's diagnostics reference rows by index
+# label; (4) datetime.datetime and pandas.Timestamp were tagged
+# identically, so a plain datetime.datetime silently came back as a
+# Timestamp. All four confirmed directly and fixed here.
+
+DATASET_FORMAT_VERSION = 1
+
+
+def _sanitize_scalar(value):
     """
     Tags non-JSON-native types so they survive the round trip through
-    JSONB and back out as the exact original Python type, rather than
-    a lossy string or, worse, a Decimal silently turned into a float
-    (float imprecision is exactly the kind of silent corruption a
-    'Financial Data Integrity Guardian' shouldn't introduce itself).
-    None already covers NaN/NaT/pd.NA by the time this runs -- see
-    _dataset_to_json.
+    JSONB and come back as the exact original Python type -- not a
+    lossy string, and never a Decimal silently turned into a float
+    (imprecision on money values is exactly the kind of silent
+    corruption a "Financial Data Integrity Guardian" shouldn't
+    introduce itself). None already covers NaN/NaT/pd.NA by the time
+    this runs -- see _dataset_to_json.
     """
     if value is None:
         return None
+    if isinstance(value, float):
+        if value == float("inf"):
+            return {"__aegis_type__": "positive_infinity"}
+        if value == float("-inf"):
+            return {"__aegis_type__": "negative_infinity"}
+        return value
     if isinstance(value, decimal.Decimal):
-        return {"__type__": "decimal", "value": str(value)}
-    # Order matters: pd.Timestamp and datetime.datetime are both
-    # subclasses of datetime.date, so the more specific checks must
-    # come first or they'd never be reached.
+        return {"__aegis_type__": "decimal", "value": str(value)}
+    # Order matters: pd.Timestamp is a subclass of datetime.datetime,
+    # which is a subclass of datetime.date -- most specific first.
+    # Getting this wrong is exactly how the previous version tagged
+    # both pd.Timestamp and plain datetime.datetime as "timestamp",
+    # silently collapsing the distinction between them.
     if isinstance(value, pd.Timestamp):
-        return {"__type__": "timestamp", "value": value.isoformat()}
+        return {"__aegis_type__": "pandas_timestamp", "value": value.isoformat()}
     if isinstance(value, datetime_module.datetime):
-        return {"__type__": "timestamp", "value": value.isoformat()}
+        return {"__aegis_type__": "python_datetime", "value": value.isoformat()}
     if isinstance(value, datetime_module.date):
-        return {"__type__": "date", "value": value.isoformat()}
+        return {"__aegis_type__": "date", "value": value.isoformat()}
     return value
 
 
-def _restore_value(value):
-    if isinstance(value, dict) and "__type__" in value:
-        kind, raw = value["__type__"], value["value"]
+def _restore_scalar(value):
+    if isinstance(value, dict) and "__aegis_type__" in value:
+        kind = value["__aegis_type__"]
+        if kind == "positive_infinity":
+            return float("inf")
+        if kind == "negative_infinity":
+            return float("-inf")
+        raw = value.get("value")
         if kind == "decimal":
             return decimal.Decimal(raw)
-        if kind == "timestamp":
+        if kind == "pandas_timestamp":
             return pd.Timestamp(raw)
+        if kind == "python_datetime":
+            return datetime_module.datetime.fromisoformat(raw)
         if kind == "date":
             return datetime_module.date.fromisoformat(raw)
     return value
 
 
 def _dataset_to_json(df: pd.DataFrame) -> dict:
-    """
-    Converts NaN/NaT/pd.NA to JSON null, boxes numpy scalar types
-    (int64, float64, ...) as native Python types, and tags Decimal /
-    Timestamp / datetime / date so _dataset_from_json can reconstruct
-    them exactly. Verified directly (see conversation history): the
-    unsanitized version fails on nulls (NaN is not valid JSON) AND
-    separately on any of these four types (none of them are JSON-
-    serializable at all, with or without nulls present).
-    """
     clean = df.astype(object).where(pd.notnull(df), None)
-    data = clean.to_dict(orient="list")
-    return {col: [_sanitize_value(v) for v in values] for col, values in data.items()}
+    column_order = list(df.columns)
+    data = {col: [_sanitize_scalar(v) for v in clean[col].tolist()] for col in column_order}
+    index_values = [
+        None if (isinstance(v, float) and pd.isna(v)) else _sanitize_scalar(v)
+        for v in df.index.tolist()
+    ]
+    return {
+        "format_version": DATASET_FORMAT_VERSION,
+        "column_order": column_order,
+        "dtypes": {col: str(df[col].dtype) for col in column_order},
+        "index": {
+            "name": df.index.name,
+            "dtype": str(df.index.dtype),
+            "values": index_values,
+        },
+        "data": data,
+    }
 
 
-def _dataset_from_json(data: dict) -> pd.DataFrame:
-    restored = {col: [_restore_value(v) for v in values] for col, values in data.items()}
-    return pd.DataFrame(restored)
+def _dataset_from_json(payload: dict) -> pd.DataFrame:
+    if payload.get("format_version") != DATASET_FORMAT_VERSION:
+        raise ValueError(f"Unsupported dataset format_version: {payload.get('format_version')!r}")
+
+    column_order = payload["column_order"]
+    dtypes = payload["dtypes"]
+    data = payload["data"]
+    index_info = payload["index"]
+
+    # Each column is built as its own object-dtype Series first (same
+    # default 0..n-1 index for every one of them, so no alignment
+    # mismatch when combined below), and ONLY THEN cast to its recorded
+    # dtype. Doing this in one shot via pd.DataFrame(dict_of_lists)
+    # instead -- as the previous version did -- lets pandas re-infer
+    # types across the whole frame at once, which silently promotes a
+    # plain datetime.datetime column back to Timestamp before the
+    # dtype ever gets reapplied. Verified directly: that was exactly
+    # how "python_datetime" and "pandas_timestamp" collapsed together.
+    columns = {}
+    for col in column_order:
+        restored_values = [_restore_scalar(v) for v in data[col]]
+        series = pd.Series(restored_values, dtype=object)
+        target_dtype = dtypes.get(col)
+        if target_dtype and target_dtype != "object":
+            try:
+                series = series.astype(target_dtype)
+            except (TypeError, ValueError):
+                # A handful of dtype strings round-trip awkwardly
+                # through astype() directly; leave the column as
+                # reconstructed rather than raise -- the values
+                # themselves are still correct even if the dtype
+                # label isn't perfectly reapplied.
+                pass
+        columns[col] = series
+
+    df = pd.DataFrame(columns, columns=column_order)
+
+    index_values = [_restore_scalar(v) for v in index_info["values"]]
+    idx = pd.Index(index_values, name=index_info["name"], dtype=object)
+    index_dtype = index_info.get("dtype")
+    if index_dtype and index_dtype != "object":
+        try:
+            idx = idx.astype(index_dtype)
+        except (TypeError, ValueError):
+            pass
+    df.index = idx
+
+    return df
 
 
 def _record_to_ticket(record: ApprovalTicketRecord) -> ApprovalTicket:

@@ -97,6 +97,31 @@ Run migrations inside the Compose network via `docker compose run`,
 not directly on the host -- `DATABASE_URL`'s `postgres` hostname only
 resolves inside that network.
 
+## Dataset persistence format
+
+`target_dataset` is stored as a versioned envelope, not a plain
+`{column: [values]}` dict -- that plain form was verified to lose four
+separate things: column order (JSON key order is not something
+Postgres JSONB guarantees to preserve -- it's a decomposed binary
+format, not text, unlike the plain `json` type), per-column dtype (a
+nullable `Int64` column with a null silently became `float64`/`NaN`),
+the DataFrame's index (name, dtype, and values all discarded, which
+matters since Surgeon's diagnostics reference rows by index label),
+and the distinction between `datetime.datetime` and `pandas.Timestamp`
+(both were tagged identically, so a plain `datetime.datetime` silently
+came back as a `Timestamp`).
+
+The envelope (`_dataset_to_json`/`_dataset_from_json` in
+`approval_repository.py`) explicitly stores `column_order`, per-column
+`dtypes`, and `index` (name/dtype/values) alongside `data`, and tags
+non-JSON-native scalars: `decimal`, `pandas_timestamp`,
+`python_datetime`, `date`, `positive_infinity`, `negative_infinity`.
+Reconstruction rebuilds each column as its own object-dtype Series
+first and only then reapplies the recorded dtype -- building the whole
+frame in one shot from a plain dict instead lets pandas re-infer types
+across all columns at once, which is exactly what silently promoted
+`datetime.datetime` back to `Timestamp` in an earlier version.
+
 ## Test database isolation
 
 `tests/test_api.py` requires `TEST_DATABASE_URL` explicitly and will
@@ -104,12 +129,16 @@ resolves inside that network.
 reads `DATABASE_URL` as a fallback, specifically because
 `setup_module`/`teardown_module` call `Base.metadata.create_all()` /
 `drop_all()` -- pointed at the real database, that would destroy
-production/dev data. It also sets `os.environ["DATABASE_URL"] =
-TEST_DATABASE_URL` itself, before importing `src.api.app` -- that
-import transitively imports `src.db.session`, which builds a
-module-level engine from `DATABASE_URL` and refuses to start without
-it, independently of `TEST_DATABASE_URL`. Only `TEST_DATABASE_URL`
-needs to be exported; the test file handles the rest.
+production/dev data. Beyond not falling back, it also parses
+`TEST_DATABASE_URL` with SQLAlchemy's `make_url()` and refuses to run
+at all unless the database name is exactly `aegis_test` -- closing the
+gap where the variable is set, just to the wrong value. It also sets
+`os.environ["DATABASE_URL"] = TEST_DATABASE_URL` itself, before
+importing `src.api.app` -- that import transitively imports
+`src.db.session`, which builds a module-level engine from
+`DATABASE_URL` and refuses to start without it, independently of
+`TEST_DATABASE_URL`. Only `TEST_DATABASE_URL` needs to be exported;
+the test file handles the rest.
 
 `alembic/env.py` prefers a URL already configured programmatically
 (`config.set_main_option("sqlalchemy.url", ...)`, used by
@@ -120,18 +149,30 @@ run --rm api alembic upgrade head` (env-var driven) and the
 programmatic test (config-object driven) both correct without either
 depending on the other.
 
+## Credential isolation in the Docker build
+
+`.dockerignore` excludes `.env` (and `.git`, `__pycache__`, etc.) from
+the build context. Without it, `COPY . .` in the Dockerfile would
+happily copy a real `.env` -- containing real Postgres credentials --
+into the image at `/app/.env`, independent of `.gitignore` (which only
+governs Git, not Docker's build context). Verify after building:
+
+```powershell
+docker compose run --rm api sh -c "test ! -f /app/.env && echo '.env not present'"
+```
+
 ## Financial datatypes
 
-`Decimal`, `Timestamp`, `datetime`, and `date` are not JSON-
-serializable on their own -- confirmed directly, all four raise
-`TypeError` from `json.dumps`. `_dataset_to_json`/`_dataset_from_json`
-in `approval_repository.py` tag each with `{"__type__": ..., "value":
-...}` so they come back as the exact original Python type, not a
-lossy string and never a `Decimal` silently turned into a `float`
-(floating-point imprecision on money values would be exactly the kind
-of silent corruption this project exists to prevent). These types
-can't arrive via a real HTTP request today (JSON itself has no such
-types), but are what a future SQL-sourced dataset would contain --
+`Decimal`, `Timestamp`, `datetime`, `date`, and `+inf`/`-inf` are not
+JSON-serializable on their own -- confirmed directly, all of them
+raise `TypeError` (or, for infinity, produce the invalid JSON literal
+`Infinity`) from `json.dumps`. The dataset envelope above tags each
+with `{"__aegis_type__": ..., "value": ...}` so they come back as the
+exact original Python type, never a `Decimal` silently turned into a
+`float` (floating-point imprecision on money values would be exactly
+the kind of silent corruption this project exists to prevent). These
+types can't arrive via a real HTTP request today (JSON itself has no
+such types), but are what a future SQL-sourced dataset would contain --
 covered by a repository-level test, not an HTTP one, since HTTP can't
 construct them in the first place.
 
