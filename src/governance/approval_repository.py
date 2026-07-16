@@ -289,6 +289,20 @@ class PostgresApprovalRepository:
     def get(self, ticket_id: str) -> ApprovalTicket:
         return _record_to_ticket(self._get_record(ticket_id))
 
+    def lock_for_live_execution(self, ticket_id: str) -> ApprovalTicket:
+        """
+        Phase 2.5 -- row-locks the ticket for the remainder of the
+        caller's transaction, reusing the same SELECT ... FOR UPDATE
+        mechanism as approve()/reject(). This is what makes the
+        check-current-state-then-create-a-live-execution-row sequence
+        in app.py's execute_live() safe against two concurrent
+        requests for the same ticket: the second blocks here until the
+        first's transaction ends, then sees the now-existing PENDING/
+        RUNNING/COMPLETED live_executions row and correctly gets
+        rejected, instead of both racing past an unlocked check.
+        """
+        return _record_to_ticket(self._get_record_for_update(ticket_id))
+
     def list_pending(self) -> List[ApprovalTicket]:
         records = (
             self.db.query(ApprovalTicketRecord)

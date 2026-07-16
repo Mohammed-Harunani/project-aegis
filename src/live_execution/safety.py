@@ -42,6 +42,13 @@ def get_target_schema_allowlist() -> List[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+def validate_and_normalize_operator(operator: str) -> str:
+    stripped = (operator or "").strip()
+    if not stripped:
+        raise LiveExecutionNotAllowedError("operator must not be empty or whitespace-only.")
+    return stripped
+
+
 def evaluate_safety_gates(
     *,
     schema_version_id: Optional[str],
@@ -53,12 +60,14 @@ def evaluate_safety_gates(
     proposed_action: str,
     target_schema: str,
     target_table: str,
-    source_schema: Optional[str],
-    source_table: Optional[str],
+    source_schema: str,
+    source_table: str,
     confirm: bool,
     schema_allowlist: List[str],
     already_executed_live: bool,
     unresolved_execution_exists_for_target: bool,
+    sandbox_output_fingerprint: Optional[str],
+    live_recomputed_fingerprint: str,
 ) -> None:
     """
     Raises on the first gate that fails. Returns None (silently) if
@@ -118,14 +127,13 @@ def evaluate_safety_gates(
             f"Target schema {target_schema!r} is not in the allowlisted set: {schema_allowlist}."
         )
 
-    # Gate 11: target != source, when a source is actually given (see
-    # spec: nothing in Aegis today tracks a live source-table
-    # reference to compare against otherwise).
-    if source_schema is not None and source_table is not None:
-        if (source_schema, source_table) == (target_schema, target_table):
-            raise LiveExecutionNotAllowedError(
-                "Target must not be the same as the original source table."
-            )
+    # Gate 11: target != source. source_schema/source_table are now
+    # mandatory -- originally optional, which converted a mandatory
+    # safety gate into something a caller could simply omit to bypass.
+    if (source_schema, source_table) == (target_schema, target_table):
+        raise LiveExecutionNotAllowedError(
+            "Target must not be the same as the original source table."
+        )
 
     # Gate 14: explicit confirmation (kept in gate order 14 per the
     # spec, though checked here rather than after 12-13 -- ordering
@@ -137,12 +145,35 @@ def evaluate_safety_gates(
 
     # Gates 12-13: state conflicts -- 409, not 422.
     if already_executed_live:
-        raise LiveExecutionConflictError("This ticket has already been executed live.")
+        raise LiveExecutionConflictError(
+            "This ticket has already executed live (or been rolled back after "
+            "doing so) -- live execution is one-shot per ticket."
+        )
 
     if unresolved_execution_exists_for_target:
         raise LiveExecutionConflictError(
             f"An unresolved (PENDING/RUNNING) live execution already exists "
             f"for {target_schema}.{target_table}."
+        )
+
+    # Correction pass (issue 8): the live recomputation must produce
+    # the exact same corrected output as what was actually validated
+    # in sandbox, not just the same row count. Between sandbox
+    # approval and a later live-execution request, code, component
+    # versions, or repair behavior could have changed -- recomputing
+    # via Surgeon rather than persisting the corrected data a second
+    # time only stays safe if this is actually checked, not assumed.
+    if not sandbox_output_fingerprint:
+        raise LiveExecutionNotAllowedError(
+            "Sandbox manifest has no recorded output fingerprint to compare "
+            "against -- cannot verify the live recomputation matches what was "
+            "actually approved."
+        )
+    if sandbox_output_fingerprint != live_recomputed_fingerprint:
+        raise LiveExecutionNotAllowedError(
+            "The live recomputation does not match the sandbox output that was "
+            "actually approved -- something has changed since approval (code, "
+            "component versions, or repair behavior). Refusing to publish."
         )
 
     # Gate 15 (PostgreSQL validation before promotion) happens inside

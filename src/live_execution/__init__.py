@@ -10,6 +10,7 @@ from .safety import (
     LiveExecutionConflictError,
     live_execution_globally_enabled,
     get_target_schema_allowlist,
+    validate_and_normalize_operator,
     evaluate_safety_gates,
 )
 
@@ -24,6 +25,7 @@ __all__ = [
     "LiveExecutionConflictError",
     "live_execution_globally_enabled",
     "get_target_schema_allowlist",
+    "validate_and_normalize_operator",
     "evaluate_safety_gates",
 ]
 

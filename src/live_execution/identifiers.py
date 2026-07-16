@@ -36,15 +36,30 @@ def validate_identifier(name: str, kind: str) -> str:
     return name
 
 
+MAX_IDENTIFIER_LENGTH = 63
+_EXECUTION_ID_SUFFIX_CHARS = 16  # 64 bits -- ample collision resistance at this system's realistic volume
+
+
+def _controlled_suffixed_name(target_table: str, marker: str, execution_id) -> str:
+    """
+    Builds a name guaranteed to fit within Postgres's 63-byte identifier
+    limit, however long target_table is. The naive version (just
+    concatenating table + marker + full UUID hex) silently overflows
+    for any target_table anywhere close to 63 characters -- confirmed
+    directly: a 63-char table name caused Postgres to truncate away
+    the ENTIRE suffix, including the shadow/backup marker itself,
+    making shadow and backup names identical and colliding across
+    different executions. The fix reserves a fixed-length suffix
+    first, then truncates the table-name portion to whatever's left.
+    """
+    suffix = f"__aegis_{marker}_{execution_id.hex[:_EXECUTION_ID_SUFFIX_CHARS]}"
+    available_for_table = MAX_IDENTIFIER_LENGTH - len(suffix)
+    return f"{target_table[:available_for_table]}{suffix}"
+
+
 def shadow_table_name(target_table: str, execution_id) -> str:
-    """
-    execution_id is a uuid.UUID; .hex strips dashes (32 hex chars).
-    Very long target_table names combined with this suffix can still
-    exceed Postgres's 63-byte identifier limit -- a known constraint,
-    not solved here with truncation/hashing schemes nobody asked for.
-    """
-    return f"{target_table}__aegis_shadow_{execution_id.hex}"
+    return _controlled_suffixed_name(target_table, "shadow", execution_id)
 
 
 def backup_table_name(target_table: str, execution_id) -> str:
-    return f"{target_table}__aegis_backup_{execution_id.hex}"
+    return _controlled_suffixed_name(target_table, "backup", execution_id)

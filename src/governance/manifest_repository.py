@@ -23,6 +23,7 @@ def save_manifest(
     manifest: HealingManifest,
     ticket_id: Optional[str] = None,
     schema_version_id: Optional[str] = None,
+    corrected_output_fingerprint: Optional[str] = None,
     commit: bool = True,
 ) -> HealingManifestRecord:
     """
@@ -31,6 +32,12 @@ def save_manifest(
     commit=False: the caller (e.g. approve_ticket in app.py) is
     bundling this into a larger transaction alongside the ticket's
     APPROVED status change, and will commit or roll back both together.
+
+    corrected_output_fingerprint (Phase 2.5 correction): the caller
+    computes this from the actual corrected DataFrame -- this function
+    only persists it, since it's purely a storage concern and Surgeon
+    itself isn't touched to produce it (see app.py for how it's
+    obtained without changing Surgeon's sandbox-mode behavior).
     """
     record = HealingManifestRecord(
         manifest_id=uuid.uuid4(),
@@ -56,6 +63,7 @@ def save_manifest(
         integrity_status=manifest.integrity_status,
         risk_level=manifest.risk_level,
         schema_version_id=uuid.UUID(schema_version_id) if schema_version_id else None,
+        corrected_output_fingerprint=corrected_output_fingerprint,
     )
     db.add(record)
     if commit:

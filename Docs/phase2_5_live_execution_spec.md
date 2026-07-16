@@ -106,3 +106,80 @@ constraint as every Postgres-dependent piece of this project before
 it. This phase raises the stakes on that gap more than any prior one:
 treat every line touching the live writer as a draft until it's run
 against a real throwaway Postgres target, not just `aegis_test`.
+
+## Correction pass
+
+A review found nine real issues, all addressed:
+
+1. **Rolled-back tickets could re-execute** -- the partial unique index
+   only covered COMPLETED. Now covers PENDING, RUNNING, COMPLETED,
+   ROLLING_BACK, and ROLLED_BACK -- everything except FAILED (which
+   stays retryable) is one-shot per ticket.
+2. **Concurrent requests could publish twice** -- the ticket is now
+   row-locked (lock_for_live_execution(), reusing the same
+   SELECT ... FOR UPDATE mechanism as ticket approval) before the
+   check-then-create sequence, and a second partial unique index on
+   (target_schema, target_table) for PENDING/RUNNING is the
+   database-enforced backstop if two different tickets race for the
+   same target. create_pending() catches the resulting IntegrityError
+   and converts it to a clean 409.
+3. **A Surgeon failure left the execution stuck RUNNING** -- the
+   Surgeon recomputation now happens inside the same try/except as
+   the target-database write.
+4. **Cross-database crash recovery** -- a durable execution-log marker
+   table lives inside the target database itself (same schema,
+   written in the same transaction as the shadow/backup/promote
+   sequence), independent of whether the governance-database update
+   after it succeeds. GET /live-executions/{id} reconciles a stuck
+   RUNNING record against this marker on read, rather than a
+   background sweep -- a deliberately scoped choice, not a full
+   reconciliation service.
+5. **Rolling back an older execution could destroy newer data** --
+   rollback now checks both the governance database (is this the
+   latest COMPLETED execution for this target?) and the target-side
+   marker (is this still the most recent PROMOTE for this exact
+   table?) before proceeding, and transitions through a new
+   ROLLING_BACK state first.
+6. **Arbitrary existing tables could be silently replaced** -- an
+   existing target with no prior PROMOTE marker (proof Aegis created
+   it) is refused outright. Aegis's simplified shadow-table schema
+   (column names + basic types only) doesn't preserve primary keys,
+   foreign keys, indexes, defaults, triggers, or grants, and Postgres's
+   object-identity-based dependency tracking means anything referencing
+   the old table by its renamed-backup identity wouldn't follow the
+   rename anyway.
+7. **Source-vs-target protection was optional** -- source_schema/
+   source_table are now required fields, always checked, not skipped
+   when omitted.
+8. **Live output wasn't proven identical to sandbox output** --
+   HealingManifestRecord.corrected_output_fingerprint (a SHA-256 over
+   column order, dtypes, index, and every row's values) is computed at
+   sandbox time and compared against a fresh fingerprint of the live
+   recomputation; a mismatch blocks publication. Getting the corrected
+   DataFrame out of Surgeon's "sandbox" mode (which discards its
+   internal copy) without modifying Surgeon.py required a second,
+   throwaway call using "live" mode's in-place-mutation behavior,
+   purely to fingerprint -- verified directly that a matching case
+   passes and an intentionally diverged repair plan is caught.
+9. **Generated shadow/backup names could overflow Postgres's 63-byte
+   identifier limit** -- confirmed directly that a 63-character target
+   table name caused the naive version to silently truncate away the
+   entire suffix, including the shadow/backup marker itself, making
+   the two names identical and colliding across different executions.
+   Fixed with a fixed-length suffix and controlled truncation of the
+   table-name portion.
+
+Also added: operator validation (strip + reject empty, both request
+models), a CHECK constraint on status, explicit Alembic-level
+verification that migration 0003 creates the expected tables,
+columns, and indexes (the rest of this test file uses Base.metadata
+directly for speed, which doesn't exercise the migration itself), and
+tests for target-write failure, Surgeon failure, concurrent rollback,
+a rolled-back ticket attempting re-execution, and a stale rollback
+after a newer execution supersedes the target.
+
+**Local verification note:** if your Postgres data volume predates
+this phase, docker/init-test-db.sql won't re-run automatically (it
+only fires on first container initialization) -- create
+aegis_live_test manually first; see the runbook at the top of
+tests/test_live_execution_api.py.

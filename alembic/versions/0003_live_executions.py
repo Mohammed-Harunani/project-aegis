@@ -51,20 +51,48 @@ def upgrade() -> None:
         sa.Column("final_row_count", sa.Integer, nullable=False),
         sa.Column("risk_level", sa.Text, nullable=False),
         sa.Column("integrity_status", sa.Text, nullable=False),
-        # Only one successful live execution per ticket -- partial
-        # unique index so PENDING/RUNNING/FAILED/ROLLED_BACK attempts
-        # for the same ticket don't collide with each other, only a
-        # second COMPLETED one would.
+        sa.CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'ROLLING_BACK', 'ROLLED_BACK')",
+            name="ck_live_executions_valid_status",
+        ),
     )
+
+    # A ticket may have AT MOST ONE non-FAILED live execution ever --
+    # FAILED attempts are retryable; anything else (in-flight or
+    # executed-in-some-form) is one-shot. Originally this covered only
+    # COMPLETED, which let a rolled-back ticket execute live again.
     op.create_index(
-        "uq_live_executions_ticket_completed",
+        "uq_live_executions_ticket_active_or_done",
         "live_executions",
         ["ticket_id"],
         unique=True,
-        postgresql_where=sa.text("status = 'COMPLETED'"),
+        postgresql_where=sa.text(
+            "status IN ('PENDING', 'RUNNING', 'COMPLETED', 'ROLLING_BACK', 'ROLLED_BACK')"
+        ),
+    )
+    # No two different tickets can have an unresolved live execution
+    # against the same target table at once -- this is what actually
+    # stops a second concurrent promote() at the database level,
+    # rather than relying solely on an application-level check.
+    op.create_index(
+        "uq_live_executions_target_in_flight",
+        "live_executions",
+        ["target_schema", "target_table"],
+        unique=True,
+        postgresql_where=sa.text("status IN ('PENDING', 'RUNNING')"),
+    )
+
+    # Phase 2.5 correction -- proves a later live-execution
+    # recomputation produces the exact same corrected output as what
+    # was actually validated in sandbox, not just the same row count.
+    op.add_column(
+        "healing_manifests",
+        sa.Column("corrected_output_fingerprint", sa.Text, nullable=True),
     )
 
 
 def downgrade() -> None:
-    op.drop_index("uq_live_executions_ticket_completed", table_name="live_executions")
+    op.drop_column("healing_manifests", "corrected_output_fingerprint")
+    op.drop_index("uq_live_executions_target_in_flight", table_name="live_executions")
+    op.drop_index("uq_live_executions_ticket_active_or_done", table_name="live_executions")
     op.drop_table("live_executions")

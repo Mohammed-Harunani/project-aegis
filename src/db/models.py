@@ -12,7 +12,7 @@ models cannot be exercised against SQLite as a stand-in for testing.
 
 import uuid
 
-from sqlalchemy import Column, Text, Numeric, DateTime, Integer, ForeignKey, UniqueConstraint, Index, text
+from sqlalchemy import Column, Text, Numeric, DateTime, Integer, ForeignKey, UniqueConstraint, Index, text, CheckConstraint
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base
 
@@ -74,6 +74,11 @@ class HealingManifestRecord(Base):
     final_row_count = Column(Integer, nullable=False)
     integrity_status = Column(Text, nullable=False)
     risk_level = Column(Text, nullable=False)
+    # Phase 2.5 correction -- proves a later live-execution
+    # recomputation produces the exact same corrected output as what
+    # was actually validated here in sandbox, not just the same row
+    # count. See src/live_execution/output_fingerprint.py.
+    corrected_output_fingerprint = Column(Text, nullable=True)
 
     # Phase 2.4 -- nullable independently of ticket_id: an
     # auto-approved execution has no ticket AT ALL, but may still have
@@ -113,13 +118,37 @@ class SchemaVersionRecord(Base):
 class LiveExecutionRecord(Base):
     __tablename__ = "live_executions"
     __table_args__ = (
-        # Only one COMPLETED execution per ticket -- a failed attempt
-        # doesn't block a later retry, only a second success would.
+        # Issues 1 & 2 fix: a ticket may have AT MOST ONE non-FAILED
+        # live execution ever. FAILED attempts are retryable; PENDING/
+        # RUNNING (in-flight), COMPLETED, ROLLING_BACK, and ROLLED_BACK
+        # (executed at least once, in some stage of that) are each
+        # one-shot. Originally this only covered COMPLETED, which let
+        # a rolled-back ticket execute live again, and let two
+        # concurrent requests both pass a plain (unlocked) check
+        # before either had committed a row -- confirmed both were
+        # real gaps.
         Index(
-            "uq_live_executions_ticket_completed",
+            "uq_live_executions_ticket_active_or_done",
             "ticket_id",
             unique=True,
-            postgresql_where=text("status = 'COMPLETED'"),
+            postgresql_where=text(
+                "status IN ('PENDING', 'RUNNING', 'COMPLETED', 'ROLLING_BACK', 'ROLLED_BACK')"
+            ),
+        ),
+        # Issue 2 fix: no two DIFFERENT tickets can have an unresolved
+        # (in-flight) live execution against the same target table at
+        # once -- this is what actually stops a second concurrent
+        # promote() from racing the first at the database level,
+        # rather than relying solely on an application-level check.
+        Index(
+            "uq_live_executions_target_in_flight",
+            "target_schema", "target_table",
+            unique=True,
+            postgresql_where=text("status IN ('PENDING', 'RUNNING')"),
+        ),
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'ROLLING_BACK', 'ROLLED_BACK')",
+            name="ck_live_executions_valid_status",
         ),
     )
 

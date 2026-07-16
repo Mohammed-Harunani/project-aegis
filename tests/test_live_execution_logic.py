@@ -64,10 +64,31 @@ def test_shadow_and_backup_table_names_are_distinct_and_deterministic():
     assert shadow != backup
     assert shadow.startswith("customer_master__aegis_shadow_")
     assert backup.startswith("customer_master__aegis_backup_")
-    assert execution_id.hex in shadow
-    assert execution_id.hex in backup
     # Deterministic given the same execution_id -- calling again must match.
     assert shadow_table_name("customer_master", execution_id) == shadow
+
+
+def test_generated_names_never_exceed_postgres_identifier_limit():
+    """
+    The specific bug this replaced: a 63-char target_table name caused
+    the naive version to silently truncate away the ENTIRE suffix,
+    including the shadow/backup marker itself -- making shadow and
+    backup names identical and colliding across different executions.
+    """
+    from live_execution.identifiers import MAX_IDENTIFIER_LENGTH
+
+    long_name = "a" * 63
+    exec_id_1 = uuid.uuid4()
+    exec_id_2 = uuid.uuid4()
+
+    shadow_1 = shadow_table_name(long_name, exec_id_1)
+    backup_1 = backup_table_name(long_name, exec_id_1)
+    shadow_2 = shadow_table_name(long_name, exec_id_2)
+
+    assert len(shadow_1) <= MAX_IDENTIFIER_LENGTH
+    assert len(backup_1) <= MAX_IDENTIFIER_LENGTH
+    assert shadow_1 != backup_1, "shadow and backup must differ even when truncated"
+    assert shadow_1 != shadow_2, "different executions must not collide even when truncated"
 
 
 def test_dtype_mapping_known_types():
@@ -98,12 +119,14 @@ def _valid_gate_kwargs(**overrides):
         proposed_action="RENAME_COLUMN Customer_ID -> customer_id",
         target_schema="warehouse",
         target_table="customer_master_live",
-        source_schema=None,
-        source_table=None,
+        source_schema="raw",
+        source_table="customer_master_source",
         confirm=True,
         schema_allowlist=["warehouse"],
         already_executed_live=False,
         unresolved_execution_exists_for_target=False,
+        sandbox_output_fingerprint="abc123",
+        live_recomputed_fingerprint="abc123",
     )
     base.update(overrides)
     return base
@@ -179,7 +202,10 @@ def test_unsafe_target_identifier_rejected():
         pass
 
 
-def test_target_same_as_source_rejected_when_source_given():
+def test_target_same_as_source_rejected():
+    """source_schema/source_table are now mandatory -- originally
+    optional, which converted a mandatory safety gate into one a
+    caller could simply omit to bypass."""
     try:
         evaluate_safety_gates(**_valid_gate_kwargs(
             source_schema="warehouse", source_table="customer_master_live",
@@ -205,7 +231,9 @@ def test_missing_confirmation_rejected():
 
 def test_already_executed_live_is_a_conflict_not_a_422():
     """State conflicts (already executed, in-flight elsewhere) map to
-    409 in app.py, distinct from validity failures (422)."""
+    409 in app.py, distinct from validity failures (422). This now
+    also covers a rolled-back ticket -- originally only COMPLETED
+    blocked re-execution, letting a rolled-back ticket run again."""
     try:
         evaluate_safety_gates(**_valid_gate_kwargs(already_executed_live=True))
         assert False
@@ -221,9 +249,48 @@ def test_unresolved_execution_against_target_is_a_conflict():
         pass
 
 
+def test_missing_sandbox_fingerprint_rejected():
+    try:
+        evaluate_safety_gates(**_valid_gate_kwargs(sandbox_output_fingerprint=None))
+        assert False
+    except LiveExecutionNotAllowedError:
+        pass
+
+
+def test_fingerprint_mismatch_rejected():
+    """The core of issue 8: if the live recomputation doesn't match
+    what was actually approved in sandbox, refuse to publish --
+    something changed since approval."""
+    try:
+        evaluate_safety_gates(**_valid_gate_kwargs(
+            sandbox_output_fingerprint="abc123", live_recomputed_fingerprint="different456",
+        ))
+        assert False
+    except LiveExecutionNotAllowedError:
+        pass
+
+
+def test_matching_fingerprint_passes():
+    evaluate_safety_gates(**_valid_gate_kwargs(
+        sandbox_output_fingerprint="xyz789", live_recomputed_fingerprint="xyz789",
+    ))  # must not raise
+
+
 def test_schema_allowlist_parsing():
     import os
     os.environ["AEGIS_LIVE_TARGET_SCHEMA_ALLOWLIST"] = " warehouse , reporting ,, "
     assert get_target_schema_allowlist() == ["warehouse", "reporting"]
     del os.environ["AEGIS_LIVE_TARGET_SCHEMA_ALLOWLIST"]
     assert get_target_schema_allowlist() == []
+
+
+def test_operator_validation_strips_and_rejects_empty():
+    from live_execution.safety import validate_and_normalize_operator
+
+    assert validate_and_normalize_operator("  mo  ") == "mo"
+    for bad in ["", "   ", None]:
+        try:
+            validate_and_normalize_operator(bad)
+            assert False, f"expected rejection for {bad!r}"
+        except LiveExecutionNotAllowedError:
+            pass
