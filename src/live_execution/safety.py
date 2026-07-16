@@ -49,6 +49,30 @@ def validate_and_normalize_operator(operator: str) -> str:
     return stripped
 
 
+def verify_output_fingerprint_match(sandbox_fingerprint: Optional[str], live_fingerprint: str) -> None:
+    """
+    Separate from evaluate_safety_gates() on purpose: this can only be
+    checked AFTER Surgeon actually recomputes the correction, which
+    (per the correction pass fixing issue 1) must happen only after a
+    durable RUNNING execution record already exists -- otherwise a
+    Surgeon failure has nothing to mark FAILED and the record is
+    stuck. So this runs inside that same protected block, not as part
+    of the earlier pre-flight gate evaluation.
+    """
+    if not sandbox_fingerprint:
+        raise LiveExecutionNotAllowedError(
+            "Sandbox manifest has no recorded output fingerprint to compare "
+            "against -- cannot verify the live recomputation matches what was "
+            "actually approved."
+        )
+    if sandbox_fingerprint != live_fingerprint:
+        raise LiveExecutionNotAllowedError(
+            "The live recomputation does not match the sandbox output that was "
+            "actually approved -- something has changed since approval (code, "
+            "component versions, or repair behavior). Refusing to publish."
+        )
+
+
 def evaluate_safety_gates(
     *,
     schema_version_id: Optional[str],
@@ -66,8 +90,6 @@ def evaluate_safety_gates(
     schema_allowlist: List[str],
     already_executed_live: bool,
     unresolved_execution_exists_for_target: bool,
-    sandbox_output_fingerprint: Optional[str],
-    live_recomputed_fingerprint: str,
 ) -> None:
     """
     Raises on the first gate that fails. Returns None (silently) if
@@ -152,29 +174,12 @@ def evaluate_safety_gates(
 
     if unresolved_execution_exists_for_target:
         raise LiveExecutionConflictError(
-            f"An unresolved (PENDING/RUNNING) live execution already exists "
-            f"for {target_schema}.{target_table}."
-        )
-
-    # Correction pass (issue 8): the live recomputation must produce
-    # the exact same corrected output as what was actually validated
-    # in sandbox, not just the same row count. Between sandbox
-    # approval and a later live-execution request, code, component
-    # versions, or repair behavior could have changed -- recomputing
-    # via Surgeon rather than persisting the corrected data a second
-    # time only stays safe if this is actually checked, not assumed.
-    if not sandbox_output_fingerprint:
-        raise LiveExecutionNotAllowedError(
-            "Sandbox manifest has no recorded output fingerprint to compare "
-            "against -- cannot verify the live recomputation matches what was "
-            "actually approved."
-        )
-    if sandbox_output_fingerprint != live_recomputed_fingerprint:
-        raise LiveExecutionNotAllowedError(
-            "The live recomputation does not match the sandbox output that was "
-            "actually approved -- something has changed since approval (code, "
-            "component versions, or repair behavior). Refusing to publish."
+            f"An unresolved (PENDING/RUNNING/ROLLING_BACK) live execution already "
+            f"exists for {target_schema}.{target_table}."
         )
 
     # Gate 15 (PostgreSQL validation before promotion) happens inside
-    # the writer during the actual DDL transaction, not here.
+    # the writer during the actual DDL transaction. The sandbox/live
+    # output-fingerprint match is verified separately, via
+    # verify_output_fingerprint_match() -- see that function's
+    # docstring for why it can't be folded in here.

@@ -13,22 +13,18 @@ validate/backup/promote sequence:
   This is what makes crash recovery possible: the governance database
   and the target database are two separate connections that cannot
   share one literal commit (see Docs/phase2_5_live_execution_spec.md).
-  If the API crashes between the target transaction committing and
-  the governance record being updated, this marker is the only
-  reliable evidence of what actually happened on the target side.
-- Only tables Aegis itself created/manages (proven via a prior PROMOTE
-  marker for that exact target) can be replaced. An existing table
-  with no such marker is refused outright -- Aegis's simplified
-  shadow-table schema (column names + basic types only) would
-  silently drop primary keys, foreign keys, indexes, defaults,
-  triggers, grants, and everything else a real production table might
-  depend on, and Postgres's object-identity-based dependency tracking
-  means anything referencing the old table by its renamed-backup
-  identity wouldn't automatically follow the rename anyway.
+- Table IDENTITY, not just name, proves Aegis manages a target. A
+  historical PROMOTE marker matching the table NAME is not enough --
+  if the table were dropped and something unrelated recreated with
+  the same name, a name-only check would wrongly treat it as
+  Aegis-managed. Each PROMOTE marker records the table's Postgres OID
+  (via to_regclass()) at the moment of promotion; both the
+  managed-target check and rollback's staleness check compare the
+  CURRENT table's OID against what's recorded, not just its name.
 - Rollback refuses to proceed unless the target-side marker confirms
   this execution is still the most recent PROMOTE for that exact
-  table -- otherwise a newer execution may have since superseded it,
-  and rolling back the older one would destroy valid newer data.
+  table (by OID, not just name) -- otherwise a newer execution (or an
+  external change) may have since superseded it.
 """
 
 import uuid as uuid_module
@@ -64,14 +60,15 @@ class LiveWriteValidationError(Exception):
 
 
 class UnmanagedTargetTableError(Exception):
-    """The target table already exists with no Aegis PROMOTE marker proving
-    Aegis created/manages it -- refusing to silently take it over."""
+    """The target table already exists with no matching Aegis PROMOTE
+    marker (by current table identity, not just name) proving Aegis
+    created/manages it -- refusing to silently take it over."""
 
 
 class StaleRollbackError(Exception):
-    """This execution is not the most recent PROMOTE for its target --
-    something newer has superseded it, so rolling back would destroy
-    valid, newer data."""
+    """This execution is not the most recent PROMOTE for its target (by
+    current table identity) -- something newer has superseded it, so
+    rolling back would destroy valid, newer data."""
 
 
 class PostgresLiveWriter:
@@ -91,29 +88,46 @@ class PostgresLiveWriter:
             {"schema": schema, "table": table},
         ).scalar())
 
+    def _current_oid(self, conn, schema: str, table: str):
+        """
+        The table's current Postgres object identifier, or None if it
+        doesn't exist. Identifiers are pre-validated against a strict
+        allowlist pattern elsewhere, so passing them unquoted into
+        to_regclass()'s string argument (itself a bind parameter, not
+        string-interpolated SQL) is safe.
+        """
+        return conn.execute(
+            text("SELECT to_regclass(:qualified)::oid"),
+            {"qualified": f"{schema}.{table}"},
+        ).scalar()
+
     def _ensure_execution_log_table(self, conn, target_schema: str) -> None:
         conn.execute(text(
             f'CREATE TABLE IF NOT EXISTS "{target_schema}"."{_EXECUTION_LOG_TABLE}" ('
             f'marker_id UUID PRIMARY KEY, '
             f'live_execution_id UUID NOT NULL, '
             f'target_table TEXT NOT NULL, '
+            f'table_oid OID, '
             f'backup_table TEXT, '
             f'operation TEXT NOT NULL, '
             f'recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()'
             f')'
         ))
 
-    def _record_marker(self, conn, target_schema, execution_id, target_table, backup_table, operation) -> None:
+    def _record_marker(
+        self, conn, target_schema, execution_id, target_table, table_oid, backup_table, operation
+    ) -> None:
         conn.execute(
             text(
                 f'INSERT INTO "{target_schema}"."{_EXECUTION_LOG_TABLE}" '
-                f'(marker_id, live_execution_id, target_table, backup_table, operation) '
-                f'VALUES (:marker_id, :execution_id, :table, :backup, :operation)'
+                f'(marker_id, live_execution_id, target_table, table_oid, backup_table, operation) '
+                f'VALUES (:marker_id, :execution_id, :table, :table_oid, :backup, :operation)'
             ),
             {
                 "marker_id": str(uuid_module.uuid4()),
                 "execution_id": str(execution_id),
                 "table": target_table,
+                "table_oid": table_oid,
                 "backup": backup_table,
                 "operation": operation,
             },
@@ -133,7 +147,7 @@ class PostgresLiveWriter:
                 return []
             rows = conn.execute(
                 text(
-                    f'SELECT target_table, backup_table, operation, recorded_at '
+                    f'SELECT target_table, table_oid, backup_table, operation, recorded_at '
                     f'FROM "{target_schema}"."{_EXECUTION_LOG_TABLE}" '
                     f'WHERE live_execution_id = :id ORDER BY recorded_at'
                 ),
@@ -144,10 +158,11 @@ class PostgresLiveWriter:
     def get_latest_promote_marker(self, target_schema: str, target_table: str):
         """
         The most recent PROMOTE-operation marker for this exact table
-        name, or None. Used both for the managed-target check (an
-        existing table with no PROMOTE marker at all is not provably
-        Aegis-managed) and rollback's staleness check (is this
-        execution still the most recent PROMOTE for this target).
+        name, or None. Used both for the managed-target check and
+        rollback's staleness check -- both ALSO compare the marker's
+        recorded table_oid against the table's CURRENT oid, since a
+        name match alone doesn't prove it's the same physical table
+        (it could have been dropped and recreated by something else).
         """
         validate_identifier(target_schema, "target schema")
         validate_identifier(target_table, "target table")
@@ -156,7 +171,7 @@ class PostgresLiveWriter:
                 return None
             row = conn.execute(
                 text(
-                    f'SELECT live_execution_id, backup_table, recorded_at '
+                    f'SELECT live_execution_id, table_oid, backup_table, recorded_at '
                     f'FROM "{target_schema}"."{_EXECUTION_LOG_TABLE}" '
                     f"WHERE target_table = :table AND operation = 'PROMOTE' "
                     f'ORDER BY recorded_at DESC LIMIT 1'
@@ -164,6 +179,20 @@ class PostgresLiveWriter:
                 {"table": target_table},
             ).mappings().first()
             return dict(row) if row else None
+
+    def is_target_aegis_managed(self, target_schema: str, target_table: str) -> bool:
+        """
+        True only if the table currently at this name and schema is
+        the SAME physical table (by OID) that Aegis's most recent
+        PROMOTE marker for this name refers to -- not just that some
+        table with this name was promoted at some point in the past.
+        """
+        marker = self.get_latest_promote_marker(target_schema, target_table)
+        if marker is None:
+            return False
+        with self.engine.connect() as conn:
+            current_oid = self._current_oid(conn, target_schema, target_table)
+        return current_oid is not None and current_oid == marker["table_oid"]
 
     def promote(
         self,
@@ -193,17 +222,21 @@ class PostgresLiveWriter:
             target_exists = self._table_exists(conn, target_schema, target_table)
 
             if target_exists:
-                has_prior_promote = conn.execute(
+                marker = conn.execute(
                     text(
-                        f'SELECT EXISTS (SELECT 1 FROM "{target_schema}"."{_EXECUTION_LOG_TABLE}" '
-                        f"WHERE target_table = :table AND operation = 'PROMOTE')"
+                        f'SELECT table_oid FROM "{target_schema}"."{_EXECUTION_LOG_TABLE}" '
+                        f"WHERE target_table = :table AND operation = 'PROMOTE' "
+                        f'ORDER BY recorded_at DESC LIMIT 1'
                     ),
                     {"table": target_table},
-                ).scalar()
-                if not has_prior_promote:
+                ).mappings().first()
+                current_oid = self._current_oid(conn, target_schema, target_table)
+                if marker is None or marker["table_oid"] != current_oid:
                     raise UnmanagedTargetTableError(
-                        f'"{target_schema}"."{target_table}" already exists with no '
-                        f"Aegis PROMOTE marker proving Aegis created it. Refusing to "
+                        f'"{target_schema}"."{target_table}" already exists and is not '
+                        f"provably the same table Aegis last promoted under that name "
+                        f"(no matching marker, or the table's identity has changed since -- "
+                        f"e.g. dropped and recreated by something else). Refusing to "
                         f"replace a table that might be a real production table with "
                         f"constraints, indexes, triggers, or grants Aegis's simplified "
                         f"shadow-table schema would silently drop."
@@ -251,8 +284,13 @@ class PostgresLiveWriter:
             ))
 
             # 6. Durable target-side evidence, in the SAME transaction --
-            # exists if and only if the promotion above actually committed.
-            self._record_marker(conn, target_schema, execution_id, target_table, backup_name, "PROMOTE")
+            # exists if and only if the promotion above actually
+            # committed. Records the NEW table's OID, so future checks
+            # compare physical identity, not just name.
+            new_oid = self._current_oid(conn, target_schema, target_table)
+            self._record_marker(
+                conn, target_schema, execution_id, target_table, new_oid, backup_name, "PROMOTE"
+            )
 
         return {"backup_table": backup_name, "final_row_count": expected_row_count}
 
@@ -260,20 +298,30 @@ class PostgresLiveWriter:
         """
         Restores the previous target table from its backup. Refuses
         (StaleRollbackError) unless this execution is still the most
-        recent PROMOTE marker for this exact target -- if a newer
-        execution has since replaced it, rolling back this older one
-        would destroy valid, newer data.
+        recent PROMOTE for this exact table BY IDENTITY (OID), not
+        just name -- if a newer execution has since replaced it, or
+        the table has been externally recreated, rolling back this
+        older one would destroy valid, newer data (or nothing
+        meaningful at all).
         """
         validate_identifier(target_schema, "target schema")
         validate_identifier(target_table, "target table")
 
-        latest = self.get_latest_promote_marker(target_schema, target_table)
-        if latest is None or str(latest["live_execution_id"]) != str(execution_id):
+        marker = self.get_latest_promote_marker(target_schema, target_table)
+        with self.engine.connect() as conn:
+            current_oid = self._current_oid(conn, target_schema, target_table)
+
+        stale = (
+            marker is None
+            or str(marker["live_execution_id"]) != str(execution_id)
+            or marker["table_oid"] != current_oid
+        )
+        if stale:
             raise StaleRollbackError(
                 f'"{target_schema}"."{target_table}" has since been replaced by a '
-                f"different live execution (or has no recorded Aegis history at all) "
-                f"-- refusing to roll back an execution that is not the latest "
-                f"PROMOTE for this target."
+                f"different live execution, externally modified, or has no recorded "
+                f"Aegis history at all -- refusing to roll back an execution that is "
+                f"not provably the latest PROMOTE for this target."
             )
 
         with self.engine.begin() as conn:
@@ -285,4 +333,7 @@ class PostgresLiveWriter:
                     f'ALTER TABLE "{target_schema}"."{backup_table}" '
                     f'RENAME TO "{target_table}"'
                 ))
-            self._record_marker(conn, target_schema, execution_id, target_table, None, "ROLLBACK")
+            restored_oid = self._current_oid(conn, target_schema, target_table)
+            self._record_marker(
+                conn, target_schema, execution_id, target_table, restored_oid, None, "ROLLBACK"
+            )

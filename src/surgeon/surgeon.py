@@ -186,6 +186,7 @@ class AegisSurgeon:
             final_row_count=final_row_count,
             integrity_status=integrity_status,
             risk_level=risk_level,
+            corrected_dataset=working_df.copy(),
         )
 
         return execution_result, manifest

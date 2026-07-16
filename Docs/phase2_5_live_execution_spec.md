@@ -183,3 +183,74 @@ this phase, docker/init-test-db.sql won't re-run automatically (it
 only fires on first container initialization) -- create
 aegis_live_test manually first; see the runbook at the top of
 tests/test_live_execution_api.py.
+
+## Second correction pass
+
+A further review found the first correction pass had real gaps of its
+own -- including that my fix for the Surgeon-failure issue had been
+silently undone by a later reordering I made to support fingerprint
+checking, without re-verifying it. Nine issues, all addressed:
+
+1. **Surgeon failure was STILL unprotected** -- moving Surgeon earlier
+   (to support the fingerprint gate) put it back outside the
+   try/except. Fixed by restructuring the whole endpoint: all non-
+   Surgeon gates evaluate first, the execution record is created
+   (already RUNNING, see #5), and ONLY THEN does Surgeon run, inside
+   the same try/except as fingerprint verification and target
+   publication.
+2. **ROLLING_BACK wasn't in the target-level in-flight index** -- a
+   target actively being rolled back is still busy; a new publication
+   could start against it mid-rollback. Fixed in both the model and
+   the migration.
+3. **Rollback crash recovery didn't exist** -- reconcile_running()
+   only handled the promote side. Added reconcile_rolling_back(),
+   using the target-side ROLLBACK marker the writer already records.
+4. **Reconciliation could fail an operation still legitimately in
+   progress** -- the original design reconciled the instant it saw no
+   marker, which would wrongly fail a target write that just hadn't
+   committed yet. Both reconciliation paths are now staleness-gated
+   (AEGIS_LIVE_EXECUTION_STALE_SECONDS, default 300s) and only act
+   once a record has sat unchanged longer than that.
+5. **PENDING could be permanently stranded** -- create_pending() and
+   mark_running() were separate commits with a crash window between
+   them and no reconciliation path for PENDING. Replaced with
+   create_running(), which creates the record already RUNNING in one
+   committed insert.
+6. **The stored fingerprint wasn't from the actual sandbox execution**
+   -- it came from a second, redundant Surgeon call, which only
+   proved two invocations agreed with each other, not that either
+   matched the real manifest. Fixed properly: HealingManifest now
+   carries corrected_dataset (never persisted -- manifest_repository.py
+   doesn't reference the field, so it's simply not written to the
+   database), populated by Surgeon itself. Required touching
+   Surgeon.py and the manifest dataclass, both previously
+   deliberately left alone -- verified first that test_surgeon.py
+   only does field-by-field assertions, never whole-object equality,
+   so adding an optional field was safe, and separately verified that
+   compare=False was necessary (DataFrame equality isn't a plain
+   bool and would otherwise break dataclass auto-eq the moment two
+   manifests were ever compared).
+7. **Manifest-to-ticket consistency wasn't checked** -- added explicit
+   verification that the sandbox manifest's execution_mode, lineage,
+   and repair plan all match the ticket before proceeding.
+8. **A historical name match didn't prove current table identity** --
+   if an Aegis-published table were dropped and something unrelated
+   recreated with the same name, the old marker would have still
+   matched by name. Every PROMOTE marker now records the table's
+   Postgres OID (via to_regclass()), and both the managed-target check
+   and rollback's staleness check compare current OID against the
+   marker's, not just the name.
+9. **LIVE_DATABASE_URL didn't verify it was actually PostgreSQL** --
+   now checks parsed.drivername and rejects an empty database name.
+
+Also fixed: evaluate_safety_gates() no longer takes fingerprint
+parameters (they required Surgeon to have already run, which
+conflicts with gate evaluation happening before Surgeon per #1) --
+verify_output_fingerprint_match() is now a separate function, called
+inside the protected block after Surgeon actually recomputes.
+
+**This documentation is being updated in the same commit as the code
+it describes**, specifically to avoid the kind of drift a prior
+review caught (spec still describing source fields as optional and
+Surgeon being called once, after the implementation had already
+changed).

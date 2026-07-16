@@ -21,6 +21,7 @@ from live_execution.safety import (
     LiveExecutionConflictError,
     evaluate_safety_gates,
     get_target_schema_allowlist,
+    verify_output_fingerprint_match,
 )
 
 
@@ -125,8 +126,6 @@ def _valid_gate_kwargs(**overrides):
         schema_allowlist=["warehouse"],
         already_executed_live=False,
         unresolved_execution_exists_for_target=False,
-        sandbox_output_fingerprint="abc123",
-        live_recomputed_fingerprint="abc123",
     )
     base.update(overrides)
     return base
@@ -251,7 +250,7 @@ def test_unresolved_execution_against_target_is_a_conflict():
 
 def test_missing_sandbox_fingerprint_rejected():
     try:
-        evaluate_safety_gates(**_valid_gate_kwargs(sandbox_output_fingerprint=None))
+        verify_output_fingerprint_match(sandbox_fingerprint=None, live_fingerprint="anything")
         assert False
     except LiveExecutionNotAllowedError:
         pass
@@ -262,18 +261,14 @@ def test_fingerprint_mismatch_rejected():
     what was actually approved in sandbox, refuse to publish --
     something changed since approval."""
     try:
-        evaluate_safety_gates(**_valid_gate_kwargs(
-            sandbox_output_fingerprint="abc123", live_recomputed_fingerprint="different456",
-        ))
+        verify_output_fingerprint_match(sandbox_fingerprint="abc123", live_fingerprint="different456")
         assert False
     except LiveExecutionNotAllowedError:
         pass
 
 
 def test_matching_fingerprint_passes():
-    evaluate_safety_gates(**_valid_gate_kwargs(
-        sandbox_output_fingerprint="xyz789", live_recomputed_fingerprint="xyz789",
-    ))  # must not raise
+    verify_output_fingerprint_match(sandbox_fingerprint="xyz789", live_fingerprint="xyz789")  # must not raise
 
 
 def test_schema_allowlist_parsing():

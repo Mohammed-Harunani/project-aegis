@@ -44,6 +44,7 @@ def upgrade() -> None:
         sa.Column("requested_by", sa.Text, nullable=False),
         sa.Column("started_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("completed_at", sa.DateTime(timezone=True), nullable=True),
+        sa.Column("rollback_started_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("rolled_back_by", sa.Text, nullable=True),
         sa.Column("rolled_back_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("failure_reason", sa.Text, nullable=True),
@@ -74,12 +75,14 @@ def upgrade() -> None:
     # against the same target table at once -- this is what actually
     # stops a second concurrent promote() at the database level,
     # rather than relying solely on an application-level check.
+    # ROLLING_BACK is included: a target actively being rolled back is
+    # still busy.
     op.create_index(
         "uq_live_executions_target_in_flight",
         "live_executions",
         ["target_schema", "target_table"],
         unique=True,
-        postgresql_where=sa.text("status IN ('PENDING', 'RUNNING')"),
+        postgresql_where=sa.text("status IN ('PENDING', 'RUNNING', 'ROLLING_BACK')"),
     )
 
     # Phase 2.5 correction -- proves a later live-execution

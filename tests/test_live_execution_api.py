@@ -39,6 +39,7 @@ TEST_DATABASE_URL = get_verified_test_database_url()
 LIVE_TEST_DATABASE_URL = get_verified_live_test_database_url()
 
 os.environ["AEGIS_LIVE_TARGET_SCHEMA_ALLOWLIST"] = "public"
+os.environ["AEGIS_LIVE_EXECUTION_STALE_SECONDS"] = "0"
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, text, inspect as sa_inspect
@@ -388,6 +389,164 @@ def test_stale_rollback_refused_when_a_newer_execution_supersedes():
         assert [r[0] for r in current] == [1, 2, 3], "the newer execution's data must survive untouched"
 
 
+def test_reconciliation_heals_a_stuck_rolling_back_record():
+    """Issue 3: the rollback counterpart to the RUNNING reconciliation
+    test -- a rollback whose target-side ROLLBACK marker committed,
+    but whose governance record never advanced past ROLLING_BACK."""
+    ticket_id, _ = _register_and_approve_registry_ticket()
+    executed = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_live_19"),
+    ).json()
+
+    with TestSessionLocal() as db:
+        live_repo = LiveExecutionRepository(db)
+        record = live_repo.mark_rolling_back(executed["live_execution_id"], operator="mo")
+
+        writer = PostgresLiveWriter(live_target_engine)
+        writer.rollback(
+            target_schema="public",
+            target_table="customer_master_live_19",
+            backup_table=record.backup_table,
+            execution_id=record.live_execution_id,
+        )
+        stuck_id = str(record.live_execution_id)
+
+    fetched = client.get(f"/live-executions/{stuck_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["status"] == "ROLLED_BACK"
+
+
+def test_staleness_gate_prevents_premature_reconciliation():
+    """
+    Issue 4: a RUNNING record with no marker yet must NOT be
+    immediately marked FAILED -- it might simply still be legitimately
+    in progress. Sets the staleness threshold high for this one test
+    specifically (opposite of the module-level override to 0) to
+    prove a fresh record is left alone.
+    """
+    ticket_id, schema_version_id = _register_and_approve_registry_ticket()
+
+    with TestSessionLocal() as db:
+        from src.governance.approval_repository import PostgresApprovalRepository
+        manifest = db.query(HealingManifestRecord).filter(
+            HealingManifestRecord.ticket_id == __import__("uuid").UUID(ticket_id)
+        ).one()
+        live_repo = LiveExecutionRepository(db)
+        live_record = live_repo.create_running(
+            ticket_id=ticket_id,
+            sandbox_manifest_id=str(manifest.manifest_id),
+            schema_version_id=schema_version_id,
+            target_schema="public",
+            target_table="customer_master_live_20",
+            requested_by="mo",
+            original_row_count=manifest.original_row_count,
+            final_row_count=manifest.final_row_count,
+            risk_level=manifest.risk_level,
+            integrity_status=manifest.integrity_status,
+        )
+        stuck_id = str(live_record.live_execution_id)
+        # No writer.promote() call at all -- simulates a target
+        # transaction that hasn't committed (or even started) yet.
+
+    old_threshold = os.environ.get("AEGIS_LIVE_EXECUTION_STALE_SECONDS")
+    os.environ["AEGIS_LIVE_EXECUTION_STALE_SECONDS"] = "3600"
+    try:
+        fetched = client.get(f"/live-executions/{stuck_id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["status"] == "RUNNING", (
+            "a fresh RUNNING record with no marker must NOT be reconciled to "
+            "FAILED before the staleness threshold has passed -- it might "
+            "still be legitimately in progress"
+        )
+    finally:
+        if old_threshold is not None:
+            os.environ["AEGIS_LIVE_EXECUTION_STALE_SECONDS"] = old_threshold
+        else:
+            os.environ.pop("AEGIS_LIVE_EXECUTION_STALE_SECONDS", None)
+
+
+def test_recreated_table_with_same_name_is_refused():
+    """
+    Issue 8: a historical PROMOTE marker matching the table NAME is
+    not enough to prove the CURRENT table is the same one Aegis
+    created -- if it were dropped and something else recreated a
+    same-named table, that must be refused too, not just a never-
+    promoted table.
+    """
+    first_ticket, _ = _register_and_approve_registry_ticket()
+    client.post(
+        f"/approvals/{first_ticket}/execute-live",
+        json=_execute_live_body("customer_master_live_21"),
+    )
+
+    # Simulates external interference: drop the Aegis-created table and
+    # recreate an unrelated one with the same name (different OID).
+    with live_target_engine.begin() as conn:
+        conn.execute(text('DROP TABLE "public"."customer_master_live_21"'))
+        conn.execute(text('CREATE TABLE "public"."customer_master_live_21" (customer_id BIGINT)'))
+        conn.execute(text('INSERT INTO "public"."customer_master_live_21" VALUES (777)'))
+
+    second_ticket, _ = _register_and_approve_registry_ticket()
+    response = client.post(
+        f"/approvals/{second_ticket}/execute-live",
+        json=_execute_live_body("customer_master_live_21"),
+    )
+    assert response.status_code == 422
+
+    with live_target_engine.connect() as conn:
+        untouched = conn.execute(text(
+            'SELECT customer_id FROM "public"."customer_master_live_21"'
+        )).fetchall()
+        assert [r[0] for r in untouched] == [777], "the recreated table must be left untouched"
+
+
+def test_new_publication_blocked_while_rollback_in_flight():
+    """Issue 2: a target actively being rolled back (ROLLING_BACK) must
+    block a new publication attempt against the same target, not just
+    PENDING/RUNNING."""
+    ticket_id, _ = _register_and_approve_registry_ticket()
+    executed = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_live_22"),
+    ).json()
+
+    with TestSessionLocal() as db:
+        LiveExecutionRepository(db).mark_rolling_back(executed["live_execution_id"], operator="mo")
+        # Deliberately don't finish the rollback -- leaves the record
+        # ROLLING_BACK, simulating that operation still being in flight.
+
+    other_ticket, _ = _register_and_approve_registry_ticket()
+    response = client.post(
+        f"/approvals/{other_ticket}/execute-live",
+        json=_execute_live_body("customer_master_live_22"),
+    )
+    assert response.status_code == 409
+
+
+def test_manifest_execution_mode_mismatch_is_refused():
+    """
+    Issue 7: defensive consistency check -- if the sandbox manifest
+    somehow doesn't say execution_mode == "sandbox" (simulated here via
+    direct DB manipulation, since the normal flow can't produce this),
+    live execution must refuse rather than trust it blindly.
+    """
+    ticket_id, _ = _register_and_approve_registry_ticket()
+
+    with TestSessionLocal() as db:
+        manifest = db.query(HealingManifestRecord).filter(
+            HealingManifestRecord.ticket_id == __import__("uuid").UUID(ticket_id)
+        ).one()
+        manifest.execution_mode = "corrupted"
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_live_23"),
+    )
+    assert response.status_code == 422
+
+
 def test_surgeon_failure_during_execute_live_marks_failed_not_stuck_running():
     """Issue 3: a Surgeon failure used to happen OUTSIDE the try/except,
     leaving the record permanently RUNNING."""
@@ -441,7 +600,7 @@ def test_reconciliation_heals_a_stuck_running_record():
         ).one()
 
         live_repo = LiveExecutionRepository(db)
-        live_record = live_repo.create_pending(
+        live_record = live_repo.create_running(
             ticket_id=ticket_id,
             sandbox_manifest_id=str(manifest.manifest_id),
             schema_version_id=schema_version_id,
@@ -453,7 +612,6 @@ def test_reconciliation_heals_a_stuck_running_record():
             risk_level=manifest.risk_level,
             integrity_status=manifest.integrity_status,
         )
-        live_repo.mark_running(live_record.live_execution_id)
 
         # Directly invoke the writer -- simulates the target transaction
         # committing successfully, without ever calling mark_completed().
@@ -525,7 +683,7 @@ def test_migration_0003_creates_expected_tables_and_columns():
     expected = {
         "live_execution_id", "ticket_id", "sandbox_manifest_id", "schema_version_id",
         "target_schema", "target_table", "backup_table", "status", "requested_by",
-        "started_at", "completed_at", "rolled_back_by", "rolled_back_at",
+        "started_at", "completed_at", "rollback_started_at", "rolled_back_by", "rolled_back_at",
         "failure_reason", "original_row_count", "final_row_count", "risk_level",
         "integrity_status",
     }

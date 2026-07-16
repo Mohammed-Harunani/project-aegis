@@ -34,6 +34,7 @@ from src.live_execution.safety import (
     live_execution_globally_enabled,
     get_target_schema_allowlist,
     validate_and_normalize_operator,
+    verify_output_fingerprint_match,
     evaluate_safety_gates,
 )
 from src.live_execution.repository import (
@@ -253,27 +254,12 @@ def simulate_migration(request: MigrationRequest, db: Session = Depends(get_db))
             operator="api_user",
             execution_mode="sandbox"
         )
-        # Phase 2.5 correction: the corrected_output_fingerprint stored
-        # on the manifest is what a later live-execution recomputation
-        # gets compared against. Surgeon's "sandbox" mode above makes
-        # its own internal copy and discards it without returning it
-        # (confirmed directly, see Docs/phase2_5_live_execution_spec.md),
-        # so getting the corrected DataFrame out requires a second,
-        # throwaway call using "live" mode's in-place-mutation behavior
-        # on a fresh copy -- this result is used only to fingerprint,
-        # never persisted or returned, and the OFFICIAL manifest above
-        # still correctly records execution_mode="sandbox".
-        fingerprint_copy = df_observed.copy()
-        surgeon.execute(
-            repair_plan=selected_plan,
-            observed_schema=observed_schema_obj,
-            gold_schema=gold_schema_obj,
-            target_dataset=fingerprint_copy,
-            operator="api_user",
-            execution_mode="live",
-            allowed_modes=["sandbox", "live"],
-        )
-        corrected_output_fingerprint = compute_dataframe_fingerprint(fingerprint_copy)
+        # Phase 2.5 correction: fingerprint the ACTUAL corrected output
+        # this exact sandbox execution produced (manifest.corrected_dataset),
+        # not a separate recomputation. A redundant second Surgeon call
+        # only proves two invocations agree with each other, not that
+        # either one matches what this manifest actually represents.
+        corrected_output_fingerprint = compute_dataframe_fingerprint(manifest.corrected_dataset)
 
         # No approval ticket for an auto-approved repair (ticket_id
         # stays null on the manifest -- see healing_manifests schema).
@@ -400,23 +386,11 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
             operator=request.operator,
             execution_mode="sandbox",
         )
-        # Phase 2.5 correction: same technique as the AUTO_APPROVE path
-        # above -- a throwaway "live"-mode call on a fresh copy, purely
-        # to obtain the corrected DataFrame for fingerprinting, since
-        # "sandbox" mode discards its internal copy without returning
-        # it. Never persisted or returned itself; the official manifest
-        # still correctly records execution_mode="sandbox".
-        fingerprint_copy = ticket.target_dataset.copy()
-        surgeon.execute(
-            repair_plan=ticket.repair_plan,
-            observed_schema=ticket.observed_schema,
-            gold_schema=ticket.gold_schema,
-            target_dataset=fingerprint_copy,
-            operator=request.operator,
-            execution_mode="live",
-            allowed_modes=["sandbox", "live"],
-        )
-        corrected_output_fingerprint = compute_dataframe_fingerprint(fingerprint_copy)
+        # Phase 2.5 correction: fingerprint the ACTUAL corrected output
+        # this exact sandbox execution produced, not a separate
+        # recomputation -- see the AUTO_APPROVE branch above for why
+        # that distinction matters.
+        corrected_output_fingerprint = compute_dataframe_fingerprint(manifest.corrected_dataset)
 
         # Manifest inherits the ticket's own lineage -- whatever
         # schema version the ticket was validated against is what it
@@ -619,40 +593,54 @@ def execute_live(
         .first()
     )
 
+    # Manifest-to-ticket consistency (issue 7) -- cheap, DB-only checks,
+    # done before anything else touches Surgeon or creates a record.
+    if manifest_record is None:
+        raise HTTPException(
+            status_code=422, detail="No sandbox Healing Manifest found for this ticket."
+        )
+    if manifest_record.execution_mode != "sandbox":
+        raise HTTPException(
+            status_code=422,
+            detail=f"Sandbox manifest has unexpected execution_mode {manifest_record.execution_mode!r}.",
+        )
+    if str(manifest_record.schema_version_id) != str(ticket.schema_version_id):
+        raise HTTPException(
+            status_code=422,
+            detail="Manifest schema_version_id does not match the ticket's own lineage.",
+        )
+    if (
+        manifest_record.repair_plan.get("proposed_action") != ticket.repair_plan.proposed_action
+        or manifest_record.repair_plan.get("confidence") != ticket.repair_plan.confidence
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Manifest repair plan does not match the ticket's repair plan.",
+        )
+    # Implicit in the query filter above (manifest_record can only be
+    # found via ticket_id == this ticket) -- asserted anyway as
+    # defense against a future query change.
+    if str(manifest_record.ticket_id) != str(ticket.ticket_id):
+        raise HTTPException(
+            status_code=422, detail="Manifest ticket_id does not match (should be unreachable)."
+        )
+
     live_repo = LiveExecutionRepository(db)
 
-    # Deterministically recompute the correction rather than persist a
-    # second copy of it anywhere -- reuses Surgeon's dormant "live"
-    # mode from Phase 1 (confirmed directly: mutates target_dataset in
-    # place instead of returning a new one). Operates on a copy of the
-    # ticket's own stored snapshot so that snapshot itself is untouched.
-    # Done BEFORE the gate check specifically so the fingerprint gate
-    # (issue 8) can compare against it in the same evaluate_safety_gates
-    # call as everything else, rather than as a separate, easy-to-miss
-    # check bolted on afterward.
-    surgeon = AegisSurgeon()
-    working_copy = ticket.target_dataset.copy()
-    surgeon.execute(
-        repair_plan=ticket.repair_plan,
-        observed_schema=ticket.observed_schema,
-        gold_schema=ticket.gold_schema,
-        target_dataset=working_copy,
-        operator=request.operator,
-        execution_mode="live",
-        allowed_modes=["sandbox", "live"],
-    )
-    live_recomputed_fingerprint = compute_dataframe_fingerprint(working_copy)
-
+    # Every gate that doesn't require actually running Surgeon --
+    # fingerprint comparison happens separately, below, inside the
+    # protected block, since it can only be checked after Surgeon
+    # recomputes (issue 1: Surgeon must not run before a durable
+    # execution record exists, or a failure has nothing to mark
+    # FAILED and leaves nothing for a caller to even look up).
     try:
         evaluate_safety_gates(
             schema_version_id=ticket.schema_version_id,
-            sandbox_manifest_applied=bool(
-                manifest_record and manifest_record.execution_result.get("applied", False)
-            ),
-            sandbox_risk_level=manifest_record.risk_level if manifest_record else "",
-            sandbox_integrity_status=manifest_record.integrity_status if manifest_record else "",
-            original_row_count=manifest_record.original_row_count if manifest_record else -1,
-            final_row_count=manifest_record.final_row_count if manifest_record else -2,
+            sandbox_manifest_applied=bool(manifest_record.execution_result.get("applied", False)),
+            sandbox_risk_level=manifest_record.risk_level,
+            sandbox_integrity_status=manifest_record.integrity_status,
+            original_row_count=manifest_record.original_row_count,
+            final_row_count=manifest_record.final_row_count,
             proposed_action=ticket.repair_plan.proposed_action,
             target_schema=request.target_schema,
             target_table=request.target_table,
@@ -664,23 +652,22 @@ def execute_live(
             unresolved_execution_exists_for_target=live_repo.has_unresolved_execution_for_target(
                 request.target_schema, request.target_table
             ),
-            sandbox_output_fingerprint=(
-                manifest_record.corrected_output_fingerprint if manifest_record else None
-            ),
-            live_recomputed_fingerprint=live_recomputed_fingerprint,
         )
     except LiveExecutionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
     except LiveExecutionNotAllowedError as e:
         raise HTTPException(status_code=422, detail=str(e))
 
+    # Created already RUNNING, in one committed insert (issue 5 fix --
+    # a separate PENDING-then-RUNNING pair of commits left a crash
+    # window where the record could be stranded at PENDING forever).
     # The database-enforced backstop against the same race the ticket
-    # lock above already guards against -- if create_pending() still
-    # hits a partial-unique-index violation (e.g. a concurrent request
+    # lock above already guards against -- if this still hits a
+    # partial-unique-index violation (e.g. a concurrent request
     # against the same TARGET from a DIFFERENT ticket, which the
     # ticket lock alone wouldn't catch), it's converted to 409 here.
     try:
-        live_record = live_repo.create_pending(
+        live_record = live_repo.create_running(
             ticket_id=ticket_id,
             sandbox_manifest_id=str(manifest_record.manifest_id),
             schema_version_id=ticket.schema_version_id,
@@ -695,14 +682,37 @@ def execute_live(
     except LiveExecutionConflictError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
-    live_repo.mark_running(live_record.live_execution_id)
-
-    # Everything from here to mark_completed() is protected -- a
-    # Surgeon failure used to happen OUTSIDE this block, leaving the
-    # record permanently RUNNING (and, per the in-flight unique index,
-    # permanently blocking that target too).
+    # Everything from here to mark_completed() is protected in one
+    # failure-handling block (issue 1 fix): Surgeon recomputation,
+    # fingerprint verification, and target publication. A failure at
+    # ANY point marks the (already-durable) record FAILED rather than
+    # leaving it stuck RUNNING or, worse, never having existed at all.
     writer = PostgresLiveWriter(live_engine)
     try:
+        # Deterministically recompute the correction rather than
+        # persist a second copy of it anywhere -- reuses Surgeon's
+        # dormant "live" mode from Phase 1 (confirmed directly:
+        # mutates target_dataset in place instead of returning a new
+        # one). Operates on a copy of the ticket's own stored snapshot
+        # so that snapshot itself is untouched.
+        surgeon = AegisSurgeon()
+        working_copy = ticket.target_dataset.copy()
+        surgeon.execute(
+            repair_plan=ticket.repair_plan,
+            observed_schema=ticket.observed_schema,
+            gold_schema=ticket.gold_schema,
+            target_dataset=working_copy,
+            operator=request.operator,
+            execution_mode="live",
+            allowed_modes=["sandbox", "live"],
+        )
+
+        live_recomputed_fingerprint = compute_dataframe_fingerprint(working_copy)
+        verify_output_fingerprint_match(
+            sandbox_fingerprint=manifest_record.corrected_output_fingerprint,
+            live_fingerprint=live_recomputed_fingerprint,
+        )
+
         result = writer.promote(
             target_schema=request.target_schema,
             target_table=request.target_table,
@@ -710,6 +720,9 @@ def execute_live(
             execution_id=live_record.live_execution_id,
             expected_row_count=manifest_record.final_row_count,
         )
+    except LiveExecutionNotAllowedError as e:
+        live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
+        raise HTTPException(status_code=422, detail=str(e))
     except UnmanagedTargetTableError as e:
         live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
         raise HTTPException(status_code=422, detail=str(e))
@@ -749,16 +762,21 @@ def get_live_execution(
     except LiveExecutionNotFoundError:
         raise HTTPException(status_code=404, detail="Live execution not found.")
 
-    # Crash-recovery reconciliation (issue 4): a record stuck RUNNING
-    # means the API may have crashed between the target transaction
-    # committing and mark_completed() running. The target-side marker
-    # is the only reliable evidence of what actually happened --
-    # reconcile on read rather than leaving it permanently RUNNING
-    # (which would also permanently block that target under the
-    # in-flight uniqueness index).
+    # Crash-recovery reconciliation (issues 3 & 4): a record stuck
+    # RUNNING or ROLLING_BACK means the API may have crashed between
+    # the target transaction committing and the governance update
+    # running. The target-side marker is the only reliable evidence of
+    # what actually happened. Staleness-gated (issue 4): only acts
+    # after AEGIS_LIVE_EXECUTION_STALE_SECONDS have passed, since a
+    # fresh RUNNING/ROLLING_BACK record might simply still be
+    # legitimately in progress -- reconciling immediately would
+    # incorrectly fail an operation that could still succeed.
     if record.status == "RUNNING":
         writer = PostgresLiveWriter(live_engine)
         record = live_repo.reconcile_running(live_execution_id, writer)
+    elif record.status == "ROLLING_BACK":
+        writer = PostgresLiveWriter(live_engine)
+        record = live_repo.reconcile_rolling_back(live_execution_id, writer)
 
     return {
         "live_execution_id": str(record.live_execution_id),
@@ -819,7 +837,7 @@ def rollback_live_execution(
         )
 
     try:
-        record = live_repo.mark_rolling_back(live_execution_id)
+        record = live_repo.mark_rolling_back(live_execution_id, operator=request.operator)
     except LiveExecutionInvalidStateError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
@@ -851,7 +869,7 @@ def rollback_live_execution(
             ),
         )
 
-    updated = live_repo.mark_rolled_back(live_execution_id, rolled_back_by=request.operator)
+    updated = live_repo.mark_rolled_back(live_execution_id)
 
     return {
         "live_execution_id": str(updated.live_execution_id),

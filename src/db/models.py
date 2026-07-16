@@ -118,15 +118,9 @@ class SchemaVersionRecord(Base):
 class LiveExecutionRecord(Base):
     __tablename__ = "live_executions"
     __table_args__ = (
-        # Issues 1 & 2 fix: a ticket may have AT MOST ONE non-FAILED
-        # live execution ever. FAILED attempts are retryable; PENDING/
-        # RUNNING (in-flight), COMPLETED, ROLLING_BACK, and ROLLED_BACK
-        # (executed at least once, in some stage of that) are each
-        # one-shot. Originally this only covered COMPLETED, which let
-        # a rolled-back ticket execute live again, and let two
-        # concurrent requests both pass a plain (unlocked) check
-        # before either had committed a row -- confirmed both were
-        # real gaps.
+        # A ticket may have AT MOST ONE non-FAILED live execution ever.
+        # FAILED attempts are retryable; anything else (in-flight or
+        # executed-in-some-form) is one-shot.
         Index(
             "uq_live_executions_ticket_active_or_done",
             "ticket_id",
@@ -135,16 +129,16 @@ class LiveExecutionRecord(Base):
                 "status IN ('PENDING', 'RUNNING', 'COMPLETED', 'ROLLING_BACK', 'ROLLED_BACK')"
             ),
         ),
-        # Issue 2 fix: no two DIFFERENT tickets can have an unresolved
-        # (in-flight) live execution against the same target table at
-        # once -- this is what actually stops a second concurrent
-        # promote() from racing the first at the database level,
-        # rather than relying solely on an application-level check.
+        # No two different tickets can have an unresolved (in-flight)
+        # live execution against the same target table at once.
+        # ROLLING_BACK is included -- a target actively being rolled
+        # back is still busy; the target database is being mutated by
+        # that operation, so a new promote() must not race it.
         Index(
             "uq_live_executions_target_in_flight",
             "target_schema", "target_table",
             unique=True,
-            postgresql_where=text("status IN ('PENDING', 'RUNNING')"),
+            postgresql_where=text("status IN ('PENDING', 'RUNNING', 'ROLLING_BACK')"),
         ),
         CheckConstraint(
             "status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'ROLLING_BACK', 'ROLLED_BACK')",
@@ -167,6 +161,13 @@ class LiveExecutionRecord(Base):
     requested_by = Column(Text, nullable=False)
     started_at = Column(DateTime(timezone=True), nullable=False)
     completed_at = Column(DateTime(timezone=True), nullable=True)
+    # Phase 2.5 correction: set when mark_rolling_back() transitions the
+    # record, BEFORE the risky target-side operation begins -- this is
+    # what lets staleness-based reconciliation of a stuck ROLLING_BACK
+    # record work without needing a fresh "who requested this" input
+    # (the original HTTP requester may never get a response if the
+    # process crashes mid-rollback).
+    rollback_started_at = Column(DateTime(timezone=True), nullable=True)
     rolled_back_by = Column(Text, nullable=True)
     rolled_back_at = Column(DateTime(timezone=True), nullable=True)
     failure_reason = Column(Text, nullable=True)

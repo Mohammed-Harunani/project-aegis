@@ -6,23 +6,32 @@ mutation happens in a separate database via PostgresLiveWriter (see
 Docs/phase2_5_live_execution_spec.md for why these are two connections,
 not one literal atomic transaction).
 
-Correction-pass additions:
-- has_executed_live() now covers ROLLED_BACK, not just COMPLETED --
+Correction-pass design:
+- create_running() creates the record ALREADY in RUNNING status, in
+  one committed insert -- not a separate PENDING-then-RUNNING pair of
+  commits. A crash between two separate commits would strand the
+  record at PENDING forever with no reconciliation path; going
+  straight to RUNNING removes that window entirely for this
+  synchronous endpoint. PENDING remains a valid status in the schema
+  (for forward compatibility with a possible future async model) but
+  nothing here creates one.
+- has_executed_live() covers ROLLED_BACK, not just COMPLETED --
   originally a rolled-back ticket could be executed live again.
-- create_pending() catches the two partial-unique-index violations
-  (one ticket, one active-execution-per-ticket) and converts them to
-  a single clear conflict error -- the database constraint is the
-  real enforcement against a race; the pre-flight checks in app.py
-  are a fast, clear-message path for the common (non-racing) case.
-- mark_rolling_back() / is_latest_completed_execution_for_target()
-  support the rollback staleness check (issue 5) at the governance
-  level, alongside PostgresLiveWriter's target-side marker check.
-- reconcile_running() recovers a stuck RUNNING record's true state by
-  consulting the target-side marker table when the governance update
-  after a successful (or failed) target-side operation never
-  happened -- e.g. the API process crashed in between (issue 4).
+- Reconciliation (reconcile_running / reconcile_rolling_back) is
+  staleness-gated: it only acts after AEGIS_LIVE_EXECUTION_STALE_SECONDS
+  has passed since the record entered its current state. Without this,
+  a GET request arriving while a legitimately still-in-progress
+  operation hasn't committed yet would incorrectly mark it FAILED --
+  confirmed this was a real bug in the first version, which reconciled
+  immediately on seeing no marker.
+- mark_rolling_back() records who requested the rollback and when
+  BEFORE the risky target-side operation begins, specifically so a
+  crashed/orphaned rollback can still be reconciled to ROLLED_BACK
+  later without needing to ask "who did this" again (the original
+  requester may never get an HTTP response).
 """
 
+import os
 import uuid
 from datetime import datetime, UTC
 from typing import Optional
@@ -49,19 +58,28 @@ class LiveExecutionInvalidStateError(Exception):
 # one-shot per ticket, matching the partial unique index in the model.
 _TICKET_ACTIVE_OR_DONE_STATUSES = ("PENDING", "RUNNING", "COMPLETED", "ROLLING_BACK", "ROLLED_BACK")
 
+# Statuses that mean "this exact target table is currently busy" --
+# ROLLING_BACK is included: the target database is actively being
+# mutated by that operation too.
+_TARGET_IN_FLIGHT_STATUSES = ("PENDING", "RUNNING", "ROLLING_BACK")
+
+
+def _stale_threshold_seconds() -> int:
+    """
+    How long a RUNNING or ROLLING_BACK record must sit unchanged
+    before reconciliation is willing to act on it. Below this, a
+    markerless record could just be a legitimately still-in-progress
+    operation -- reconciling immediately would incorrectly fail
+    something that might commit successfully moments later.
+    """
+    return int(os.environ.get("AEGIS_LIVE_EXECUTION_STALE_SECONDS", "300"))
+
 
 class LiveExecutionRepository:
     def __init__(self, db: Session):
         self.db = db
 
     def has_executed_live(self, ticket_id: str) -> bool:
-        """
-        True if this ticket has a live execution that is in-flight,
-        completed, or completed-then-rolled-back. Originally only
-        checked COMPLETED, which let a rolled-back ticket execute
-        live again -- ROLLED_BACK still counts as "already executed"
-        for the purposes of the one-shot-per-ticket rule.
-        """
         return (
             self.db.query(LiveExecutionRecord)
             .filter(
@@ -78,7 +96,7 @@ class LiveExecutionRepository:
             .filter(
                 LiveExecutionRecord.target_schema == target_schema,
                 LiveExecutionRecord.target_table == target_table,
-                LiveExecutionRecord.status.in_(["PENDING", "RUNNING"]),
+                LiveExecutionRecord.status.in_(_TARGET_IN_FLIGHT_STATUSES),
             )
             .first()
             is not None
@@ -89,12 +107,12 @@ class LiveExecutionRepository:
     ) -> bool:
         """
         Governance-side counterpart to PostgresLiveWriter's target-side
-        marker check (issue 5) -- confirms no COMPLETED execution
-        newer than this one exists for the same target. Both checks
-        are required: this one guards against governance-recorded
-        supersession, the target-side marker guards against the
-        target table itself having been changed by something the
-        governance database doesn't know about.
+        identity check -- confirms no COMPLETED execution newer than
+        this one exists for the same target. Both checks are required:
+        this one guards against governance-recorded supersession, the
+        target-side OID check guards against the target table itself
+        having been changed by something the governance database
+        doesn't know about.
         """
         latest = (
             self.db.query(LiveExecutionRecord)
@@ -108,7 +126,7 @@ class LiveExecutionRepository:
         )
         return latest is not None and str(latest.live_execution_id) == str(live_execution_id)
 
-    def create_pending(
+    def create_running(
         self,
         ticket_id: str,
         sandbox_manifest_id: str,
@@ -121,6 +139,11 @@ class LiveExecutionRepository:
         risk_level: str,
         integrity_status: str,
     ) -> LiveExecutionRecord:
+        """
+        Creates the record already RUNNING, in one committed insert --
+        see the module docstring for why this replaces a separate
+        PENDING-then-RUNNING pair of commits.
+        """
         record = LiveExecutionRecord(
             live_execution_id=uuid.uuid4(),
             ticket_id=uuid.UUID(ticket_id),
@@ -129,7 +152,7 @@ class LiveExecutionRepository:
             target_schema=target_schema,
             target_table=target_table,
             backup_table=None,
-            status="PENDING",
+            status="RUNNING",
             requested_by=requested_by,
             started_at=datetime.now(UTC),
             original_row_count=original_row_count,
@@ -166,13 +189,9 @@ class LiveExecutionRepository:
         return record
 
     def _get_for_update(self, live_execution_id) -> LiveExecutionRecord:
-        """
-        Row-locked read, used by mark_rolling_back(). Without this,
-        two concurrent rollback requests for the same execution could
-        both read status == COMPLETED before either commits the
-        ROLLING_BACK transition, and both proceed -- same class of race
-        as the ticket-locking fix for issue 2, applied here too.
-        """
+        """Row-locked read, used by mark_rolling_back() -- without this,
+        two concurrent rollback requests could both see COMPLETED
+        before either commits the ROLLING_BACK transition."""
         if isinstance(live_execution_id, str):
             try:
                 live_execution_id = uuid.UUID(live_execution_id)
@@ -191,11 +210,6 @@ class LiveExecutionRepository:
     def get(self, live_execution_id: str) -> LiveExecutionRecord:
         return self._get(live_execution_id)
 
-    def mark_running(self, live_execution_id) -> None:
-        record = self._get(live_execution_id)
-        record.status = "RUNNING"
-        self.db.commit()
-
     def mark_completed(
         self, live_execution_id, backup_table: Optional[str], final_row_count: int
     ) -> None:
@@ -213,7 +227,7 @@ class LiveExecutionRepository:
         record.completed_at = datetime.now(UTC)
         self.db.commit()
 
-    def mark_rolling_back(self, live_execution_id) -> LiveExecutionRecord:
+    def mark_rolling_back(self, live_execution_id, operator: str) -> LiveExecutionRecord:
         record = self._get_for_update(live_execution_id)
         if record.status != "COMPLETED":
             raise LiveExecutionInvalidStateError(
@@ -221,11 +235,13 @@ class LiveExecutionRepository:
                 f"{record.status!r} -- only a COMPLETED execution can be rolled back."
             )
         record.status = "ROLLING_BACK"
+        record.rolled_back_by = operator
+        record.rollback_started_at = datetime.now(UTC)
         self.db.commit()
         self.db.refresh(record)
         return record
 
-    def mark_rolled_back(self, live_execution_id, rolled_back_by: str) -> LiveExecutionRecord:
+    def mark_rolled_back(self, live_execution_id) -> LiveExecutionRecord:
         record = self._get(live_execution_id)
         if record.status != "ROLLING_BACK":
             raise LiveExecutionInvalidStateError(
@@ -233,7 +249,6 @@ class LiveExecutionRepository:
                 f"{record.status!r} -- expected ROLLING_BACK."
             )
         record.status = "ROLLED_BACK"
-        record.rolled_back_by = rolled_back_by
         record.rolled_back_at = datetime.now(UTC)
         self.db.commit()
         self.db.refresh(record)
@@ -242,10 +257,10 @@ class LiveExecutionRepository:
     def mark_rollback_failed(self, live_execution_id, failure_reason: str) -> None:
         """
         Left in ROLLING_BACK on failure rather than reverted to
-        COMPLETED or forced to FAILED -- neither of those would be
-        honest about a rollback that started but didn't finish
-        cleanly. A record stuck here needs manual investigation
-        against the target-side marker, not an automatic guess.
+        COMPLETED or forced to FAILED -- neither would be honest about
+        a rollback that started but didn't finish cleanly. Stays there
+        until reconciled (via the target-side marker) or manually
+        investigated.
         """
         record = self._get(live_execution_id)
         record.failure_reason = failure_reason
@@ -253,18 +268,21 @@ class LiveExecutionRepository:
 
     def reconcile_running(self, live_execution_id, writer) -> LiveExecutionRecord:
         """
-        Recovers a stuck RUNNING record's true state using the target-
-        side marker (issue 4): if the target transaction actually
+        Recovers a stuck RUNNING record's true state using the
+        target-side marker: if the target transaction actually
         committed a PROMOTE before the API crashed (or otherwise never
-        reached mark_completed()), the marker proves it -- bring the
-        governance record in line with reality rather than leaving it
-        permanently RUNNING (which would also permanently block that
-        target under the in-flight uniqueness index). If no marker
-        exists, the target-side transaction never committed, so it's
-        safe to mark the record FAILED.
+        reached mark_completed()), the marker proves it. Only acts
+        after the record has been RUNNING longer than the staleness
+        threshold -- a fresh RUNNING record with no marker yet might
+        simply still be in progress, and reconciling it immediately
+        would incorrectly fail an operation that could still succeed.
         """
         record = self._get(live_execution_id)
         if record.status != "RUNNING":
+            return record
+
+        age_seconds = (datetime.now(UTC) - record.started_at).total_seconds()
+        if age_seconds < _stale_threshold_seconds():
             return record
 
         markers = writer.get_marker_for_execution(record.target_schema, record.live_execution_id)
@@ -277,12 +295,43 @@ class LiveExecutionRepository:
         else:
             record.status = "FAILED"
             record.failure_reason = (
-                "Reconciled: no target-side PROMOTE marker found for this execution "
-                "-- the target transaction never committed, so this is being marked "
-                "FAILED rather than left permanently RUNNING."
+                f"Reconciled after {age_seconds:.0f}s with no target-side PROMOTE "
+                f"marker -- treating as failed rather than left stuck RUNNING."
             )
             record.completed_at = datetime.now(UTC)
 
         self.db.commit()
         self.db.refresh(record)
+        return record
+
+    def reconcile_rolling_back(self, live_execution_id, writer) -> LiveExecutionRecord:
+        """
+        Rollback counterpart to reconcile_running(): if the target-side
+        ROLLBACK marker exists, the rollback actually committed even
+        though the API may have crashed before mark_rolled_back() ran.
+        Same staleness gate -- a fresh ROLLING_BACK record might simply
+        still be in progress.
+        """
+        record = self._get(live_execution_id)
+        if record.status != "ROLLING_BACK":
+            return record
+
+        reference_time = record.rollback_started_at or record.started_at
+        age_seconds = (datetime.now(UTC) - reference_time).total_seconds()
+        if age_seconds < _stale_threshold_seconds():
+            return record
+
+        markers = writer.get_marker_for_execution(record.target_schema, record.live_execution_id)
+        rollback_marker = next((m for m in markers if m["operation"] == "ROLLBACK"), None)
+
+        if rollback_marker is not None:
+            record.status = "ROLLED_BACK"
+            record.rolled_back_at = datetime.now(UTC)
+            self.db.commit()
+            self.db.refresh(record)
+        # If no ROLLBACK marker exists yet, leave it in ROLLING_BACK --
+        # this needs manual investigation, same as the synchronous
+        # failure path; guessing wrong here (e.g. reverting to
+        # COMPLETED) could be worse than leaving it for a human.
+
         return record

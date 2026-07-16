@@ -32,6 +32,15 @@ def _get_live_database_url() -> str:
             "will not guess at or default to any connection."
         )
     parsed = make_url(url)
+    if not parsed.drivername.startswith("postgresql"):
+        raise RuntimeError(
+            f"LIVE_DATABASE_URL must be a PostgreSQL connection string "
+            f"(got drivername {parsed.drivername!r}) -- the live writer "
+            f"depends on PostgreSQL-specific transactional DDL and SQL "
+            f"that will not work against any other database."
+        )
+    if not parsed.database:
+        raise RuntimeError("LIVE_DATABASE_URL must specify a database name.")
     if parsed.database in ("aegis", "aegis_test"):
         raise RuntimeError(
             f"LIVE_DATABASE_URL must not point at Aegis's own governance "
