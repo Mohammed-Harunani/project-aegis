@@ -254,6 +254,22 @@ class LiveExecutionRepository:
         self.db.refresh(record)
         return record
 
+    def mark_outcome_unknown(self, live_execution_id, reason: str) -> None:
+        """
+        Records that an ambiguous exception occurred and the target-
+        side marker couldn't even be checked (e.g. the connection
+        itself is down) -- status is deliberately left unchanged
+        (RUNNING or ROLLING_BACK). Neither FAILED (which is retryable
+        and could create a duplicate publication if it actually did
+        commit) nor COMPLETED (which would hide a real failure if it
+        didn't) would be honest here. This needs manual investigation
+        against the target-side marker once it's reachable again, not
+        an automatic guess in either direction.
+        """
+        record = self._get(live_execution_id)
+        record.failure_reason = reason
+        self.db.commit()
+
     def mark_rollback_failed(self, live_execution_id, failure_reason: str) -> None:
         """
         Left in ROLLING_BACK on failure rather than reverted to
@@ -271,11 +287,15 @@ class LiveExecutionRepository:
         Recovers a stuck RUNNING record's true state using the
         target-side marker: if the target transaction actually
         committed a PROMOTE before the API crashed (or otherwise never
-        reached mark_completed()), the marker proves it. Only acts
-        after the record has been RUNNING longer than the staleness
-        threshold -- a fresh RUNNING record with no marker yet might
-        simply still be in progress, and reconciling it immediately
-        would incorrectly fail an operation that could still succeed.
+        reached mark_completed()), the marker proves it. Two
+        conditions must BOTH hold before acting, not just the
+        staleness threshold: a timeout alone can only ever prove "a
+        while has passed," never "nothing is still active" -- a
+        legitimately long-running publication could still be mid-
+        transaction past the threshold. The advisory lock is what
+        actually proves exclusivity: if it can't be acquired, something
+        genuinely still holds it, and the record is left alone
+        regardless of how stale it looks.
         """
         record = self._get(live_execution_id)
         if record.status != "RUNNING":
@@ -283,6 +303,12 @@ class LiveExecutionRepository:
 
         age_seconds = (datetime.now(UTC) - record.started_at).total_seconds()
         if age_seconds < _stale_threshold_seconds():
+            return record
+
+        if writer.is_target_currently_locked(record.target_schema, record.target_table):
+            # Something genuinely still holds the lock -- definitive
+            # proof of activity a timeout alone could never provide.
+            # Leave it RUNNING no matter how stale it looks.
             return record
 
         markers = writer.get_marker_for_execution(record.target_schema, record.live_execution_id)
@@ -295,8 +321,9 @@ class LiveExecutionRepository:
         else:
             record.status = "FAILED"
             record.failure_reason = (
-                f"Reconciled after {age_seconds:.0f}s with no target-side PROMOTE "
-                f"marker -- treating as failed rather than left stuck RUNNING."
+                f"Reconciled after {age_seconds:.0f}s with the target lock free and "
+                f"no target-side PROMOTE marker -- treating as failed rather than "
+                f"left stuck RUNNING."
             )
             record.completed_at = datetime.now(UTC)
 
@@ -309,8 +336,8 @@ class LiveExecutionRepository:
         Rollback counterpart to reconcile_running(): if the target-side
         ROLLBACK marker exists, the rollback actually committed even
         though the API may have crashed before mark_rolled_back() ran.
-        Same staleness gate -- a fresh ROLLING_BACK record might simply
-        still be in progress.
+        Same two-condition gate: staleness AND a free advisory lock,
+        not staleness alone.
         """
         record = self._get(live_execution_id)
         if record.status != "ROLLING_BACK":
@@ -321,6 +348,9 @@ class LiveExecutionRepository:
         if age_seconds < _stale_threshold_seconds():
             return record
 
+        if writer.is_target_currently_locked(record.target_schema, record.target_table):
+            return record
+
         markers = writer.get_marker_for_execution(record.target_schema, record.live_execution_id)
         rollback_marker = next((m for m in markers if m["operation"] == "ROLLBACK"), None)
 
@@ -329,9 +359,11 @@ class LiveExecutionRepository:
             record.rolled_back_at = datetime.now(UTC)
             self.db.commit()
             self.db.refresh(record)
-        # If no ROLLBACK marker exists yet, leave it in ROLLING_BACK --
-        # this needs manual investigation, same as the synchronous
-        # failure path; guessing wrong here (e.g. reverting to
-        # COMPLETED) could be worse than leaving it for a human.
+        # If no ROLLBACK marker exists yet (and the lock is free, so
+        # nothing is actively retrying it either), leave it in
+        # ROLLING_BACK -- this needs manual investigation, same as the
+        # synchronous failure path; guessing wrong here (e.g.
+        # reverting to COMPLETED) could be worse than leaving it for a
+        # human.
 
         return record

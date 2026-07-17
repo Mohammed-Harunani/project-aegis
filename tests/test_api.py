@@ -211,6 +211,22 @@ def test_repeated_approval_returns_409():
     assert second.status_code == 409
 
 
+def test_empty_approval_operator_rejected():
+    """Phase 2.5 correction: status alone (APPROVED) doesn't prove a
+    meaningful human identity approved a ticket -- operator must be
+    non-empty after stripping, same validation as the live-execution
+    request models."""
+    ticket_id = _submit_rename_scenario().json()["ticket_id"]
+    response = client.post(f"/approvals/{ticket_id}/approve", json={"operator": ""})
+    assert response.status_code == 422
+
+
+def test_whitespace_only_approval_operator_rejected():
+    ticket_id = _submit_rename_scenario().json()["ticket_id"]
+    response = client.post(f"/approvals/{ticket_id}/approve", json={"operator": "   "})
+    assert response.status_code == 422
+
+
 def test_execution_failure_rolls_back_approval():
     """Ticket must stay PENDING, not get stranded as APPROVED with no manifest."""
     ticket_id = _submit_rename_scenario().json()["ticket_id"]

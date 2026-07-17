@@ -27,6 +27,7 @@ validate/backup/promote sequence:
   external change) may have since superseded it.
 """
 
+import hashlib
 import uuid as uuid_module
 
 import pandas as pd
@@ -55,6 +56,21 @@ _POSTGRES_TYPE_TO_SA = {
 _EXECUTION_LOG_TABLE = "_aegis_execution_log"
 
 
+def _advisory_lock_key(target_schema: str, target_table: str) -> int:
+    """
+    Deterministic signed 64-bit key for Postgres advisory locks (bigint
+    is signed 64-bit), derived from the fully-qualified target name.
+    Confirmed via Postgres docs: pg_advisory_xact_lock is transaction-
+    scoped and releases automatically on commit OR rollback, which is
+    exactly what makes this usable as a liveness proof -- if a process
+    crashes mid-operation, its connection drops, its transaction never
+    commits, and the lock is released, so a LATER attempt to acquire it
+    succeeding proves nothing is currently active for this target.
+    """
+    digest = hashlib.sha256(f"{target_schema}.{target_table}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="big", signed=True)
+
+
 class LiveWriteValidationError(Exception):
     """Post-write validation failed inside the transaction; it has been rolled back."""
 
@@ -71,9 +87,66 @@ class StaleRollbackError(Exception):
     rolling back would destroy valid, newer data."""
 
 
+class TargetLockUnavailableError(Exception):
+    """Another operation currently holds the advisory lock for this
+    target -- something is genuinely still active against it."""
+
+
 class PostgresLiveWriter:
     def __init__(self, engine: Engine):
         self.engine = engine
+
+    def _try_acquire_target_lock(self, conn, target_schema: str, target_table: str) -> bool:
+        """
+        Transaction-scoped Postgres advisory lock unique to this
+        (schema, table) pair -- automatically released when the
+        transaction commits or rolls back, no manual unlock needed.
+        This is what actually proves mutual exclusion, unlike a
+        timeout alone: a timeout can only ever prove "a while has
+        passed," never "nothing is still active." Used to serialize
+        promote()/rollback() against each other for the same target,
+        and by reconciliation to prove a markerless RUNNING/
+        ROLLING_BACK record's target transaction is genuinely no
+        longer active (if the lock CAN be acquired, nothing else
+        holds it).
+        """
+        return bool(conn.execute(
+            text("SELECT pg_try_advisory_xact_lock(hashtext(:schema), hashtext(:table))"),
+            {"schema": target_schema, "table": target_table},
+        ).scalar())
+
+    def is_target_currently_locked(self, target_schema: str, target_table: str) -> bool:
+        """
+        True if a DIFFERENT active transaction currently holds the
+        lock for this target (a promote/rollback is genuinely still
+        in progress there right now) -- False if the lock is free.
+        Opens its own short-lived transaction purely to test the lock,
+        which releases it immediately upon exit if acquired.
+        """
+        with self.engine.connect() as conn:
+            with conn.begin():
+                acquired = self._try_acquire_target_lock(conn, target_schema, target_table)
+        return not acquired
+
+    def check_operation_outcome(self, target_schema: str, execution_id, operation: str) -> str:
+        """
+        Used after an AMBIGUOUS exception (e.g. the target transaction
+        may have committed but the connection dropped before
+        acknowledging it) to determine what actually happened,
+        target-side. `operation` is "PROMOTE" or "ROLLBACK". Returns:
+        "completed" -- a matching marker exists, so it committed
+        despite the exception; "not_committed" -- the marker table was
+        reachable and has no such marker, so it's provable this did
+        NOT commit; "unknown" -- the marker table itself couldn't even
+        be checked (e.g. the connection is still down), so nothing can
+        be concluded and the caller must not guess either way.
+        """
+        try:
+            markers = self.get_marker_for_execution(target_schema, execution_id)
+        except Exception:
+            return "unknown"
+        has_marker = any(m["operation"] == operation for m in markers)
+        return "completed" if has_marker else "not_committed"
 
     def _sa_type_for(self, pandas_dtype: str):
         postgres_type_name = pandas_dtype_to_postgres_type(pandas_dtype)
@@ -155,14 +228,22 @@ class PostgresLiveWriter:
             ).mappings().all()
             return [dict(r) for r in rows]
 
-    def get_latest_promote_marker(self, target_schema: str, target_table: str):
+    def get_latest_management_marker(self, target_schema: str, target_table: str):
         """
-        The most recent PROMOTE-operation marker for this exact table
-        name, or None. Used both for the managed-target check and
-        rollback's staleness check -- both ALSO compare the marker's
-        recorded table_oid against the table's CURRENT oid, since a
-        name match alone doesn't prove it's the same physical table
-        (it could have been dropped and recreated by something else).
+        The most recent marker of EITHER operation (PROMOTE or
+        ROLLBACK) for this exact table name, or None. A ROLLBACK is
+        also a legitimate management event: it restores a table to a
+        known OID, and that restoration must become the new
+        authoritative "current identity" for future checks. Confirmed
+        this was a real bug when it only considered PROMOTE markers:
+        publish A (oid 100) -> publish B (renames A's table to backup,
+        oid 100, promotes a new table, oid 200) -> roll back B
+        (restores oid 100 as the target, records a ROLLBACK marker
+        with oid 100) -> publish C. Looking only at the latest PROMOTE
+        marker would still see B's oid 200, mismatching the restored
+        table's actual oid 100, and incorrectly refuse C as targeting
+        an "unmanaged" table -- even though it's the same table A
+        originally created, correctly restored by B's rollback.
         """
         validate_identifier(target_schema, "target schema")
         validate_identifier(target_table, "target table")
@@ -171,9 +252,9 @@ class PostgresLiveWriter:
                 return None
             row = conn.execute(
                 text(
-                    f'SELECT live_execution_id, table_oid, backup_table, recorded_at '
+                    f'SELECT live_execution_id, table_oid, backup_table, operation, recorded_at '
                     f'FROM "{target_schema}"."{_EXECUTION_LOG_TABLE}" '
-                    f"WHERE target_table = :table AND operation = 'PROMOTE' "
+                    f"WHERE target_table = :table AND operation IN ('PROMOTE', 'ROLLBACK') "
                     f'ORDER BY recorded_at DESC LIMIT 1'
                 ),
                 {"table": target_table},
@@ -184,10 +265,11 @@ class PostgresLiveWriter:
         """
         True only if the table currently at this name and schema is
         the SAME physical table (by OID) that Aegis's most recent
-        PROMOTE marker for this name refers to -- not just that some
-        table with this name was promoted at some point in the past.
+        management event (promote OR rollback-restore) for this name
+        refers to -- not just that some table with this name was
+        promoted at some point in the past.
         """
-        marker = self.get_latest_promote_marker(target_schema, target_table)
+        marker = self.get_latest_management_marker(target_schema, target_table)
         if marker is None:
             return False
         with self.engine.connect() as conn:
@@ -217,6 +299,13 @@ class PostgresLiveWriter:
         backup_name = backup_table_name(target_table, execution_id)
 
         with self.engine.begin() as conn:
+            if not self._try_acquire_target_lock(conn, target_schema, target_table):
+                raise TargetLockUnavailableError(
+                    f"Another operation is currently active against "
+                    f'"{target_schema}"."{target_table}" -- refusing to proceed '
+                    f"concurrently rather than racing it."
+                )
+
             self._ensure_execution_log_table(conn, target_schema)
 
             target_exists = self._table_exists(conn, target_schema, target_table)
@@ -225,7 +314,7 @@ class PostgresLiveWriter:
                 marker = conn.execute(
                     text(
                         f'SELECT table_oid FROM "{target_schema}"."{_EXECUTION_LOG_TABLE}" '
-                        f"WHERE target_table = :table AND operation = 'PROMOTE' "
+                        f"WHERE target_table = :table AND operation IN ('PROMOTE', 'ROLLBACK') "
                         f'ORDER BY recorded_at DESC LIMIT 1'
                     ),
                     {"table": target_table},
@@ -297,17 +386,17 @@ class PostgresLiveWriter:
     def rollback(self, target_schema: str, target_table: str, backup_table, execution_id) -> None:
         """
         Restores the previous target table from its backup. Refuses
-        (StaleRollbackError) unless this execution is still the most
-        recent PROMOTE for this exact table BY IDENTITY (OID), not
-        just name -- if a newer execution has since replaced it, or
-        the table has been externally recreated, rolling back this
-        older one would destroy valid, newer data (or nothing
-        meaningful at all).
+        (StaleRollbackError) unless this execution's own PROMOTE is
+        still the most recent management event (PROMOTE or ROLLBACK)
+        for this exact table BY IDENTITY (OID), not just name -- if a
+        newer execution has since promoted over it, or something else
+        has already rolled it back, rolling back this older one would
+        destroy valid, newer data (or touch nothing meaningful at all).
         """
         validate_identifier(target_schema, "target schema")
         validate_identifier(target_table, "target table")
 
-        marker = self.get_latest_promote_marker(target_schema, target_table)
+        marker = self.get_latest_management_marker(target_schema, target_table)
         with self.engine.connect() as conn:
             current_oid = self._current_oid(conn, target_schema, target_table)
 
@@ -325,6 +414,12 @@ class PostgresLiveWriter:
             )
 
         with self.engine.begin() as conn:
+            if not self._try_acquire_target_lock(conn, target_schema, target_table):
+                raise TargetLockUnavailableError(
+                    f"Another operation is currently active against "
+                    f'"{target_schema}"."{target_table}" -- refusing to roll back '
+                    f"concurrently rather than racing it."
+                )
             self._ensure_execution_log_table(conn, target_schema)
             conn.execute(text(f'DROP TABLE IF EXISTS "{target_schema}"."{target_table}"'))
             if backup_table:

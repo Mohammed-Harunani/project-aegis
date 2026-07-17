@@ -581,6 +581,49 @@ def test_target_write_failure_marks_execution_failed():
         assert record.status == "FAILED"
 
 
+def test_ambiguous_commit_recovers_via_target_side_marker():
+    """
+    Issue 2 (third correction pass): simulates a connection drop AFTER
+    the target transaction actually committed -- the PROMOTE marker
+    genuinely exists, but the call site still sees an exception (e.g.
+    the network dropped before the commit acknowledgment arrived).
+    Must resolve to COMPLETED via the target-side marker, not
+    incorrectly marked FAILED -- FAILED is retryable, and retrying a
+    publication that already actually happened risks a duplicate.
+    """
+    ticket_id, _ = _register_and_approve_registry_ticket()
+
+    from src.live_execution.writer import PostgresLiveWriter
+    real_promote = PostgresLiveWriter.promote
+
+    def promote_then_raise(self, *args, **kwargs):
+        result = real_promote(self, *args, **kwargs)  # actually succeeds; marker gets written for real
+        raise RuntimeError("simulated connection drop after commit")
+
+    with patch("src.api.app.PostgresLiveWriter.promote", promote_then_raise):
+        response = client.post(
+            f"/approvals/{ticket_id}/execute-live",
+            json=_execute_live_body("customer_master_live_24"),
+        )
+
+    body = response.json()
+    assert response.status_code == 200
+    assert body["status"] == "COMPLETED"
+    assert "note" in body
+
+    with TestSessionLocal() as db:
+        record = db.query(LiveExecutionRecord).filter(
+            LiveExecutionRecord.ticket_id == __import__("uuid").UUID(ticket_id)
+        ).one()
+        assert record.status == "COMPLETED"
+
+    with live_target_engine.connect() as conn:
+        rows = conn.execute(text(
+            'SELECT customer_id FROM "public"."customer_master_live_24" ORDER BY customer_id'
+        )).fetchall()
+        assert [r[0] for r in rows] == [1, 2, 3]
+
+
 def test_reconciliation_heals_a_stuck_running_record():
     """
     Issue 4: simulates the crash window directly -- a live execution

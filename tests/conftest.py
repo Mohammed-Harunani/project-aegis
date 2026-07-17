@@ -62,10 +62,11 @@ def get_verified_test_database_url():
 def get_verified_live_test_database_url():
     """
     Same shape as get_verified_test_database_url(), for Phase 2.5's
-    live-execution tests. The live target must be a THIRD database,
-    distinct from both aegis and aegis_test -- the live writer itself
-    refuses those two as targets, so testing live writes needs
-    aegis_live_test (or equivalent) instead.
+    live-execution tests. Requires EXACTLY 'aegis_live_test' -- not
+    just "anything except aegis/aegis_test" -- since this test suite
+    drops tables in the public schema; a mistaken environment variable
+    pointing at some other real database would be destructive there
+    too, not just against aegis/aegis_test specifically.
     """
     import os
     import pytest
@@ -82,10 +83,16 @@ def get_verified_live_test_database_url():
     from sqlalchemy.engine import make_url
 
     parsed = make_url(live_test_url)
-    if parsed.database in ("aegis", "aegis_test"):
+    if not parsed.drivername.startswith("postgresql"):
         raise RuntimeError(
-            f"LIVE_TEST_DATABASE_URL must not be {parsed.database!r} -- "
-            f"use a distinct database (e.g. aegis_live_test)."
+            f"LIVE_TEST_DATABASE_URL must be a PostgreSQL connection string "
+            f"(got drivername {parsed.drivername!r})."
+        )
+    if parsed.database != "aegis_live_test":
+        raise RuntimeError(
+            f"LIVE_TEST_DATABASE_URL must point at exactly 'aegis_live_test', "
+            f"not {parsed.database!r} -- refusing to run tests that drop "
+            f"tables against anything else."
         )
 
     os.environ["LIVE_DATABASE_URL"] = live_test_url

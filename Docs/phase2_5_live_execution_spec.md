@@ -23,20 +23,24 @@ architecture asks for. So: the target-database sequence (create
 shadow, write, validate, backup existing, promote) genuinely is one
 atomic transaction -- if anything in it fails, Postgres rolls the
 *target* database back to exactly its pre-execution state, guaranteed.
-The governance record is written in stages instead: `PENDING` before
-the target transaction starts, `RUNNING` once it does, then
-`COMPLETED` or `FAILED` based on the outcome. The target table itself
-can never be left half-mutated; the governance record's job is to
-accurately reflect what happened, not to be part of the same commit.
+The governance record's job is to accurately reflect what happened,
+not to be part of the same commit as the target transaction. It is
+created already `RUNNING`, in one committed insert (`create_running()`
+-- see "Second correction pass" below for why a separate `PENDING`
+stage was tried first and then removed), then updated to `COMPLETED`
+or `FAILED` based on the outcome. The target table itself can never be
+left half-mutated by this design, regardless of how the governance
+record's own update turns out.
 
 **2. "The target is not the original source table" (safety gate #11)
-has no concrete data to check against yet.** Nothing in Aegis today
+originally had no concrete data to check against.** Nothing in Aegis
 tracks a live source-table reference -- data arrives as JSON
 `sample_data`, not a query against a live table via the read-only
-connector. `execute-live` accepts an *optional* `source_schema` /
-`source_table` pair purely for this comparison; if supplied, target
-must differ; if omitted, the check is skipped rather than invented.
-Flagging this rather than silently deciding it either way.
+connector. The first correction pass made `source_schema`/
+`source_table` **mandatory** request fields specifically because an
+optional check that a caller could simply omit isn't a safety gate at
+all -- see "Correction pass" below. This section originally proposed
+making them optional; that proposal did not survive review.
 
 ## Scope boundary (restated from the locked decisions)
 
@@ -78,9 +82,10 @@ DataFrame in place (no defensive copy) instead of returning a new
 one, and `"live"` is rejected with `ValueError` unless explicitly
 listed in `allowed_modes`. `execute-live` calls this exactly once,
 deterministically recomputing the same correction already validated
-in sandbox at approval time (not persisting a second copy of the
-corrected dataset anywhere) -- consistent with "every repair must be
-deterministic."
+in sandbox at approval time -- consistent with "every repair must be
+deterministic." This is separate from how the SANDBOX-time output is
+captured for fingerprinting, which the second correction pass changed
+significantly -- see below.
 
 ## Safety gates (all 15, evaluated before any write)
 
@@ -254,3 +259,84 @@ it describes**, specifically to avoid the kind of drift a prior
 review caught (spec still describing source fields as optional and
 Surgeon being called once, after the implementation had already
 changed).
+
+## Third correction pass
+
+A further review found the staleness-timeout approach from the second
+pass could still race a legitimately slow operation, plus five more
+issues. Fixed:
+
+1. **A timeout alone can't prove death** -- reconciliation now also
+   requires acquiring a Postgres transaction-scoped advisory lock
+   (pg_try_advisory_xact_lock, keyed by hashtext(schema)/hashtext(table))
+   before concluding a markerless record has failed. Confirmed via
+   Postgres documentation that this lock type releases automatically on
+   commit OR rollback -- including a crash, since the connection drops
+   and the transaction never commits -- which is exactly the property
+   that turns "looks stale" into "provably nothing is running." If the
+   lock can't be acquired, something is genuinely still active and the
+   record is left alone regardless of elapsed time. promote()/
+   rollback() now acquire this same lock at the start of their own
+   transactions, both as another layer of protection against a
+   concurrent operation on the same target and to make the lock
+   meaningful for reconciliation to check.
+2. **An uncertain commit could be wrongly marked FAILED** -- a generic
+   exception from the writer no longer means automatic FAILED. The
+   target-side marker is checked first: if it shows PROMOTE/ROLLBACK
+   actually committed, the record is marked COMPLETED/ROLLED_BACK
+   instead (the original request's response was lost, not the
+   operation); if the marker table itself can't even be reached, the
+   record is left as-is with an outcome-unknown note, not guessed in
+   either direction.
+3. **A restored table lost its "managed" status** -- the ownership
+   check now uses the latest marker of EITHER type (PROMOTE or
+   ROLLBACK), not just the latest PROMOTE. A rollback's restored OID
+   is just as authoritative as a promotion's; using PROMOTE-only kept
+   pointing at whatever the rollback had just superseded.
+6. **Approval operator wasn't validated, and status alone didn't prove
+   identity** -- `ApprovalDecisionRequest.operator` now uses the same
+   strip-and-reject validation as the live-execution request models.
+   `execute-live` additionally requires `ticket.decided_by` to be
+   non-empty and `ticket.decided_at` to exist before proceeding, as a
+   defense against any ticket that predates this validation.
+7. **The live test database guard was too permissive** -- it accepted
+   any database except `aegis`/`aegis_test`. Now requires exactly
+   `aegis_live_test` and a PostgreSQL driver.
+
+Also fixed two stale/contradictory passages this review caught: the
+"two design decisions" section still described `source_schema`/
+`source_table` as optional after a later pass made them mandatory, the
+governance-record lifecycle was still described as PENDING-then-RUNNING
+after `create_running()` replaced that with one committed insert, and
+`manifest_repository.py`'s comment still claimed Surgeon wasn't touched
+after the second correction pass added `corrected_dataset` to it.
+
+## Two issues NOT implemented in this pass -- flagged for a decision,
+## not resolved unilaterally
+
+**Blocker 4 (publishing `sample_data`, not a verified complete
+dataset)** and **blocker 5 (rename-based table swapping breaking
+Postgres object identity for views/FKs/grants)** are not bugs in this
+implementation of the locked architecture -- they are challenges to
+the architecture itself, and in blocker 5's case, a direct
+contradiction of what was explicitly locked in (the rename-to-backup
+mechanism was specified by name in the original Phase 2.5 decisions).
+
+Blocker 4 would require Aegis to read a complete, trusted dataset from
+a real source system with some proof of completeness -- Aegis has
+never done this, in any phase; `sample_data` supplied directly in the
+request has been the entire data-ingestion model since Phase 1.
+Solving it properly is a data-ingestion redesign, not a Phase 2.5 bug
+fix, and deserves the same kind of explicit scope discussion Phase 2.5
+itself got before implementation began.
+
+Blocker 5's proposed fix (a dedicated publication schema with either a
+stable view over versioned physical tables, or a verified-no-
+dependencies restriction) is a different publication mechanism than
+the one actually locked in. Replacing it unilaterally would mean
+overriding your own prior decision based on a review's suggestion,
+which isn't a call I think is mine to make alone.
+
+Both are real, and both are more architecturally significant than
+anything fixed in the three correction passes so far. They need your
+decision on direction before any code changes, not my guess at one.

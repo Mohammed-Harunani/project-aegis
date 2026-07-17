@@ -33,11 +33,12 @@ def save_manifest(
     bundling this into a larger transaction alongside the ticket's
     APPROVED status change, and will commit or roll back both together.
 
-    corrected_output_fingerprint (Phase 2.5 correction): the caller
-    computes this from the actual corrected DataFrame -- this function
-    only persists it, since it's purely a storage concern and Surgeon
-    itself isn't touched to produce it (see app.py for how it's
-    obtained without changing Surgeon's sandbox-mode behavior).
+    corrected_output_fingerprint: the caller computes this from
+    manifest.corrected_dataset (populated by Surgeon itself, as of the
+    second Phase 2.5 correction pass -- Surgeon.execute() now attaches
+    the actual corrected DataFrame to the HealingManifest it returns).
+    This function only persists the fingerprint string; the DataFrame
+    itself is never written here or anywhere in the database.
     """
     record = HealingManifestRecord(
         manifest_id=uuid.uuid4(),

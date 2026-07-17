@@ -47,6 +47,7 @@ from src.live_execution.writer import (
     LiveWriteValidationError,
     UnmanagedTargetTableError,
     StaleRollbackError,
+    TargetLockUnavailableError,
 )
 from src.live_execution.output_fingerprint import compute_dataframe_fingerprint
 
@@ -97,6 +98,14 @@ class MigrationRequest(BaseModel):
 class ApprovalDecisionRequest(BaseModel):
     operator: str
     note: str = ""
+
+    @field_validator("operator")
+    @classmethod
+    def _operator_must_be_meaningful(cls, value: str) -> str:
+        try:
+            return validate_and_normalize_operator(value)
+        except LiveExecutionNotAllowedError as e:
+            raise ValueError(str(e))
 
 
 class ExecuteLiveRequest(BaseModel):
@@ -586,6 +595,16 @@ def execute_live(
             detail=f"Ticket must be APPROVED to execute live, currently {ticket.status}.",
         )
 
+    # Status alone doesn't prove a meaningful human identity approved
+    # this -- ApprovalDecisionRequest.operator is now validated at the
+    # API layer, but this defends against any ticket that predates
+    # that validation, or reached APPROVED some other way.
+    if not (ticket.decided_by or "").strip() or not ticket.decided_at:
+        raise HTTPException(
+            status_code=422,
+            detail="Ticket has no recorded approval identity or timestamp -- refusing to execute live.",
+        )
+
     manifest_record = (
         db.query(HealingManifestRecord)
         .filter(HealingManifestRecord.ticket_id == uuid.UUID(ticket_id))
@@ -720,13 +739,22 @@ def execute_live(
             execution_id=live_record.live_execution_id,
             expected_row_count=manifest_record.final_row_count,
         )
+    except TargetLockUnavailableError as e:
+        # Provably nothing happened -- raised before any DDL even
+        # starts inside promote()'s transaction.
+        live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
+        raise HTTPException(status_code=409, detail=str(e))
     except LiveExecutionNotAllowedError as e:
         live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
         raise HTTPException(status_code=422, detail=str(e))
     except UnmanagedTargetTableError as e:
+        # Provably nothing happened -- raised before any DDL, still
+        # inside the same transaction.
         live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
         raise HTTPException(status_code=422, detail=str(e))
-    except Exception as e:
+    except LiveWriteValidationError as e:
+        # Raised inside promote()'s own transaction before any commit
+        # -- provably rolled back, safe to mark FAILED directly.
         live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
         raise HTTPException(
             status_code=500,
@@ -735,6 +763,70 @@ def execute_live(
                 f"database -- the target table is unchanged. Reason: {e}"
             ),
         )
+    except Exception as e:
+        # Genuinely ambiguous: this exception alone doesn't prove
+        # whether the target transaction committed -- e.g. the
+        # connection could have dropped after a successful commit but
+        # before acknowledging it back to us. Guessing wrong in either
+        # direction is dangerous: marking FAILED (retryable) when it
+        # actually committed risks a duplicate publication; marking
+        # COMPLETED when it didn't would hide a real failure. Check the
+        # target-side marker before concluding anything.
+        outcome = writer.check_operation_outcome(
+            request.target_schema, live_record.live_execution_id, "PROMOTE"
+        )
+        if outcome == "completed":
+            marker = writer.get_latest_management_marker(
+                request.target_schema, request.target_table
+            )
+            backup_table = marker["backup_table"] if marker else None
+            live_repo.mark_completed(
+                live_record.live_execution_id,
+                backup_table=backup_table,
+                final_row_count=manifest_record.final_row_count,
+            )
+            return {
+                "live_execution_id": str(live_record.live_execution_id),
+                "status": "COMPLETED",
+                "target_schema": request.target_schema,
+                "target_table": request.target_table,
+                "backup_table": backup_table,
+                "final_row_count": manifest_record.final_row_count,
+                "note": (
+                    "The original response to this request was lost to a "
+                    "connection error, but the target-side marker confirms "
+                    "the publication actually committed -- this reflects "
+                    "that, not a new attempt."
+                ),
+            }
+        elif outcome == "not_committed":
+            live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Live execution failed and was rolled back at the target "
+                    f"database -- the target table is unchanged. Reason: {e}"
+                ),
+            )
+        else:
+            live_repo.mark_outcome_unknown(
+                live_record.live_execution_id,
+                reason=(
+                    f"Connection error during promotion, and the target-side "
+                    f"marker could not be checked either -- outcome unknown. "
+                    f"Reason: {e}"
+                ),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Live execution outcome is UNKNOWN -- a connection error "
+                    f"occurred and the target-side marker could not be checked "
+                    f"either. This execution remains RUNNING and needs manual "
+                    f"investigation before any retry; retrying blindly risks a "
+                    f"duplicate publication. Reason: {e}"
+                ),
+            )
 
     live_repo.mark_completed(
         live_record.live_execution_id,
@@ -856,18 +948,61 @@ def rollback_live_execution(
         # dishonest about having attempted this at all.
         live_repo.mark_rollback_failed(live_execution_id, failure_reason=str(e))
         raise HTTPException(status_code=409, detail=str(e))
-    except Exception as e:
+    except TargetLockUnavailableError as e:
+        # Provably nothing happened -- raised before any DDL even
+        # starts inside rollback()'s transaction.
         live_repo.mark_rollback_failed(live_execution_id, failure_reason=str(e))
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                f"Rollback failed partway. This execution is left in "
-                f"ROLLING_BACK status and needs manual investigation against "
-                f"the target-side marker before retrying -- automatically "
-                f"guessing its true state here would be worse than leaving "
-                f"it for a human to check. Reason: {e}"
-            ),
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        # Genuinely ambiguous, same reasoning as execute_live's
+        # generic handler: this exception alone doesn't prove whether
+        # the rollback transaction committed. Check the target-side
+        # marker before concluding anything.
+        outcome = writer.check_operation_outcome(
+            record.target_schema, record.live_execution_id, "ROLLBACK"
         )
+        if outcome == "completed":
+            updated = live_repo.mark_rolled_back(live_execution_id)
+            return {
+                "live_execution_id": str(updated.live_execution_id),
+                "status": updated.status,
+                "rolled_back_by": updated.rolled_back_by,
+                "rolled_back_at": updated.rolled_back_at.isoformat(),
+                "note": (
+                    "The original response to this request was lost to a "
+                    "connection error, but the target-side marker confirms "
+                    "the rollback actually committed -- this reflects that, "
+                    "not a new attempt."
+                ),
+            }
+        elif outcome == "not_committed":
+            live_repo.mark_rollback_failed(live_execution_id, failure_reason=str(e))
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Rollback failed and was rolled back at the target "
+                    f"database -- the target table is unchanged from before "
+                    f"this rollback attempt. Reason: {e}"
+                ),
+            )
+        else:
+            live_repo.mark_outcome_unknown(
+                live_execution_id,
+                reason=(
+                    f"Connection error during rollback, and the target-side "
+                    f"marker could not be checked either -- outcome unknown. "
+                    f"Reason: {e}"
+                ),
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    f"Rollback outcome is UNKNOWN -- a connection error occurred "
+                    f"and the target-side marker could not be checked either. "
+                    f"This execution remains in ROLLING_BACK and needs manual "
+                    f"investigation before any retry. Reason: {e}"
+                ),
+            )
 
     updated = live_repo.mark_rolled_back(live_execution_id)
 
