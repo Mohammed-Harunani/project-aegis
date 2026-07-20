@@ -402,3 +402,149 @@ which would reverse a mechanism the user explicitly locked in at the
 start of Phase 2.5. This is called out here so the gap is never
 ambiguous: implementation of 4 and 5 starts only after the user says
 so directly.
+
+## FINAL LOCKED ARCHITECTURE (supersedes the rename-based design above)
+
+The user confirmed directly, in chat, that this redesign is required
+before live execution -- not an optional extension, not a later
+phase. This section is the locked spec; implementation follows it.
+Everything above describing the rename-to-backup mechanism and
+caller-supplied sample_data as a live-execution input is HISTORICAL,
+kept for context on how the design evolved, not a description of the
+current system.
+
+### Trusted source
+
+- New `SOURCE_DATABASE_URL`, validated the same way as
+  `LIVE_DATABASE_URL` (must be PostgreSQL, must have a database name,
+  lazy import so existing tests importing app.py don't break).
+- `POST /simulate-migration-from-source` is the live-capable
+  simulation path. Given `schema_name`, `schema_version`,
+  `source_schema`, `source_table`, it: validates the source
+  identifiers, confirms the source table has a primary key, reads the
+  COMPLETE table in a read-only REPEATABLE READ transaction ordered
+  deterministically by the primary key, computes a source schema
+  fingerprint (column names + Postgres types) and a source dataset
+  fingerprint (reusing compute_dataframe_fingerprint -- the same
+  function that already proves sandbox/live consistency elsewhere),
+  runs sandbox Surgeon against that complete dataset, and persists all
+  of this provenance on both the ticket and the manifest.
+- The existing `POST /simulate-migration` (sample_data) path remains
+  for sandbox-only analysis. Tickets from it are permanently
+  `live_eligible = false` -- checked at execute-live time, not just at
+  approval time, since a caller could otherwise approve a sample_data
+  ticket and still attempt to execute it live.
+- `execute-live` no longer accepts source_schema/source_table from the
+  caller at all -- source identity comes only from the approved
+  ticket's own persisted provenance. Before publishing, Aegis re-reads
+  the source table and requires the SAME source dataset fingerprint as
+  what was approved; any change blocks execution and requires a new
+  simulation and approval. This is the same "prove it still matches
+  what was approved" pattern already used for the sandbox/live
+  Surgeon-output fingerprint -- applied one layer earlier, to the
+  input rather than just the correction.
+
+### Stable-view publication
+
+The rename-to-backup mechanism is retired entirely -- not hardened
+further. Two fixed schemas, not caller-supplied:
+
+- `aegis_publish_data` -- immutable physical version tables, one per
+  execution, named `<logical_target>__<execution_suffix>`, and the
+  target-side marker table. Never renamed, never dropped by Aegis
+  (including on rollback).
+- `aegis_publish` -- stable, consumer-facing views. A live execution
+  does `CREATE OR REPLACE VIEW aegis_publish.<logical_target> AS
+  SELECT <explicit columns> FROM aegis_publish_data.<new physical
+  table>`. Postgres preserves a view's OID across `CREATE OR REPLACE
+  VIEW` as long as the output column names, order, and types stay
+  compatible (columns may be added at the end) -- which is what
+  actually solves the object-identity problem the rename mechanism
+  had: anything referencing the view by OID keeps working across
+  republication, because the view's identity never changes, only what
+  it selects from does.
+- Rollback repoints the view to the execution's own recorded
+  `previous_physical_table` -- it does not drop the current physical
+  version, recreate anything, or touch `aegis_publish_data` beyond
+  that one read.
+- The API accepts only a logical target name; `target_schema` is gone
+  from the request entirely, since there is only ever one valid
+  publication schema now.
+- Explicitly out of scope, per the locked decision: foreign keys
+  targeting the published view, writing through the view, replacing
+  arbitrary tables in `public`, preserving arbitrary trigger/
+  constraint sets on a "target" (there is no arbitrary target
+  anymore), and mutating a source table in place.
+
+### What this replaces
+
+The OID-based "is this the same physical table" tracking from the
+third/fourth correction passes existed because the rename mechanism
+could hand the same NAME to different physical tables over time.
+Immutable, uniquely-suffixed physical version tables that are never
+renamed or reused make that whole class of problem structurally
+unreachable -- there is no "was this table swapped under me" question
+to ask anymore, only "does the marker/view agree on which physical
+table is current," which is a much simpler thing to check.
+
+The session-level advisory locking design from the fourth correction
+pass (held by the caller for the whole execute-live/rollback flow,
+not just the DDL transaction) carries forward unchanged -- locking
+around "don't let two operations touch the same logical_target at
+once" is orthogonal to how publication itself works underneath it.
+
+## Implementation complete
+
+The locked architecture above is now built, not just specified:
+
+- `src/db/source_session.py` -- lazy SOURCE_DATABASE_URL engine,
+  mirrors live_session.py's validation pattern exactly.
+- `src/live_execution/source_connector.py` -- reads a complete source
+  table under REPEATABLE READ + READ ONLY, ordered by primary key
+  (required; a table without one is rejected). Primary key columns
+  are looked up via information_schema.key_column_usage rather than
+  decoding pg_index's indkey directly -- checked first and switched
+  after not being able to fully confirm array_position() behaves
+  correctly against int2vector; the ANSI-standard information_schema
+  path is unambiguous. Reuses compute_dataframe_fingerprint for the
+  dataset fingerprint -- the same function that already proves
+  sandbox/live Surgeon-output consistency, now applied one layer
+  earlier, to the input.
+- `src/live_execution/writer.py` -- rewritten as
+  PostgresPublicationWriter. publish() creates an immutable physical
+  version table and repoints the stable view via CREATE OR REPLACE
+  VIEW in one transaction; structural compatibility (same columns,
+  same order, may append at the end) is checked before attempting the
+  view swap. rollback_to_previous() repoints to the recorded previous
+  version, or drops the view entirely if there wasn't one -- never
+  drops or recreates a physical version table. Session-level locking
+  (hold_target_lock, held by the caller for the whole flow) carries
+  forward unchanged from the prior correction pass.
+- `src/live_execution/safety.py` -- the schema-allowlist gate is gone
+  (nothing left to allowlist, schemas are fixed); live_eligible is
+  the new gate that actually enforces sample_data tickets can never
+  execute live.
+- `src/api/app.py` -- new POST /simulate-migration-from-source
+  (always routes to REQUIRES_HUMAN_APPROVAL, even for a
+  high-confidence repair, since AUTO_APPROVE never creates a ticket
+  and execute-live needs one to reference). execute-live re-reads the
+  source and requires the same dataset fingerprint as what was
+  approved before ever running Surgeon; a mismatch blocks execution
+  (SourceChangedError, 409) rather than publishing against stale
+  provenance. The Surgeon recomputation itself now runs against that
+  freshly-verified read, not the ticket's stored snapshot, so
+  "verified unchanged" and "what actually gets corrected" are
+  provably the same data.
+- Migration 0003 (amended, not a new migration -- not yet applied
+  live) creates the aegis_publish / aegis_publish_data schemas and
+  all the new columns.
+
+Test count: 58 pure-Python (run and passing) + 27 in
+test_live_execution_api.py + 17 in test_api.py + 27 in
+test_schema_registry_api.py = 129 total, 71 needing three disposable
+Postgres databases now (governance, live target, trusted source --
+docker/init-test-db.sql updated to create all three automatically on
+first container init). None of the Postgres-dependent pieces have run
+against a real database in this environment -- everything here is
+written, syntax-checked, and reasoned through as carefully as the
+rest of this project, but unexecuted until run for real.

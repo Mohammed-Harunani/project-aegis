@@ -1,34 +1,32 @@
 """
 Aegis_LiveExecutionRepository
-Phase 2.5 -- governance-database persistence for live_executions.
-Tracks the STATE of a live-execution attempt; the actual target-table
-mutation happens in a separate database via PostgresLiveWriter (see
-Docs/phase2_5_live_execution_spec.md for why these are two connections,
-not one literal atomic transaction).
+Phase 2.5 final architecture -- governance-database persistence for
+live_executions. Tracks the STATE of a live-execution attempt; the
+actual publication happens in a separate database via
+PostgresPublicationWriter (see Docs/phase2_5_live_execution_spec.md
+for why these are two connections, not one literal atomic
+transaction).
 
-Correction-pass design:
+Design carried forward unchanged from the rename-based writer:
 - create_running() creates the record ALREADY in RUNNING status, in
   one committed insert -- not a separate PENDING-then-RUNNING pair of
-  commits. A crash between two separate commits would strand the
-  record at PENDING forever with no reconciliation path; going
-  straight to RUNNING removes that window entirely for this
-  synchronous endpoint. PENDING remains a valid status in the schema
-  (for forward compatibility with a possible future async model) but
-  nothing here creates one.
+  commits, which left a crash window where the record could be
+  stranded at PENDING forever.
 - has_executed_live() covers ROLLED_BACK, not just COMPLETED --
-  originally a rolled-back ticket could be executed live again.
+  a rolled-back ticket must not execute live again.
 - Reconciliation (reconcile_running / reconcile_rolling_back) is
-  staleness-gated: it only acts after AEGIS_LIVE_EXECUTION_STALE_SECONDS
-  has passed since the record entered its current state. Without this,
-  a GET request arriving while a legitimately still-in-progress
-  operation hasn't committed yet would incorrectly mark it FAILED --
-  confirmed this was a real bug in the first version, which reconciled
-  immediately on seeing no marker.
+  staleness-gated AND lock-proven: a timeout alone can only ever prove
+  "a while has passed," never "nothing is still active" -- the
+  session-level advisory lock (held by the caller for the whole
+  execute-live/rollback flow) is what actually proves exclusivity.
 - mark_rolling_back() records who requested the rollback and when
-  BEFORE the risky target-side operation begins, specifically so a
-  crashed/orphaned rollback can still be reconciled to ROLLED_BACK
-  later without needing to ask "who did this" again (the original
-  requester may never get an HTTP response).
+  BEFORE the risky target-side operation begins, so a crashed/orphaned
+  rollback can still be reconciled without needing that information
+  again.
+
+Renamed to match the stable-view model: target_schema/target_table
+are gone (replaced by logical_target); backup_table is gone (replaced
+by physical_table/previous_physical_table).
 """
 
 import os
@@ -58,7 +56,7 @@ class LiveExecutionInvalidStateError(Exception):
 # one-shot per ticket, matching the partial unique index in the model.
 _TICKET_ACTIVE_OR_DONE_STATUSES = ("PENDING", "RUNNING", "COMPLETED", "ROLLING_BACK", "ROLLED_BACK")
 
-# Statuses that mean "this exact target table is currently busy" --
+# Statuses that mean "this logical target is currently busy" --
 # ROLLING_BACK is included: the target database is actively being
 # mutated by that operation too.
 _TARGET_IN_FLIGHT_STATUSES = ("PENDING", "RUNNING", "ROLLING_BACK")
@@ -90,12 +88,11 @@ class LiveExecutionRepository:
             is not None
         )
 
-    def has_unresolved_execution_for_target(self, target_schema: str, target_table: str) -> bool:
+    def has_unresolved_execution_for_target(self, logical_target: str) -> bool:
         return (
             self.db.query(LiveExecutionRecord)
             .filter(
-                LiveExecutionRecord.target_schema == target_schema,
-                LiveExecutionRecord.target_table == target_table,
+                LiveExecutionRecord.logical_target == logical_target,
                 LiveExecutionRecord.status.in_(_TARGET_IN_FLIGHT_STATUSES),
             )
             .first()
@@ -103,22 +100,21 @@ class LiveExecutionRepository:
         )
 
     def is_latest_completed_execution_for_target(
-        self, live_execution_id: str, target_schema: str, target_table: str
+        self, live_execution_id: str, logical_target: str
     ) -> bool:
         """
-        Governance-side counterpart to PostgresLiveWriter's target-side
-        identity check -- confirms no COMPLETED execution newer than
-        this one exists for the same target. Both checks are required:
-        this one guards against governance-recorded supersession, the
-        target-side OID check guards against the target table itself
-        having been changed by something the governance database
-        doesn't know about.
+        Governance-side counterpart to the writer's own target-side
+        marker check -- confirms no COMPLETED execution newer than
+        this one exists for the same logical target. Both checks are
+        required: this one guards against governance-recorded
+        supersession, the target-side marker check guards against the
+        published view having been changed by something the
+        governance database doesn't know about.
         """
         latest = (
             self.db.query(LiveExecutionRecord)
             .filter(
-                LiveExecutionRecord.target_schema == target_schema,
-                LiveExecutionRecord.target_table == target_table,
+                LiveExecutionRecord.logical_target == logical_target,
                 LiveExecutionRecord.status.in_(["COMPLETED", "ROLLING_BACK", "ROLLED_BACK"]),
             )
             .order_by(LiveExecutionRecord.completed_at.desc())
@@ -131,27 +127,30 @@ class LiveExecutionRepository:
         ticket_id: str,
         sandbox_manifest_id: str,
         schema_version_id: str,
-        target_schema: str,
-        target_table: str,
+        logical_target: str,
         requested_by: str,
         original_row_count: int,
         final_row_count: int,
         risk_level: str,
         integrity_status: str,
+        source_schema: Optional[str] = None,
+        source_table: Optional[str] = None,
+        source_dataset_fingerprint: Optional[str] = None,
     ) -> LiveExecutionRecord:
         """
-        Creates the record already RUNNING, in one committed insert --
-        see the module docstring for why this replaces a separate
-        PENDING-then-RUNNING pair of commits.
+        Creates the record already RUNNING, in one committed insert.
+        source_* fields are copied from the ticket's own persisted
+        provenance for an independent audit trail on this specific
+        execution.
         """
         record = LiveExecutionRecord(
             live_execution_id=uuid.uuid4(),
             ticket_id=uuid.UUID(ticket_id),
             sandbox_manifest_id=uuid.UUID(sandbox_manifest_id),
             schema_version_id=uuid.UUID(schema_version_id),
-            target_schema=target_schema,
-            target_table=target_table,
-            backup_table=None,
+            logical_target=logical_target,
+            physical_table=None,
+            previous_physical_table=None,
             status="RUNNING",
             requested_by=requested_by,
             started_at=datetime.now(UTC),
@@ -159,6 +158,9 @@ class LiveExecutionRepository:
             final_row_count=final_row_count,
             risk_level=risk_level,
             integrity_status=integrity_status,
+            source_schema=source_schema,
+            source_table=source_table,
+            source_dataset_fingerprint=source_dataset_fingerprint,
         )
         self.db.add(record)
         try:
@@ -211,11 +213,16 @@ class LiveExecutionRepository:
         return self._get(live_execution_id)
 
     def mark_completed(
-        self, live_execution_id, backup_table: Optional[str], final_row_count: int
+        self,
+        live_execution_id,
+        physical_table: Optional[str],
+        previous_physical_table: Optional[str],
+        final_row_count: int,
     ) -> None:
         record = self._get(live_execution_id)
         record.status = "COMPLETED"
-        record.backup_table = backup_table
+        record.physical_table = physical_table
+        record.previous_physical_table = previous_physical_table
         record.final_row_count = final_row_count
         record.completed_at = datetime.now(UTC)
         self.db.commit()
@@ -262,9 +269,7 @@ class LiveExecutionRepository:
         (RUNNING or ROLLING_BACK). Neither FAILED (which is retryable
         and could create a duplicate publication if it actually did
         commit) nor COMPLETED (which would hide a real failure if it
-        didn't) would be honest here. This needs manual investigation
-        against the target-side marker once it's reachable again, not
-        an automatic guess in either direction.
+        didn't) would be honest here.
         """
         record = self._get(live_execution_id)
         record.failure_reason = reason
@@ -285,13 +290,10 @@ class LiveExecutionRepository:
     def reconcile_running(self, live_execution_id, writer) -> LiveExecutionRecord:
         """
         Recovers a stuck RUNNING record's true state. Staleness is a
-        cheap first filter (skip the lock/marker check entirely for a
-        record that's still fresh); the actual proof comes from
+        cheap first filter; the actual proof comes from
         writer.determine_outcome_under_lock(), which acquires the same
         session-level lock genuine operations hold and checks the
-        marker WHILE holding it -- closing the gap where testing the
-        lock and checking the marker as two separate steps could let
-        something else start in between.
+        marker WHILE holding it.
         """
         record = self._get(live_execution_id)
         if record.status != "RUNNING":
@@ -302,12 +304,10 @@ class LiveExecutionRepository:
             return record
 
         outcome = writer.determine_outcome_under_lock(
-            record.target_schema, record.target_table, record.live_execution_id, "PROMOTE"
+            record.logical_target, record.live_execution_id, "PUBLISH"
         )
 
         if outcome == "active":
-            # Something genuinely still holds the lock -- definitive
-            # proof of activity a timeout alone could never provide.
             return record
         if outcome == "unknown":
             record.failure_reason = (
@@ -318,16 +318,19 @@ class LiveExecutionRepository:
             self.db.refresh(record)
             return record
         if outcome == "completed":
-            markers = writer.get_marker_for_execution(record.target_schema, record.live_execution_id)
-            promote_marker = next((m for m in markers if m["operation"] == "PROMOTE"), None)
+            markers = writer.get_marker_for_execution(record.live_execution_id)
+            publish_marker = next((m for m in markers if m["operation"] == "PUBLISH"), None)
             record.status = "COMPLETED"
-            record.backup_table = promote_marker["backup_table"] if promote_marker else None
+            record.physical_table = publish_marker["physical_table"] if publish_marker else None
+            record.previous_physical_table = (
+                publish_marker["previous_physical_table"] if publish_marker else None
+            )
             record.completed_at = datetime.now(UTC)
         else:  # "not_committed"
             record.status = "FAILED"
             record.failure_reason = (
                 f"Reconciled after {age_seconds:.0f}s: the target lock was free (proving "
-                f"nothing is active) and no target-side PROMOTE marker exists -- treating "
+                f"nothing is active) and no target-side PUBLISH marker exists -- treating "
                 f"as failed rather than left stuck RUNNING."
             )
             record.completed_at = datetime.now(UTC)
@@ -351,7 +354,7 @@ class LiveExecutionRepository:
             return record
 
         outcome = writer.determine_outcome_under_lock(
-            record.target_schema, record.target_table, record.live_execution_id, "ROLLBACK"
+            record.logical_target, record.live_execution_id, "ROLLBACK"
         )
 
         if outcome == "active":
@@ -372,9 +375,6 @@ class LiveExecutionRepository:
         # "not_committed": leave it in ROLLING_BACK -- this needs
         # manual investigation, same as the synchronous failure path;
         # guessing wrong here (e.g. reverting to COMPLETED) could be
-        # worse than leaving it for a human. The lock being free here
-        # DOES prove nothing is actively retrying it, but that alone
-        # doesn't tell us it's safe to assume any particular resting
-        # state beyond what it already is.
+        # worse than leaving it for a human.
 
         return record

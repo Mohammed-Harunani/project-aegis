@@ -59,6 +59,19 @@ class ApprovalTicket:
     # requests, which never reference the registry at all.
     schema_version_id: Optional[str] = None
 
+    # Phase 2.5 final architecture -- trusted-source provenance. None
+    # for sample_data tickets (/simulate-migration); populated for
+    # /simulate-migration-from-source tickets. live_eligible is the
+    # enforced gate: a sample_data ticket can be approved but can
+    # never execute live.
+    source_schema: Optional[str] = None
+    source_table: Optional[str] = None
+    source_primary_key: Optional[List[str]] = None
+    source_row_count: Optional[int] = None
+    source_schema_fingerprint: Optional[str] = None
+    source_dataset_fingerprint: Optional[str] = None
+    live_eligible: bool = False
+
 
 class ApprovalQueue:
     """

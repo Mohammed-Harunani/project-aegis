@@ -1,20 +1,28 @@
 """
 Aegis_LiveExecutionSafetyPolicy
-Phase 2.5 -- the 15 mandatory gates a repair must pass before it can
-execute live. Deliberately takes plain primitives, not ORM/ticket
-objects, so it's fully testable without a database at all -- the
-caller (app.py) is responsible for extracting these values from the
-real ticket/manifest records.
+Phase 2.5 final architecture -- the mandatory gates a repair must pass
+before it can execute live. Deliberately takes plain primitives, not
+ORM/ticket objects, so it's fully testable without a database at all
+-- the caller (app.py) is responsible for extracting these values
+from the real ticket/manifest records.
 
 Two exception types map to two different HTTP statuses in app.py:
 LiveExecutionConflictError (409) for state conflicts -- already
 executed, another execution in flight against the same target.
 LiveExecutionNotAllowedError (422) for everything else -- the ticket
 or request doesn't meet a live-execution requirement.
+
+The target-schema-allowlist gate from the rename-based design is gone
+entirely -- publication schemas (aegis_publish / aegis_publish_data)
+are fixed, not caller-configurable, so there's nothing left to
+allowlist. In its place: live_eligible, the gate that actually closes
+the gap the whole redesign was for -- a sample_data ticket
+(/simulate-migration) is permanently ineligible for live execution,
+enforced here rather than only at approval time.
 """
 
 import os
-from typing import List, Optional
+from typing import Optional
 
 from src.live_execution.identifiers import validate_identifier, InvalidIdentifierError
 
@@ -37,11 +45,6 @@ def live_execution_globally_enabled() -> bool:
     return os.environ.get("AEGIS_LIVE_EXECUTION_ENABLED", "false").strip().lower() == "true"
 
 
-def get_target_schema_allowlist() -> List[str]:
-    raw = os.environ.get("AEGIS_LIVE_TARGET_SCHEMA_ALLOWLIST", "")
-    return [s.strip() for s in raw.split(",") if s.strip()]
-
-
 def validate_and_normalize_operator(operator: str) -> str:
     stripped = (operator or "").strip()
     if not stripped:
@@ -53,11 +56,10 @@ def verify_output_fingerprint_match(sandbox_fingerprint: Optional[str], live_fin
     """
     Separate from evaluate_safety_gates() on purpose: this can only be
     checked AFTER Surgeon actually recomputes the correction, which
-    (per the correction pass fixing issue 1) must happen only after a
-    durable RUNNING execution record already exists -- otherwise a
-    Surgeon failure has nothing to mark FAILED and the record is
-    stuck. So this runs inside that same protected block, not as part
-    of the earlier pre-flight gate evaluation.
+    must happen only after a durable RUNNING execution record already
+    exists -- otherwise a Surgeon failure has nothing to mark FAILED
+    and the record is stuck. So this runs inside that same protected
+    block, not as part of the earlier pre-flight gate evaluation.
     """
     if not sandbox_fingerprint:
         raise LiveExecutionNotAllowedError(
@@ -82,12 +84,11 @@ def evaluate_safety_gates(
     original_row_count: int,
     final_row_count: int,
     proposed_action: str,
-    target_schema: str,
-    target_table: str,
-    source_schema: str,
-    source_table: str,
+    logical_target: str,
+    live_eligible: bool,
+    source_schema: Optional[str],
+    source_table: Optional[str],
     confirm: bool,
-    schema_allowlist: List[str],
     already_executed_live: bool,
     unresolved_execution_exists_for_target: bool,
 ) -> None:
@@ -135,31 +136,42 @@ def evaluate_safety_gates(
             "Destructive repairs (WITH_DROP_INVALID) are prohibited for live execution."
         )
 
-    # Gates 9-10: allowlisted schema, explicit table (Pydantic already
-    # makes target_schema/target_table required -- this re-validates
-    # the identifiers themselves are safe to put in DDL).
+    # Gate 9: the logical target name is safe to put in DDL. There is
+    # no schema allowlist anymore -- aegis_publish/aegis_publish_data
+    # are fixed, not caller-configurable, so there's nothing left to
+    # allowlist against.
     try:
-        validate_identifier(target_schema, "target schema")
-        validate_identifier(target_table, "target table")
+        validate_identifier(logical_target, "logical target")
     except InvalidIdentifierError as e:
         raise LiveExecutionNotAllowedError(str(e))
 
-    if target_schema not in schema_allowlist:
+    # Gate 10 (final architecture): this is THE gate that actually
+    # closes the sample_data gap -- a ticket from /simulate-migration
+    # is permanently ineligible for live execution, no matter its
+    # approval status. Enforced here (execute-live time), not just at
+    # approval, since approval alone doesn't prevent someone from
+    # attempting execute-live afterward.
+    if not live_eligible:
         raise LiveExecutionNotAllowedError(
-            f"Target schema {target_schema!r} is not in the allowlisted set: {schema_allowlist}."
+            "This ticket is not live-eligible -- it was created via "
+            "/simulate-migration (sample_data), which can never execute live. "
+            "Live execution requires /simulate-migration-from-source, which "
+            "reads a complete, trusted dataset with verifiable provenance."
         )
 
-    # Gate 11: target != source. source_schema/source_table are now
-    # mandatory -- originally optional, which converted a mandatory
-    # safety gate into something a caller could simply omit to bypass.
-    if (source_schema, source_table) == (target_schema, target_table):
+    # Gate 11: the source table must not itself be inside Aegis's own
+    # publication schemas -- a defensive check against a degenerate
+    # self-referential loop. Structurally much less likely to collide
+    # now than under the old design (source is a real, DB-verified
+    # table; target is a fixed-schema logical name), but cheap to
+    # check and worth keeping.
+    if source_schema in ("aegis_publish", "aegis_publish_data"):
         raise LiveExecutionNotAllowedError(
-            "Target must not be the same as the original source table."
+            f"Source schema {source_schema!r} must not be one of Aegis's own "
+            f"publication schemas."
         )
 
-    # Gate 14: explicit confirmation (kept in gate order 14 per the
-    # spec, though checked here rather than after 12-13 -- ordering
-    # among independent gates doesn't change which ones are enforced).
+    # Gate 14: explicit confirmation.
     if not confirm:
         raise LiveExecutionNotAllowedError(
             "Live execution requires explicit confirmation (confirm=true)."
@@ -175,11 +187,12 @@ def evaluate_safety_gates(
     if unresolved_execution_exists_for_target:
         raise LiveExecutionConflictError(
             f"An unresolved (PENDING/RUNNING/ROLLING_BACK) live execution already "
-            f"exists for {target_schema}.{target_table}."
+            f"exists for logical target {logical_target!r}."
         )
 
-    # Gate 15 (PostgreSQL validation before promotion) happens inside
-    # the writer during the actual DDL transaction. The sandbox/live
-    # output-fingerprint match is verified separately, via
-    # verify_output_fingerprint_match() -- see that function's
-    # docstring for why it can't be folded in here.
+    # Gate 15 (PostgreSQL validation before publication) happens
+    # inside the writer during the actual DDL transaction. The
+    # sandbox/live output-fingerprint match and the source-unchanged
+    # check are verified separately -- both need an actual read
+    # (Surgeon recomputation, source re-read) that can't happen inside
+    # this pure, DB-free gate evaluation.

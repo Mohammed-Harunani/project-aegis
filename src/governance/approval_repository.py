@@ -208,6 +208,13 @@ def _record_to_ticket(record: ApprovalTicketRecord) -> ApprovalTicket:
         decided_at=record.decided_at.isoformat() if record.decided_at else None,
         decision_note=record.decision_note,
         schema_version_id=str(record.schema_version_id) if record.schema_version_id else None,
+        source_schema=record.source_schema,
+        source_table=record.source_table,
+        source_primary_key=record.source_primary_key,
+        source_row_count=record.source_row_count,
+        source_schema_fingerprint=record.source_schema_fingerprint,
+        source_dataset_fingerprint=record.source_dataset_fingerprint,
+        live_eligible=bool(record.live_eligible),
     )
 
 
@@ -228,6 +235,13 @@ class PostgresApprovalRepository:
         gold_schema: ObservedSchema,
         target_dataset: pd.DataFrame,
         schema_version_id: str = None,
+        source_schema: str = None,
+        source_table: str = None,
+        source_primary_key: list = None,
+        source_row_count: int = None,
+        source_schema_fingerprint: str = None,
+        source_dataset_fingerprint: str = None,
+        live_eligible: bool = False,
     ) -> ApprovalTicket:
         record = ApprovalTicketRecord(
             ticket_id=uuid.uuid4(),
@@ -240,6 +254,13 @@ class PostgresApprovalRepository:
             gold_schema=_schema_to_json(gold_schema),
             target_dataset=_dataset_to_json(target_dataset),
             schema_version_id=uuid.UUID(schema_version_id) if schema_version_id else None,
+            source_schema=source_schema,
+            source_table=source_table,
+            source_primary_key=source_primary_key,
+            source_row_count=source_row_count,
+            source_schema_fingerprint=source_schema_fingerprint,
+            source_dataset_fingerprint=source_dataset_fingerprint,
+            live_eligible=live_eligible,
         )
         self.db.add(record)
         self.db.commit()

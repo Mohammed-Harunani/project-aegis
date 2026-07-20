@@ -1,7 +1,7 @@
 """
-Pure-Python tests for Phase 2.5's identifier validation and dtype
-mapping. No database dependency -- these run in any environment,
-unlike the rest of Phase 2.5's tests.
+Pure-Python tests for Phase 2.5's identifier validation, dtype
+mapping, and safety gates. No database dependency -- these run in any
+environment, unlike the rest of Phase 2.5's tests.
 """
 
 import uuid
@@ -9,8 +9,8 @@ import uuid
 from live_execution.identifiers import (
     InvalidIdentifierError,
     validate_identifier,
-    shadow_table_name,
-    backup_table_name,
+    physical_version_table_name,
+    MAX_IDENTIFIER_LENGTH,
 )
 from live_execution.dtype_mapping import (
     UnsupportedDtypeError,
@@ -20,8 +20,8 @@ from live_execution.safety import (
     LiveExecutionNotAllowedError,
     LiveExecutionConflictError,
     evaluate_safety_gates,
-    get_target_schema_allowlist,
     verify_output_fingerprint_match,
+    validate_and_normalize_operator,
 )
 
 
@@ -51,45 +51,39 @@ def test_invalid_identifiers_rejected():
 def test_sql_injection_attempt_rejected():
     malicious = 'customer_master"; DROP TABLE approval_tickets; --'
     try:
-        validate_identifier(malicious, "target table")
+        validate_identifier(malicious, "logical target")
         assert False, "expected rejection"
     except InvalidIdentifierError:
         pass
 
 
-def test_shadow_and_backup_table_names_are_distinct_and_deterministic():
+def test_physical_version_table_name_deterministic_and_distinct():
     execution_id = uuid.uuid4()
-    shadow = shadow_table_name("customer_master", execution_id)
-    backup = backup_table_name("customer_master", execution_id)
+    name = physical_version_table_name("customer_master", execution_id)
+    assert name.startswith("customer_master__")
+    # Deterministic given the same execution_id.
+    assert physical_version_table_name("customer_master", execution_id) == name
 
-    assert shadow != backup
-    assert shadow.startswith("customer_master__aegis_shadow_")
-    assert backup.startswith("customer_master__aegis_backup_")
-    # Deterministic given the same execution_id -- calling again must match.
-    assert shadow_table_name("customer_master", execution_id) == shadow
+    other_execution_id = uuid.uuid4()
+    other_name = physical_version_table_name("customer_master", other_execution_id)
+    assert name != other_name
 
 
 def test_generated_names_never_exceed_postgres_identifier_limit():
     """
-    The specific bug this replaced: a 63-char target_table name caused
-    the naive version to silently truncate away the ENTIRE suffix,
-    including the shadow/backup marker itself -- making shadow and
-    backup names identical and colliding across different executions.
+    The specific bug this replaced: a 63-char logical_target name
+    caused the naive version to silently truncate away the ENTIRE
+    suffix, making two different executions' names collide.
     """
-    from live_execution.identifiers import MAX_IDENTIFIER_LENGTH
-
     long_name = "a" * 63
     exec_id_1 = uuid.uuid4()
     exec_id_2 = uuid.uuid4()
 
-    shadow_1 = shadow_table_name(long_name, exec_id_1)
-    backup_1 = backup_table_name(long_name, exec_id_1)
-    shadow_2 = shadow_table_name(long_name, exec_id_2)
+    name_1 = physical_version_table_name(long_name, exec_id_1)
+    name_2 = physical_version_table_name(long_name, exec_id_2)
 
-    assert len(shadow_1) <= MAX_IDENTIFIER_LENGTH
-    assert len(backup_1) <= MAX_IDENTIFIER_LENGTH
-    assert shadow_1 != backup_1, "shadow and backup must differ even when truncated"
-    assert shadow_1 != shadow_2, "different executions must not collide even when truncated"
+    assert len(name_1) <= MAX_IDENTIFIER_LENGTH
+    assert name_1 != name_2, "different executions must not collide even when truncated"
 
 
 def test_dtype_mapping_known_types():
@@ -118,12 +112,11 @@ def _valid_gate_kwargs(**overrides):
         original_row_count=10,
         final_row_count=10,
         proposed_action="RENAME_COLUMN Customer_ID -> customer_id",
-        target_schema="warehouse",
-        target_table="customer_master_live",
+        logical_target="customer_master",
+        live_eligible=True,
         source_schema="raw",
         source_table="customer_master_source",
         confirm=True,
-        schema_allowlist=["warehouse"],
         already_executed_live=False,
         unresolved_execution_exists_for_target=False,
     )
@@ -185,39 +178,46 @@ def test_destructive_repair_rejected():
         pass
 
 
-def test_non_allowlisted_schema_rejected():
+def test_unsafe_logical_target_identifier_rejected():
     try:
-        evaluate_safety_gates(**_valid_gate_kwargs(target_schema="not_allowlisted"))
+        evaluate_safety_gates(**_valid_gate_kwargs(logical_target='x"; DROP TABLE approval_tickets; --'))
         assert False
     except LiveExecutionNotAllowedError:
         pass
 
 
-def test_unsafe_target_identifier_rejected():
+def test_sample_data_ticket_rejected_via_live_eligible_gate():
+    """
+    The core safety property of the final architecture: a ticket from
+    /simulate-migration (sample_data) is permanently live_eligible =
+    false, and this gate is what actually enforces it can never
+    execute live, regardless of approval status.
+    """
     try:
-        evaluate_safety_gates(**_valid_gate_kwargs(target_table='x"; DROP TABLE approval_tickets; --'))
+        evaluate_safety_gates(**_valid_gate_kwargs(live_eligible=False))
+        assert False
+    except LiveExecutionNotAllowedError as e:
+        assert "live-eligible" in str(e) or "live_eligible" in str(e).lower()
+
+
+def test_live_eligible_ticket_passes():
+    evaluate_safety_gates(**_valid_gate_kwargs(live_eligible=True))  # must not raise
+
+
+def test_source_from_publication_schema_rejected():
+    """Defensive check against a degenerate self-referential loop --
+    the source table must not itself live inside Aegis's own
+    publication schemas."""
+    try:
+        evaluate_safety_gates(**_valid_gate_kwargs(source_schema="aegis_publish"))
         assert False
     except LiveExecutionNotAllowedError:
         pass
-
-
-def test_target_same_as_source_rejected():
-    """source_schema/source_table are now mandatory -- originally
-    optional, which converted a mandatory safety gate into one a
-    caller could simply omit to bypass."""
     try:
-        evaluate_safety_gates(**_valid_gate_kwargs(
-            source_schema="warehouse", source_table="customer_master_live",
-        ))
+        evaluate_safety_gates(**_valid_gate_kwargs(source_schema="aegis_publish_data"))
         assert False
     except LiveExecutionNotAllowedError:
         pass
-
-
-def test_target_different_from_source_passes():
-    evaluate_safety_gates(**_valid_gate_kwargs(
-        source_schema="warehouse", source_table="customer_master_source",
-    ))  # must not raise
 
 
 def test_missing_confirmation_rejected():
@@ -230,9 +230,9 @@ def test_missing_confirmation_rejected():
 
 def test_already_executed_live_is_a_conflict_not_a_422():
     """State conflicts (already executed, in-flight elsewhere) map to
-    409 in app.py, distinct from validity failures (422). This now
-    also covers a rolled-back ticket -- originally only COMPLETED
-    blocked re-execution, letting a rolled-back ticket run again."""
+    409 in app.py, distinct from validity failures (422). This also
+    covers a rolled-back ticket -- a rolled-back ticket must not
+    execute live again."""
     try:
         evaluate_safety_gates(**_valid_gate_kwargs(already_executed_live=True))
         assert False
@@ -257,9 +257,9 @@ def test_missing_sandbox_fingerprint_rejected():
 
 
 def test_fingerprint_mismatch_rejected():
-    """The core of issue 8: if the live recomputation doesn't match
-    what was actually approved in sandbox, refuse to publish --
-    something changed since approval."""
+    """If the live recomputation doesn't match what was actually
+    approved in sandbox, refuse to publish -- something changed since
+    approval."""
     try:
         verify_output_fingerprint_match(sandbox_fingerprint="abc123", live_fingerprint="different456")
         assert False
@@ -271,17 +271,7 @@ def test_matching_fingerprint_passes():
     verify_output_fingerprint_match(sandbox_fingerprint="xyz789", live_fingerprint="xyz789")  # must not raise
 
 
-def test_schema_allowlist_parsing():
-    import os
-    os.environ["AEGIS_LIVE_TARGET_SCHEMA_ALLOWLIST"] = " warehouse , reporting ,, "
-    assert get_target_schema_allowlist() == ["warehouse", "reporting"]
-    del os.environ["AEGIS_LIVE_TARGET_SCHEMA_ALLOWLIST"]
-    assert get_target_schema_allowlist() == []
-
-
 def test_operator_validation_strips_and_rejects_empty():
-    from live_execution.safety import validate_and_normalize_operator
-
     assert validate_and_normalize_operator("  mo  ") == "mo"
     for bad in ["", "   ", None]:
         try:

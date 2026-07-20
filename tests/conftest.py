@@ -97,3 +97,44 @@ def get_verified_live_test_database_url():
 
     os.environ["LIVE_DATABASE_URL"] = live_test_url
     return live_test_url
+
+
+def get_verified_source_test_database_url():
+    """
+    Third test database, for Phase 2.5's final trusted-source
+    architecture -- source_connector.py reads real tables from here.
+    Requires exactly 'aegis_source_test', distinct from aegis_test
+    (governance) and aegis_live_test (publication target), for the
+    same reason as both of those: a mistaken environment variable
+    pointing at some other real database would be destructive, since
+    this test suite creates and drops source tables.
+    """
+    import os
+    import pytest
+
+    source_test_url = os.environ.get("SOURCE_TEST_DATABASE_URL")
+    if not source_test_url:
+        pytest.skip(
+            "SOURCE_TEST_DATABASE_URL is not set. Trusted-source tests need a "
+            "real, disposable database distinct from aegis, aegis_test, and "
+            "aegis_live_test. See Docs/phase2_5_live_execution_spec.md.",
+            allow_module_level=True,
+        )
+
+    from sqlalchemy.engine import make_url
+
+    parsed = make_url(source_test_url)
+    if not parsed.drivername.startswith("postgresql"):
+        raise RuntimeError(
+            f"SOURCE_TEST_DATABASE_URL must be a PostgreSQL connection string "
+            f"(got drivername {parsed.drivername!r})."
+        )
+    if parsed.database != "aegis_source_test":
+        raise RuntimeError(
+            f"SOURCE_TEST_DATABASE_URL must point at exactly 'aegis_source_test', "
+            f"not {parsed.database!r} -- refusing to run tests that create/drop "
+            f"tables against anything else."
+        )
+
+    os.environ["SOURCE_DATABASE_URL"] = source_test_url
+    return source_test_url

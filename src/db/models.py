@@ -12,7 +12,7 @@ models cannot be exercised against SQLite as a stand-in for testing.
 
 import uuid
 
-from sqlalchemy import Column, Text, Numeric, DateTime, Integer, ForeignKey, UniqueConstraint, Index, text, CheckConstraint
+from sqlalchemy import Column, Text, Numeric, DateTime, Integer, ForeignKey, UniqueConstraint, Index, text, CheckConstraint, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base
 
@@ -45,6 +45,20 @@ class ApprovalTicketRecord(Base):
     schema_version_id = Column(
         UUID(as_uuid=True), ForeignKey("schema_versions.schema_version_id"), nullable=True
     )
+
+    # Phase 2.5 final architecture -- trusted-source provenance.
+    # NULL for sample_data tickets (/simulate-migration); populated
+    # for /simulate-migration-from-source tickets. live_eligible is
+    # the enforced gate: a sample_data ticket can be approved (still
+    # useful for sandbox analysis) but can never execute live,
+    # checked at execute-live time, not just at approval time.
+    source_schema = Column(Text, nullable=True)
+    source_table = Column(Text, nullable=True)
+    source_primary_key = Column(JSONB, nullable=True)
+    source_row_count = Column(Integer, nullable=True)
+    source_schema_fingerprint = Column(Text, nullable=True)
+    source_dataset_fingerprint = Column(Text, nullable=True)
+    live_eligible = Column(Boolean, nullable=False, default=False)
 
 
 class HealingManifestRecord(Base):
@@ -79,6 +93,16 @@ class HealingManifestRecord(Base):
     # was actually validated here in sandbox, not just the same row
     # count. See src/live_execution/output_fingerprint.py.
     corrected_output_fingerprint = Column(Text, nullable=True)
+
+    # Phase 2.5 final architecture -- mirrors the ticket's own source
+    # provenance at manifest-creation time, independent of whatever
+    # the ticket looks like later.
+    source_schema = Column(Text, nullable=True)
+    source_table = Column(Text, nullable=True)
+    source_primary_key = Column(JSONB, nullable=True)
+    source_row_count = Column(Integer, nullable=True)
+    source_schema_fingerprint = Column(Text, nullable=True)
+    source_dataset_fingerprint = Column(Text, nullable=True)
 
     # Phase 2.4 -- nullable independently of ticket_id: an
     # auto-approved execution has no ticket AT ALL, but may still have
@@ -130,13 +154,15 @@ class LiveExecutionRecord(Base):
             ),
         ),
         # No two different tickets can have an unresolved (in-flight)
-        # live execution against the same target table at once.
-        # ROLLING_BACK is included -- a target actively being rolled
-        # back is still busy; the target database is being mutated by
-        # that operation, so a new promote() must not race it.
+        # live execution against the same logical target at once.
+        # Keyed on logical_target alone now -- schemas are fixed
+        # (aegis_publish / aegis_publish_data), not caller-supplied, so
+        # there's nothing else to disambiguate on. ROLLING_BACK is
+        # included -- a target actively being rolled back is still
+        # busy.
         Index(
             "uq_live_executions_target_in_flight",
-            "target_schema", "target_table",
+            "logical_target",
             unique=True,
             postgresql_where=text("status IN ('PENDING', 'RUNNING', 'ROLLING_BACK')"),
         ),
@@ -154,9 +180,22 @@ class LiveExecutionRecord(Base):
     schema_version_id = Column(
         UUID(as_uuid=True), ForeignKey("schema_versions.schema_version_id"), nullable=False
     )
-    target_schema = Column(Text, nullable=False)
-    target_table = Column(Text, nullable=False)
-    backup_table = Column(Text, nullable=True)
+
+    # Phase 2.5 final architecture -- replaces target_schema/
+    # target_table/backup_table entirely. There is no caller-supplied
+    # schema anymore: publication always happens in the fixed
+    # aegis_publish (stable views) / aegis_publish_data (immutable
+    # physical versions) schemas. logical_target is the single name
+    # used for both. physical_table is the NEW immutable version this
+    # execution created (e.g. "customer_master__a1b2c3d4"), never
+    # renamed or reused. previous_physical_table is whatever the
+    # stable view pointed to immediately before this execution, so
+    # rollback knows what to repoint to -- rollback never drops or
+    # recreates anything, only repoints the view.
+    logical_target = Column(Text, nullable=False)
+    physical_table = Column(Text, nullable=True)
+    previous_physical_table = Column(Text, nullable=True)
+
     status = Column(Text, nullable=False)
     requested_by = Column(Text, nullable=False)
     started_at = Column(DateTime(timezone=True), nullable=False)
@@ -175,3 +214,12 @@ class LiveExecutionRecord(Base):
     final_row_count = Column(Integer, nullable=False)
     risk_level = Column(Text, nullable=False)
     integrity_status = Column(Text, nullable=False)
+
+    # Phase 2.5 final architecture -- copied from the ticket at
+    # execution time for an independent audit trail, and re-verified
+    # (source re-read, fingerprint compared) immediately before
+    # publishing -- a source change between approval and execution
+    # blocks the execution rather than silently publishing stale data.
+    source_schema = Column(Text, nullable=True)
+    source_table = Column(Text, nullable=True)
+    source_dataset_fingerprint = Column(Text, nullable=True)

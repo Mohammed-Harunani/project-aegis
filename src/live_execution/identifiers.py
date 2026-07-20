@@ -40,26 +40,24 @@ MAX_IDENTIFIER_LENGTH = 63
 _EXECUTION_ID_SUFFIX_CHARS = 16  # 64 bits -- ample collision resistance at this system's realistic volume
 
 
-def _controlled_suffixed_name(target_table: str, marker: str, execution_id) -> str:
+def physical_version_table_name(logical_target: str, execution_id) -> str:
     """
-    Builds a name guaranteed to fit within Postgres's 63-byte identifier
-    limit, however long target_table is. The naive version (just
-    concatenating table + marker + full UUID hex) silently overflows
-    for any target_table anywhere close to 63 characters -- confirmed
-    directly: a 63-char table name caused Postgres to truncate away
-    the ENTIRE suffix, including the shadow/backup marker itself,
-    making shadow and backup names identical and colliding across
-    different executions. The fix reserves a fixed-length suffix
-    first, then truncates the table-name portion to whatever's left.
+    Builds the name of the immutable physical version table this
+    execution creates, e.g. "customer_master__a1b2c3d4e5f60718" --
+    guaranteed to fit within Postgres's 63-byte identifier limit
+    however long logical_target is. The naive version (just
+    concatenating logical_target + full UUID hex) silently overflows
+    for any logical_target anywhere close to 63 characters -- confirmed
+    directly in an earlier design: a 63-char name caused Postgres to
+    truncate away the entire suffix, making two different executions'
+    names collide. This reserves a fixed-length suffix first, then
+    truncates the logical_target portion to whatever's left.
+
+    Unlike the retired shadow/backup naming, there's only ONE physical
+    table per execution now (the stable view, not a second renamed
+    table, is what represents "the previous version"), so there's no
+    marker word needed in the suffix -- just the execution ID itself.
     """
-    suffix = f"__aegis_{marker}_{execution_id.hex[:_EXECUTION_ID_SUFFIX_CHARS]}"
-    available_for_table = MAX_IDENTIFIER_LENGTH - len(suffix)
-    return f"{target_table[:available_for_table]}{suffix}"
-
-
-def shadow_table_name(target_table: str, execution_id) -> str:
-    return _controlled_suffixed_name(target_table, "shadow", execution_id)
-
-
-def backup_table_name(target_table: str, execution_id) -> str:
-    return _controlled_suffixed_name(target_table, "backup", execution_id)
+    suffix = f"__{execution_id.hex[:_EXECUTION_ID_SUFFIX_CHARS]}"
+    available_for_logical_target = MAX_IDENTIFIER_LENGTH - len(suffix)
+    return f"{logical_target[:available_for_logical_target]}{suffix}"

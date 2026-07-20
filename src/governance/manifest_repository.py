@@ -24,6 +24,12 @@ def save_manifest(
     ticket_id: Optional[str] = None,
     schema_version_id: Optional[str] = None,
     corrected_output_fingerprint: Optional[str] = None,
+    source_schema: Optional[str] = None,
+    source_table: Optional[str] = None,
+    source_primary_key: Optional[list] = None,
+    source_row_count: Optional[int] = None,
+    source_schema_fingerprint: Optional[str] = None,
+    source_dataset_fingerprint: Optional[str] = None,
     commit: bool = True,
 ) -> HealingManifestRecord:
     """
@@ -34,11 +40,14 @@ def save_manifest(
     APPROVED status change, and will commit or roll back both together.
 
     corrected_output_fingerprint: the caller computes this from
-    manifest.corrected_dataset (populated by Surgeon itself, as of the
-    second Phase 2.5 correction pass -- Surgeon.execute() now attaches
-    the actual corrected DataFrame to the HealingManifest it returns).
-    This function only persists the fingerprint string; the DataFrame
+    manifest.corrected_dataset (populated by Surgeon itself). This
+    function only persists the fingerprint string; the DataFrame
     itself is never written here or anywhere in the database.
+
+    source_* fields (Phase 2.5 final architecture): mirror the
+    ticket's own source provenance at manifest-creation time,
+    independent of whatever the ticket looks like later. None for
+    sample_data-derived manifests.
     """
     record = HealingManifestRecord(
         manifest_id=uuid.uuid4(),
@@ -65,6 +74,12 @@ def save_manifest(
         risk_level=manifest.risk_level,
         schema_version_id=uuid.UUID(schema_version_id) if schema_version_id else None,
         corrected_output_fingerprint=corrected_output_fingerprint,
+        source_schema=source_schema,
+        source_table=source_table,
+        source_primary_key=source_primary_key,
+        source_row_count=source_row_count,
+        source_schema_fingerprint=source_schema_fingerprint,
+        source_dataset_fingerprint=source_dataset_fingerprint,
     )
     db.add(record)
     if commit:

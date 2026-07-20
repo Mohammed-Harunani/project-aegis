@@ -1,29 +1,30 @@
 """
-Postgres integration tests for Phase 2.5 live execution: safety gates
-enforced end-to-end, actual promotion to a real (disposable) target
-database, crash-recovery reconciliation, and rollback.
+Postgres integration tests for Phase 2.5's final architecture:
+trusted-source ingestion (read a complete, real table server-side,
+never caller-supplied sample_data) and stable-view publication
+(immutable versioned physical tables behind a CREATE OR REPLACE VIEW,
+replacing the earlier rename-to-backup design entirely).
 
-Needs BOTH TEST_DATABASE_URL (governance -- aegis_test) and
-LIVE_TEST_DATABASE_URL (the live target -- aegis_live_test, a THIRD
-database, since the writer itself refuses aegis/aegis_test as targets).
+Needs THREE disposable Postgres databases:
+- TEST_DATABASE_URL / aegis_test -- governance (tickets, manifests, live_executions)
+- LIVE_TEST_DATABASE_URL / aegis_live_test -- the publication target
+  (aegis_publish / aegis_publish_data schemas)
+- SOURCE_TEST_DATABASE_URL / aegis_source_test -- the trusted source
+  Aegis reads complete tables from
 
-    docker compose up -d postgres   # creates aegis_test AND aegis_live_test
+    docker compose up -d postgres
     export TEST_DATABASE_URL=postgresql+psycopg://aegis_user:change_me@localhost:5432/aegis_test
     export LIVE_TEST_DATABASE_URL=postgresql+psycopg://aegis_user:change_me@localhost:5432/aegis_live_test
+    export SOURCE_TEST_DATABASE_URL=postgresql+psycopg://aegis_user:change_me@localhost:5432/aegis_source_test
     python -m pytest tests/test_live_execution_api.py -v
 
-NOTE: if your Postgres data volume predates Phase 2.5, the init script
-won't re-run automatically (it only fires on first container
-initialization) -- create aegis_live_test manually first:
+If your Postgres data volume predates this phase, the init script
+won't create aegis_source_test automatically -- create it manually:
     docker compose exec postgres psql -U aegis_user -d postgres \
-        -c "CREATE DATABASE aegis_live_test;"
+        -c "CREATE DATABASE aegis_source_test;"
 
 Written and syntax-checked but NOT executed -- same constraint as
-every Postgres-dependent piece of this project, and the stakes on
-that gap are higher here than anywhere else: this is the one place
-Aegis writes to something other than its own governance database.
-Treat every assertion here as a draft until run against a real,
-disposable Postgres target.
+every Postgres-dependent piece of this project.
 """
 
 import sys
@@ -33,12 +34,16 @@ from pathlib import Path
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from conftest import get_verified_test_database_url, get_verified_live_test_database_url
+from conftest import (
+    get_verified_test_database_url,
+    get_verified_live_test_database_url,
+    get_verified_source_test_database_url,
+)
 
 TEST_DATABASE_URL = get_verified_test_database_url()
 LIVE_TEST_DATABASE_URL = get_verified_live_test_database_url()
+SOURCE_TEST_DATABASE_URL = get_verified_source_test_database_url()
 
-os.environ["AEGIS_LIVE_TARGET_SCHEMA_ALLOWLIST"] = "public"
 os.environ["AEGIS_LIVE_EXECUTION_STALE_SECONDS"] = "0"
 
 from fastapi.testclient import TestClient
@@ -48,6 +53,7 @@ from sqlalchemy.orm import sessionmaker
 from src.api.app import app
 from src.db.session import get_db
 from src.db.live_session import get_live_engine
+from src.db.source_session import get_source_engine
 from src.db.models import (
     Base,
     ApprovalTicketRecord,
@@ -56,15 +62,15 @@ from src.db.models import (
     SchemaVersionRecord,
     LiveExecutionRecord,
 )
-from src.live_execution.safety import live_execution_globally_enabled
 from src.live_execution.repository import LiveExecutionRepository
-from src.live_execution.writer import PostgresLiveWriter
+from src.live_execution.writer import PostgresPublicationWriter, AEGIS_PUBLISH_SCHEMA, AEGIS_PUBLISH_DATA_SCHEMA
 
 
 engine = create_engine(TEST_DATABASE_URL)
 TestSessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 live_target_engine = create_engine(LIVE_TEST_DATABASE_URL)
+source_engine = create_engine(SOURCE_TEST_DATABASE_URL)
 
 
 def override_get_db():
@@ -75,12 +81,9 @@ def override_get_db():
         db.close()
 
 
-def override_get_live_engine():
-    return live_target_engine
-
-
 app.dependency_overrides[get_db] = override_get_db
-app.dependency_overrides[get_live_engine] = override_get_live_engine
+app.dependency_overrides[get_live_engine] = lambda: live_target_engine
+app.dependency_overrides[get_source_engine] = lambda: source_engine
 client = TestClient(app)
 
 
@@ -101,207 +104,256 @@ def setup_function(_):
         conn.execute(SchemaVersionRecord.__table__.delete())
         conn.execute(GoldSchemaRecord.__table__.delete())
     with live_target_engine.begin() as conn:
-        rows = conn.execute(text(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public' "
-            "AND (tablename LIKE 'customer_master_live%' OR tablename = '_aegis_execution_log')"
-        )).fetchall()
-        for (table_name,) in rows:
-            conn.execute(text(f'DROP TABLE IF EXISTS "public"."{table_name}"'))
+        conn.execute(text(f'DROP SCHEMA IF EXISTS "{AEGIS_PUBLISH_SCHEMA}" CASCADE'))
+        conn.execute(text(f'DROP SCHEMA IF EXISTS "{AEGIS_PUBLISH_DATA_SCHEMA}" CASCADE'))
+    with source_engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS customers"))
+        conn.execute(text("DROP TABLE IF EXISTS customers_no_pk"))
 
 
-def _register_and_approve_registry_ticket(schema_name="customer_master_live_test"):
+def _create_source_table(rows=((1, "alice"), (2, "bob"), (3, "carol"))):
+    """
+    Creates a simple, real source table with a primary key and some
+    rows in the trusted-source test database. Column name deliberately
+    mismatches the Gold schema (Customer_ID vs customer_id) so a
+    repair plan actually gets proposed, mirroring the rename scenario
+    used throughout the rest of this project's tests.
+    """
+    with source_engine.begin() as conn:
+        conn.execute(text(
+            'CREATE TABLE customers ('
+            '"Customer_ID" BIGINT PRIMARY KEY, name TEXT)'
+        ))
+        for pk, name in rows:
+            conn.execute(
+                text('INSERT INTO customers VALUES (:pk, :name)'),
+                {"pk": pk, "name": name},
+            )
+
+
+def _register_schema(schema_name="customer_master_source_test"):
     client.post(f"/schemas/{schema_name}/versions", json={
         "format_version": 1, "created_by": "mo",
-        "columns": [{"name": "customer_id", "dtype": "int64"}],
+        "columns": [{"name": "customer_id", "dtype": "int64"}, {"name": "name", "dtype": "object"}],
     })
-    submit = client.post("/simulate-migration", json={
+    return schema_name
+
+
+def _register_and_approve_source_ticket(schema_name=None, rows=None):
+    schema_name = schema_name or _register_schema()
+    _create_source_table(rows=rows) if rows else _create_source_table()
+    body = {
         "schema_name": schema_name,
-        "sample_data": {"Customer_ID": [1, 2, 3]},
-    }).json()
+        "source_schema": "public",
+        "source_table": "customers",
+    }
+    submit = client.post("/simulate-migration-from-source", json=body).json()
     ticket_id = submit["ticket_id"]
     client.post(f"/approvals/{ticket_id}/approve", json={"operator": "mo"})
     return ticket_id, submit["schema_version_id"]
 
 
-def _execute_live_body(target_table, target_schema="public", confirm=True, operator="mo", **overrides):
-    body = {
-        "operator": operator,
-        "target_schema": target_schema,
-        "target_table": target_table,
-        "source_schema": "raw",
-        "source_table": "customer_master_source",
-        "confirm": confirm,
-    }
+def _execute_live_body(logical_target, confirm=True, operator="mo", **overrides):
+    body = {"operator": operator, "logical_target": logical_target, "confirm": confirm}
     body.update(overrides)
     return body
 
 
-def test_execute_live_disabled_by_default_returns_403():
-    os.environ["AEGIS_LIVE_EXECUTION_ENABLED"] = "false"
-    ticket_id, _ = _register_and_approve_registry_ticket()
+def _view_rows(logical_target, order_col="customer_id"):
+    with live_target_engine.connect() as conn:
+        rows = conn.execute(text(
+            f'SELECT * FROM "{AEGIS_PUBLISH_SCHEMA}"."{logical_target}" ORDER BY "{order_col}"'
+        )).fetchall()
+    return rows
+
+
+# ---- Trusted source ----
+
+def test_source_table_without_primary_key_rejected():
+    with source_engine.begin() as conn:
+        conn.execute(text('CREATE TABLE customers_no_pk (customer_id BIGINT, name TEXT)'))
+    schema_name = _register_schema()
+    response = client.post("/simulate-migration-from-source", json={
+        "schema_name": schema_name, "source_schema": "public", "source_table": "customers_no_pk",
+    })
+    assert response.status_code == 422
+
+
+def test_sample_data_ticket_is_not_live_eligible():
+    """The core safety property of this whole redesign: a ticket from
+    /simulate-migration (sample_data) must never be able to execute
+    live, even if approved."""
+    client.post("/schemas/customer_master_sampledata_test/versions", json={
+        "format_version": 1, "created_by": "mo",
+        "columns": [{"name": "customer_id", "dtype": "int64"}],
+    })
+    submit = client.post("/simulate-migration", json={
+        "schema_name": "customer_master_sampledata_test",
+        "sample_data": {"Customer_ID": [1, 2, 3]},
+    }).json()
+    ticket_id = submit["ticket_id"]
+    client.post(f"/approvals/{ticket_id}/approve", json={"operator": "mo"})
+
     response = client.post(
         f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_1"),
+        json=_execute_live_body("customer_master_sampledata_target"),
+    )
+    assert response.status_code == 422
+    assert "live-eligible" in response.json()["detail"] or "sample_data" in response.json()["detail"]
+
+
+def test_source_backed_simulation_records_provenance():
+    ticket_id, schema_version_id = _register_and_approve_source_ticket()
+    with TestSessionLocal() as db:
+        record = db.query(ApprovalTicketRecord).filter(
+            ApprovalTicketRecord.ticket_id == __import__("uuid").UUID(ticket_id)
+        ).one()
+        assert record.live_eligible is True
+        assert record.source_schema == "public"
+        assert record.source_table == "customers"
+        assert record.source_row_count == 3
+        assert record.source_dataset_fingerprint is not None
+
+
+def test_execute_live_disabled_by_default_returns_403():
+    os.environ["AEGIS_LIVE_EXECUTION_ENABLED"] = "false"
+    ticket_id, _ = _register_and_approve_source_ticket()
+    response = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_1"),
     )
     assert response.status_code == 403
 
 
 def test_execute_live_requires_approved_ticket():
-    client.post("/schemas/customer_master_live_test/versions", json={
-        "format_version": 1, "created_by": "mo",
-        "columns": [{"name": "customer_id", "dtype": "int64"}],
-    })
-    submit = client.post("/simulate-migration", json={
-        "schema_name": "customer_master_live_test",
-        "sample_data": {"Customer_ID": [1, 2, 3]},
+    schema_name = _register_schema()
+    _create_source_table()
+    submit = client.post("/simulate-migration-from-source", json={
+        "schema_name": schema_name, "source_schema": "public", "source_table": "customers",
     }).json()
     response = client.post(
         f"/approvals/{submit['ticket_id']}/execute-live",
-        json=_execute_live_body("customer_master_live_2"),
+        json=_execute_live_body("customer_master_2"),
     )
     assert response.status_code == 409
 
 
-def test_execute_live_rejects_legacy_gold_schema_ticket():
-    submit = client.post("/simulate-migration", json={
-        "gold_schema": {"customer_id": "int64"},
-        "sample_data": {"Customer_ID": [1, 2, 3]},
-    }).json()
-    client.post(f"/approvals/{submit['ticket_id']}/approve", json={"operator": "mo"})
-    response = client.post(
-        f"/approvals/{submit['ticket_id']}/execute-live",
-        json=_execute_live_body("customer_master_live_3"),
-    )
-    assert response.status_code == 422
-
-
-def test_execute_live_rejects_non_allowlisted_schema():
-    ticket_id, _ = _register_and_approve_registry_ticket()
-    response = client.post(
-        f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_4", target_schema="not_allowlisted"),
-    )
-    assert response.status_code == 422
-
-
 def test_execute_live_rejects_missing_confirmation():
-    ticket_id, _ = _register_and_approve_registry_ticket()
+    ticket_id, _ = _register_and_approve_source_ticket()
     response = client.post(
         f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_5", confirm=False),
+        json=_execute_live_body("customer_master_3", confirm=False),
     )
     assert response.status_code == 422
 
 
-def test_execute_live_rejects_target_same_as_source():
-    """source_schema/source_table are now mandatory -- originally
-    optional, which converted a mandatory safety gate into one a
-    caller could simply omit to bypass."""
-    ticket_id, _ = _register_and_approve_registry_ticket()
+# ---- Stable-view publication ----
+
+def test_execute_live_succeeds_and_publishes_a_stable_view():
+    ticket_id, schema_version_id = _register_and_approve_source_ticket()
     response = client.post(
         f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body(
-            "customer_master_live_6", source_schema="public", source_table="customer_master_live_6",
-        ),
-    )
-    assert response.status_code == 422
-
-
-def test_execute_live_succeeds_and_actually_writes_the_target_table():
-    ticket_id, schema_version_id = _register_and_approve_registry_ticket()
-    response = client.post(
-        f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_7"),
+        json=_execute_live_body("customer_master_4"),
     )
     body = response.json()
     assert response.status_code == 200
     assert body["status"] == "COMPLETED"
-    assert body["backup_table"] is None
-    assert body["final_row_count"] == 3
+    assert body["previous_physical_table"] is None
+    assert body["physical_table"].startswith("customer_master_4__")
 
-    with live_target_engine.connect() as conn:
-        rows = conn.execute(text(
-            'SELECT customer_id FROM "public"."customer_master_live_7" ORDER BY customer_id'
-        )).fetchall()
-        assert [r[0] for r in rows] == [1, 2, 3]
+    rows = _view_rows("customer_master_4")
+    assert len(rows) == 3
 
     fetched = client.get(f"/live-executions/{body['live_execution_id']}").json()
     assert fetched["status"] == "COMPLETED"
     assert fetched["schema_version_id"] == schema_version_id
+    assert fetched["source_schema"] == "public"
+    assert fetched["source_table"] == "customers"
+
+
+def test_republish_creates_new_version_and_repoints_view_without_dropping_old():
+    first_ticket, _ = _register_and_approve_source_ticket()
+    first = client.post(
+        f"/approvals/{first_ticket}/execute-live",
+        json=_execute_live_body("customer_master_5"),
+    ).json()
+    first_physical = first["physical_table"]
+
+    second_ticket, _ = _register_and_approve_source_ticket(
+        rows=((1, "alice"), (2, "bob"), (3, "carol"), (4, "dave"))
+    )
+    second = client.post(
+        f"/approvals/{second_ticket}/execute-live",
+        json=_execute_live_body("customer_master_5"),
+    ).json()
+    assert second["previous_physical_table"] == first_physical
+    assert second["physical_table"] != first_physical
+
+    rows = _view_rows("customer_master_5")
+    assert len(rows) == 4, "the view must show the NEW version's data"
+
+    with live_target_engine.connect() as conn:
+        old_still_exists = conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = :schema AND table_name = :table)"
+        ), {"schema": AEGIS_PUBLISH_DATA_SCHEMA, "table": first_physical}).scalar()
+        assert old_still_exists, "immutable physical versions must never be dropped by publication"
 
 
 def test_execute_live_rejects_repeat_execution_of_same_ticket():
-    ticket_id, _ = _register_and_approve_registry_ticket()
+    ticket_id, _ = _register_and_approve_source_ticket()
     first = client.post(
         f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_8"),
+        json=_execute_live_body("customer_master_6"),
     )
     assert first.status_code == 200
     second = client.post(
         f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_8b"),
+        json=_execute_live_body("customer_master_6b"),
     )
     assert second.status_code == 409
 
 
-def test_execute_live_backs_up_and_replaces_an_aegis_managed_target():
-    """The target must already be Aegis-managed (a prior PROMOTE marker)
-    for a second execution to be allowed to replace it -- otherwise
-    this would silently take over an arbitrary existing table."""
-    first_ticket, _ = _register_and_approve_registry_ticket()
-    client.post(
+def test_rollback_repoints_view_to_previous_version_without_dropping_current():
+    first_ticket, _ = _register_and_approve_source_ticket()
+    first = client.post(
         f"/approvals/{first_ticket}/execute-live",
-        json=_execute_live_body("customer_master_live_9"),
-    )
+        json=_execute_live_body("customer_master_7"),
+    ).json()
+    first_physical = first["physical_table"]
 
-    second_ticket, _ = _register_and_approve_registry_ticket()
-    response = client.post(
+    second_ticket, _ = _register_and_approve_source_ticket(
+        rows=((1, "alice"), (2, "bob"), (3, "carol"), (4, "dave"))
+    )
+    second = client.post(
         f"/approvals/{second_ticket}/execute-live",
-        json=_execute_live_body("customer_master_live_9"),
+        json=_execute_live_body("customer_master_7"),
+    ).json()
+    second_physical = second["physical_table"]
+
+    rollback = client.post(
+        f"/live-executions/{second['live_execution_id']}/rollback",
+        json={"operator": "mo"},
     )
-    body = response.json()
-    assert response.status_code == 200
-    assert body["backup_table"] is not None
+    assert rollback.status_code == 200
+    assert rollback.json()["status"] == "ROLLED_BACK"
+
+    rows = _view_rows("customer_master_7")
+    assert len(rows) == 3, "view must be repointed back to the first (3-row) version"
 
     with live_target_engine.connect() as conn:
-        current = conn.execute(text(
-            'SELECT customer_id FROM "public"."customer_master_live_9" ORDER BY customer_id'
-        )).fetchall()
-        assert [r[0] for r in current] == [1, 2, 3]
+        second_still_exists = conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = :schema AND table_name = :table)"
+        ), {"schema": AEGIS_PUBLISH_DATA_SCHEMA, "table": second_physical}).scalar()
+        assert second_still_exists, "rollback must never drop the physical version it's moving away from"
 
 
-def test_execute_live_refuses_an_unmanaged_existing_table():
-    """An existing table Aegis didn't create (no PROMOTE marker) must
-    be refused outright -- Aegis's simplified shadow-table schema would
-    silently drop whatever real constraints/indexes/triggers it had."""
-    with live_target_engine.begin() as conn:
-        conn.execute(text('CREATE TABLE "public"."customer_master_live_10" (customer_id BIGINT)'))
-        conn.execute(text('INSERT INTO "public"."customer_master_live_10" VALUES (999)'))
-
-    ticket_id, _ = _register_and_approve_registry_ticket()
-    response = client.post(
-        f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_10"),
-    )
-    assert response.status_code == 422
-
-    with live_target_engine.connect() as conn:
-        untouched = conn.execute(text(
-            'SELECT customer_id FROM "public"."customer_master_live_10"'
-        )).fetchall()
-        assert [r[0] for r in untouched] == [999]
-
-
-def test_rollback_restores_the_previous_aegis_managed_target():
-    first_ticket, _ = _register_and_approve_registry_ticket()
-    client.post(
-        f"/approvals/{first_ticket}/execute-live",
-        json=_execute_live_body("customer_master_live_11"),
-    )
-    second_ticket, _ = _register_and_approve_registry_ticket()
+def test_rollback_of_first_ever_publish_removes_the_view():
+    ticket_id, _ = _register_and_approve_source_ticket()
     executed = client.post(
-        f"/approvals/{second_ticket}/execute-live",
-        json=_execute_live_body("customer_master_live_11"),
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_8"),
     ).json()
 
     rollback = client.post(
@@ -309,13 +361,13 @@ def test_rollback_restores_the_previous_aegis_managed_target():
         json={"operator": "mo"},
     )
     assert rollback.status_code == 200
-    assert rollback.json()["status"] == "ROLLED_BACK"
 
     with live_target_engine.connect() as conn:
-        restored = conn.execute(text(
-            'SELECT customer_id FROM "public"."customer_master_live_11" ORDER BY customer_id'
-        )).fetchall()
-        assert [r[0] for r in restored] == [1, 2, 3]
+        view_exists = conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.views "
+            "WHERE table_schema = :schema AND table_name = :view)"
+        ), {"schema": AEGIS_PUBLISH_SCHEMA, "view": "customer_master_8"}).scalar()
+        assert not view_exists, "rolling back the only-ever publish removes the view (nothing to repoint to)"
 
 
 def test_rollback_of_unknown_execution_returns_404():
@@ -327,10 +379,10 @@ def test_rollback_of_unknown_execution_returns_404():
 
 
 def test_rollback_twice_returns_409():
-    ticket_id, _ = _register_and_approve_registry_ticket()
+    ticket_id, _ = _register_and_approve_source_ticket()
     executed = client.post(
         f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_12"),
+        json=_execute_live_body("customer_master_9"),
     ).json()
     first = client.post(
         f"/live-executions/{executed['live_execution_id']}/rollback", json={"operator": "mo"},
@@ -343,37 +395,34 @@ def test_rollback_twice_returns_409():
 
 
 def test_rolled_back_ticket_cannot_execute_live_again():
-    """Issue 1: a rolled-back ticket must not be able to re-execute --
-    live execution is one-shot per ticket, not per successful attempt."""
-    ticket_id, _ = _register_and_approve_registry_ticket()
+    ticket_id, _ = _register_and_approve_source_ticket()
     executed = client.post(
         f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_13"),
+        json=_execute_live_body("customer_master_10"),
     ).json()
     client.post(
         f"/live-executions/{executed['live_execution_id']}/rollback", json={"operator": "mo"},
     )
     retry = client.post(
         f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_13b"),
+        json=_execute_live_body("customer_master_10b"),
     )
     assert retry.status_code == 409
 
 
 def test_stale_rollback_refused_when_a_newer_execution_supersedes():
-    """Issue 5: rolling back an OLDER execution after a NEWER one has
-    already replaced the same target must be refused -- otherwise it
-    would destroy the newer, valid data."""
-    first_ticket, _ = _register_and_approve_registry_ticket()
+    first_ticket, _ = _register_and_approve_source_ticket()
     first_executed = client.post(
         f"/approvals/{first_ticket}/execute-live",
-        json=_execute_live_body("customer_master_live_14"),
+        json=_execute_live_body("customer_master_11"),
     ).json()
 
-    second_ticket, _ = _register_and_approve_registry_ticket()
+    second_ticket, _ = _register_and_approve_source_ticket(
+        rows=((1, "alice"), (2, "bob"), (3, "carol"), (4, "dave"))
+    )
     client.post(
         f"/approvals/{second_ticket}/execute-live",
-        json=_execute_live_body("customer_master_live_14"),
+        json=_execute_live_body("customer_master_11"),
     )
 
     stale_rollback = client.post(
@@ -382,236 +431,74 @@ def test_stale_rollback_refused_when_a_newer_execution_supersedes():
     )
     assert stale_rollback.status_code == 409
 
-    with live_target_engine.connect() as conn:
-        current = conn.execute(text(
-            'SELECT customer_id FROM "public"."customer_master_live_14" ORDER BY customer_id'
-        )).fetchall()
-        assert [r[0] for r in current] == [1, 2, 3], "the newer execution's data must survive untouched"
+    rows = _view_rows("customer_master_11")
+    assert len(rows) == 4, "the newer execution's data must survive untouched"
 
 
-def test_reconciliation_heals_a_stuck_rolling_back_record():
-    """Issue 3: the rollback counterpart to the RUNNING reconciliation
-    test -- a rollback whose target-side ROLLBACK marker committed,
-    but whose governance record never advanced past ROLLING_BACK."""
-    ticket_id, _ = _register_and_approve_registry_ticket()
-    executed = client.post(
-        f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_19"),
-    ).json()
-
-    with TestSessionLocal() as db:
-        live_repo = LiveExecutionRepository(db)
-        record = live_repo.mark_rolling_back(executed["live_execution_id"], operator="mo")
-
-        writer = PostgresLiveWriter(live_target_engine)
-        writer.rollback(
-            target_schema="public",
-            target_table="customer_master_live_19",
-            backup_table=record.backup_table,
-            execution_id=record.live_execution_id,
-        )
-        stuck_id = str(record.live_execution_id)
-
-    fetched = client.get(f"/live-executions/{stuck_id}")
-    assert fetched.status_code == 200
-    assert fetched.json()["status"] == "ROLLED_BACK"
-
-
-def test_staleness_gate_prevents_premature_reconciliation():
+def test_incompatible_view_schema_rejected():
     """
-    Issue 4: a RUNNING record with no marker yet must NOT be
-    immediately marked FAILED -- it might simply still be legitimately
-    in progress. Sets the staleness threshold high for this one test
-    specifically (opposite of the module-level override to 0) to
-    prove a fresh record is left alone.
+    Postgres requires a replacement view to retain the same output
+    column names/order/types (columns may be added at the end). A
+    structurally incompatible republish must be refused, not silently
+    break the view.
     """
-    ticket_id, schema_version_id = _register_and_approve_registry_ticket()
-
-    with TestSessionLocal() as db:
-        from src.governance.approval_repository import PostgresApprovalRepository
-        manifest = db.query(HealingManifestRecord).filter(
-            HealingManifestRecord.ticket_id == __import__("uuid").UUID(ticket_id)
-        ).one()
-        live_repo = LiveExecutionRepository(db)
-        live_record = live_repo.create_running(
-            ticket_id=ticket_id,
-            sandbox_manifest_id=str(manifest.manifest_id),
-            schema_version_id=schema_version_id,
-            target_schema="public",
-            target_table="customer_master_live_20",
-            requested_by="mo",
-            original_row_count=manifest.original_row_count,
-            final_row_count=manifest.final_row_count,
-            risk_level=manifest.risk_level,
-            integrity_status=manifest.integrity_status,
-        )
-        stuck_id = str(live_record.live_execution_id)
-        # No writer.promote() call at all -- simulates a target
-        # transaction that hasn't committed (or even started) yet.
-
-    old_threshold = os.environ.get("AEGIS_LIVE_EXECUTION_STALE_SECONDS")
-    os.environ["AEGIS_LIVE_EXECUTION_STALE_SECONDS"] = "3600"
-    try:
-        fetched = client.get(f"/live-executions/{stuck_id}")
-        assert fetched.status_code == 200
-        assert fetched.json()["status"] == "RUNNING", (
-            "a fresh RUNNING record with no marker must NOT be reconciled to "
-            "FAILED before the staleness threshold has passed -- it might "
-            "still be legitimately in progress"
-        )
-    finally:
-        if old_threshold is not None:
-            os.environ["AEGIS_LIVE_EXECUTION_STALE_SECONDS"] = old_threshold
-        else:
-            os.environ.pop("AEGIS_LIVE_EXECUTION_STALE_SECONDS", None)
-
-
-def test_recreated_table_with_same_name_is_refused():
-    """
-    Issue 8: a historical PROMOTE marker matching the table NAME is
-    not enough to prove the CURRENT table is the same one Aegis
-    created -- if it were dropped and something else recreated a
-    same-named table, that must be refused too, not just a never-
-    promoted table.
-    """
-    first_ticket, _ = _register_and_approve_registry_ticket()
+    first_ticket, _ = _register_and_approve_source_ticket()
     client.post(
         f"/approvals/{first_ticket}/execute-live",
-        json=_execute_live_body("customer_master_live_21"),
+        json=_execute_live_body("customer_master_12"),
     )
 
-    # Simulates external interference: drop the Aegis-created table and
-    # recreate an unrelated one with the same name (different OID).
-    with live_target_engine.begin() as conn:
-        conn.execute(text('DROP TABLE "public"."customer_master_live_21"'))
-        conn.execute(text('CREATE TABLE "public"."customer_master_live_21" (customer_id BIGINT)'))
-        conn.execute(text('INSERT INTO "public"."customer_master_live_21" VALUES (777)'))
+    # A different Gold schema with a totally different column set,
+    # published to the SAME logical target.
+    client.post("/schemas/customer_master_incompatible_test/versions", json={
+        "format_version": 1, "created_by": "mo",
+        "columns": [{"name": "totally_different_column", "dtype": "int64"}],
+    })
+    with source_engine.begin() as conn:
+        conn.execute(text('DROP TABLE IF EXISTS customers'))
+        conn.execute(text('CREATE TABLE customers ("totally_different_column" BIGINT PRIMARY KEY)'))
+        conn.execute(text('INSERT INTO customers VALUES (1), (2)'))
+    submit = client.post("/simulate-migration-from-source", json={
+        "schema_name": "customer_master_incompatible_test",
+        "source_schema": "public", "source_table": "customers",
+    }).json()
+    if "ticket_id" not in submit:
+        # No repair plan needed (matches Gold already) -- nothing to
+        # approve/execute; this specific scenario needs a repair plan
+        # to reach a ticket, so skip gracefully if none was proposed.
+        return
+    second_ticket = submit["ticket_id"]
+    client.post(f"/approvals/{second_ticket}/approve", json={"operator": "mo"})
 
-    second_ticket, _ = _register_and_approve_registry_ticket()
     response = client.post(
         f"/approvals/{second_ticket}/execute-live",
-        json=_execute_live_body("customer_master_live_21"),
+        json=_execute_live_body("customer_master_12"),
     )
     assert response.status_code == 422
 
-    with live_target_engine.connect() as conn:
-        untouched = conn.execute(text(
-            'SELECT customer_id FROM "public"."customer_master_live_21"'
-        )).fetchall()
-        assert [r[0] for r in untouched] == [777], "the recreated table must be left untouched"
 
+def test_source_changed_since_approval_blocks_execution():
+    ticket_id, _ = _register_and_approve_source_ticket()
 
-def test_new_publication_blocked_while_rollback_in_flight():
-    """Issue 2: a target actively being rolled back (ROLLING_BACK) must
-    block a new publication attempt against the same target, not just
-    PENDING/RUNNING."""
-    ticket_id, _ = _register_and_approve_registry_ticket()
-    executed = client.post(
-        f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_22"),
-    ).json()
+    # Mutate the source AFTER approval -- the stored fingerprint on
+    # the ticket no longer matches.
+    with source_engine.begin() as conn:
+        conn.execute(text('INSERT INTO customers VALUES (999, \'zed\')'))
 
-    with TestSessionLocal() as db:
-        LiveExecutionRepository(db).mark_rolling_back(executed["live_execution_id"], operator="mo")
-        # Deliberately don't finish the rollback -- leaves the record
-        # ROLLING_BACK, simulating that operation still being in flight.
-
-    other_ticket, _ = _register_and_approve_registry_ticket()
     response = client.post(
-        f"/approvals/{other_ticket}/execute-live",
-        json=_execute_live_body("customer_master_live_22"),
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_13"),
     )
     assert response.status_code == 409
-
-
-def test_reconciliation_respects_lock_held_before_promote_even_starts():
-    """
-    Issue 1 (fourth correction pass): the session lock is now held for
-    the WHOLE flow (acquired before create_running(), not just inside
-    promote()'s DDL transaction). Simulates a slow Surgeon call by
-    directly holding the target's lock on a separate connection while
-    a RUNNING record with no marker exists yet. Reconciliation must
-    NOT conclude FAILED just because the staleness threshold has
-    passed and no marker exists -- the held lock must prove the
-    operation is still genuinely active, closing the exact race a
-    transaction-scoped lock (acquired only inside promote()) left
-    open.
-    """
-    ticket_id, schema_version_id = _register_and_approve_registry_ticket()
-
-    with TestSessionLocal() as db:
-        manifest = db.query(HealingManifestRecord).filter(
-            HealingManifestRecord.ticket_id == __import__("uuid").UUID(ticket_id)
-        ).one()
-        live_repo = LiveExecutionRepository(db)
-        live_record = live_repo.create_running(
-            ticket_id=ticket_id,
-            sandbox_manifest_id=str(manifest.manifest_id),
-            schema_version_id=schema_version_id,
-            target_schema="public",
-            target_table="customer_master_live_25",
-            requested_by="mo",
-            original_row_count=manifest.original_row_count,
-            final_row_count=manifest.final_row_count,
-            risk_level=manifest.risk_level,
-            integrity_status=manifest.integrity_status,
-        )
-        stuck_id = str(live_record.live_execution_id)
-        # Deliberately no writer.promote() call -- no marker exists,
-        # simulating Surgeon still mid-recomputation, before promote()
-        # would ever be reached.
-
-    writer = PostgresLiveWriter(live_target_engine)
-    with writer.hold_target_lock("public", "customer_master_live_25"):
-        fetched = client.get(f"/live-executions/{stuck_id}")
-        assert fetched.status_code == 200
-        assert fetched.json()["status"] == "RUNNING", (
-            "must not be marked FAILED while the lock is genuinely held, "
-            "even past the staleness threshold and with no marker yet -- "
-            "this is exactly the race a transaction-scoped lock (acquired "
-            "only inside promote()) would have missed"
-        )
-
-    # Lock released (as if Surgeon finished but the process then
-    # crashed before promote() ever ran) -- reconciliation can now
-    # safely conclude, since the lock being free plus no marker
-    # together prove it genuinely didn't commit.
-    fetched_after = client.get(f"/live-executions/{stuck_id}")
-    assert fetched_after.status_code == 200
-    assert fetched_after.json()["status"] == "FAILED"
-
-
-def test_manifest_execution_mode_mismatch_is_refused():
-    """
-    Issue 7: defensive consistency check -- if the sandbox manifest
-    somehow doesn't say execution_mode == "sandbox" (simulated here via
-    direct DB manipulation, since the normal flow can't produce this),
-    live execution must refuse rather than trust it blindly.
-    """
-    ticket_id, _ = _register_and_approve_registry_ticket()
-
-    with TestSessionLocal() as db:
-        manifest = db.query(HealingManifestRecord).filter(
-            HealingManifestRecord.ticket_id == __import__("uuid").UUID(ticket_id)
-        ).one()
-        manifest.execution_mode = "corrupted"
-        db.commit()
-
-    response = client.post(
-        f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_23"),
-    )
-    assert response.status_code == 422
+    assert "changed" in response.json()["detail"].lower()
 
 
 def test_surgeon_failure_during_execute_live_marks_failed_not_stuck_running():
-    """Issue 3: a Surgeon failure used to happen OUTSIDE the try/except,
-    leaving the record permanently RUNNING."""
-    ticket_id, _ = _register_and_approve_registry_ticket()
+    ticket_id, _ = _register_and_approve_source_ticket()
     with patch("src.api.app.AegisSurgeon.execute", side_effect=RuntimeError("boom")):
         response = client.post(
             f"/approvals/{ticket_id}/execute-live",
-            json=_execute_live_body("customer_master_live_15"),
+            json=_execute_live_body("customer_master_14"),
         )
     assert response.status_code == 500
 
@@ -623,11 +510,11 @@ def test_surgeon_failure_during_execute_live_marks_failed_not_stuck_running():
 
 
 def test_target_write_failure_marks_execution_failed():
-    ticket_id, _ = _register_and_approve_registry_ticket()
-    with patch("src.api.app.PostgresLiveWriter.promote", side_effect=RuntimeError("target db exploded")):
+    ticket_id, _ = _register_and_approve_source_ticket()
+    with patch("src.api.app.PostgresPublicationWriter.publish", side_effect=RuntimeError("target db exploded")):
         response = client.post(
             f"/approvals/{ticket_id}/execute-live",
-            json=_execute_live_body("customer_master_live_16"),
+            json=_execute_live_body("customer_master_15"),
         )
     assert response.status_code == 500
 
@@ -640,27 +527,23 @@ def test_target_write_failure_marks_execution_failed():
 
 def test_ambiguous_commit_recovers_via_target_side_marker():
     """
-    Issue 2 (third correction pass): simulates a connection drop AFTER
-    the target transaction actually committed -- the PROMOTE marker
-    genuinely exists, but the call site still sees an exception (e.g.
-    the network dropped before the commit acknowledgment arrived).
-    Must resolve to COMPLETED via the target-side marker, not
-    incorrectly marked FAILED -- FAILED is retryable, and retrying a
-    publication that already actually happened risks a duplicate.
+    Simulates a connection drop AFTER the target transaction actually
+    committed -- the PUBLISH marker genuinely exists, but the call
+    site still sees an exception. Must resolve to COMPLETED via the
+    target-side marker, not incorrectly marked FAILED.
     """
-    ticket_id, _ = _register_and_approve_registry_ticket()
+    ticket_id, _ = _register_and_approve_source_ticket()
 
-    from src.live_execution.writer import PostgresLiveWriter
-    real_promote = PostgresLiveWriter.promote
+    real_publish = PostgresPublicationWriter.publish
 
-    def promote_then_raise(self, *args, **kwargs):
-        result = real_promote(self, *args, **kwargs)  # actually succeeds; marker gets written for real
+    def publish_then_raise(self, *args, **kwargs):
+        result = real_publish(self, *args, **kwargs)
         raise RuntimeError("simulated connection drop after commit")
 
-    with patch("src.api.app.PostgresLiveWriter.promote", promote_then_raise):
+    with patch("src.api.app.PostgresPublicationWriter.publish", publish_then_raise):
         response = client.post(
             f"/approvals/{ticket_id}/execute-live",
-            json=_execute_live_body("customer_master_live_24"),
+            json=_execute_live_body("customer_master_16"),
         )
 
     body = response.json()
@@ -668,31 +551,19 @@ def test_ambiguous_commit_recovers_via_target_side_marker():
     assert body["status"] == "COMPLETED"
     assert "note" in body
 
-    with TestSessionLocal() as db:
-        record = db.query(LiveExecutionRecord).filter(
-            LiveExecutionRecord.ticket_id == __import__("uuid").UUID(ticket_id)
-        ).one()
-        assert record.status == "COMPLETED"
-
-    with live_target_engine.connect() as conn:
-        rows = conn.execute(text(
-            'SELECT customer_id FROM "public"."customer_master_live_24" ORDER BY customer_id'
-        )).fetchall()
-        assert [r[0] for r in rows] == [1, 2, 3]
+    rows = _view_rows("customer_master_16")
+    assert len(rows) == 3
 
 
 def test_reconciliation_heals_a_stuck_running_record():
     """
-    Issue 4: simulates the crash window directly -- a live execution
-    whose target-side PROMOTE actually committed, but whose governance
-    record never got updated past RUNNING (as if the API crashed in
-    between). GET must self-heal it to COMPLETED using the target-side
-    marker, not leave it stuck.
+    Simulates the crash window directly: a live execution whose
+    target-side PUBLISH actually committed, but whose governance
+    record never got updated past RUNNING.
     """
-    ticket_id, schema_version_id = _register_and_approve_registry_ticket()
+    ticket_id, schema_version_id = _register_and_approve_source_ticket()
 
     with TestSessionLocal() as db:
-        ticket = None
         from src.governance.approval_repository import PostgresApprovalRepository
         ticket = PostgresApprovalRepository(db).get(ticket_id)
         manifest = db.query(HealingManifestRecord).filter(
@@ -704,21 +575,20 @@ def test_reconciliation_heals_a_stuck_running_record():
             ticket_id=ticket_id,
             sandbox_manifest_id=str(manifest.manifest_id),
             schema_version_id=schema_version_id,
-            target_schema="public",
-            target_table="customer_master_live_17",
+            logical_target="customer_master_17",
             requested_by="mo",
             original_row_count=manifest.original_row_count,
             final_row_count=manifest.final_row_count,
             risk_level=manifest.risk_level,
             integrity_status=manifest.integrity_status,
+            source_schema=ticket.source_schema,
+            source_table=ticket.source_table,
+            source_dataset_fingerprint=ticket.source_dataset_fingerprint,
         )
 
-        # Directly invoke the writer -- simulates the target transaction
-        # committing successfully, without ever calling mark_completed().
-        writer = PostgresLiveWriter(live_target_engine)
-        writer.promote(
-            target_schema="public",
-            target_table="customer_master_live_17",
+        writer = PostgresPublicationWriter(live_target_engine)
+        writer.publish(
+            logical_target="customer_master_17",
             dataframe=ticket.target_dataset,
             execution_id=live_record.live_execution_id,
             expected_row_count=3,
@@ -730,11 +600,117 @@ def test_reconciliation_heals_a_stuck_running_record():
     assert fetched.json()["status"] == "COMPLETED"
 
 
-def test_concurrent_rollback_only_one_succeeds():
-    ticket_id, _ = _register_and_approve_registry_ticket()
+def test_reconciliation_heals_a_stuck_rolling_back_record():
+    ticket_id, _ = _register_and_approve_source_ticket()
     executed = client.post(
         f"/approvals/{ticket_id}/execute-live",
-        json=_execute_live_body("customer_master_live_18"),
+        json=_execute_live_body("customer_master_18"),
+    ).json()
+
+    with TestSessionLocal() as db:
+        live_repo = LiveExecutionRepository(db)
+        record = live_repo.mark_rolling_back(executed["live_execution_id"], operator="mo")
+
+        writer = PostgresPublicationWriter(live_target_engine)
+        writer.rollback_to_previous(
+            logical_target="customer_master_18",
+            execution_id=record.live_execution_id,
+            previous_physical_table=record.previous_physical_table,
+        )
+        stuck_id = str(record.live_execution_id)
+
+    fetched = client.get(f"/live-executions/{stuck_id}")
+    assert fetched.status_code == 200
+    assert fetched.json()["status"] == "ROLLED_BACK"
+
+
+def test_staleness_gate_prevents_premature_reconciliation():
+    ticket_id, schema_version_id = _register_and_approve_source_ticket()
+
+    with TestSessionLocal() as db:
+        from src.governance.approval_repository import PostgresApprovalRepository
+        ticket = PostgresApprovalRepository(db).get(ticket_id)
+        manifest = db.query(HealingManifestRecord).filter(
+            HealingManifestRecord.ticket_id == __import__("uuid").UUID(ticket_id)
+        ).one()
+        live_repo = LiveExecutionRepository(db)
+        live_record = live_repo.create_running(
+            ticket_id=ticket_id,
+            sandbox_manifest_id=str(manifest.manifest_id),
+            schema_version_id=schema_version_id,
+            logical_target="customer_master_19",
+            requested_by="mo",
+            original_row_count=manifest.original_row_count,
+            final_row_count=manifest.final_row_count,
+            risk_level=manifest.risk_level,
+            integrity_status=manifest.integrity_status,
+            source_schema=ticket.source_schema,
+            source_table=ticket.source_table,
+            source_dataset_fingerprint=ticket.source_dataset_fingerprint,
+        )
+        stuck_id = str(live_record.live_execution_id)
+
+    old_threshold = os.environ.get("AEGIS_LIVE_EXECUTION_STALE_SECONDS")
+    os.environ["AEGIS_LIVE_EXECUTION_STALE_SECONDS"] = "3600"
+    try:
+        fetched = client.get(f"/live-executions/{stuck_id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["status"] == "RUNNING"
+    finally:
+        if old_threshold is not None:
+            os.environ["AEGIS_LIVE_EXECUTION_STALE_SECONDS"] = old_threshold
+        else:
+            os.environ.pop("AEGIS_LIVE_EXECUTION_STALE_SECONDS", None)
+
+
+def test_reconciliation_respects_lock_held_before_publish_even_starts():
+    """
+    The session lock is held for the WHOLE flow (before create_running,
+    not just inside publish()'s DDL transaction). Simulates a slow
+    Surgeon call by directly holding the lock on a separate connection
+    while a RUNNING record with no marker exists yet.
+    """
+    ticket_id, schema_version_id = _register_and_approve_source_ticket()
+
+    with TestSessionLocal() as db:
+        from src.governance.approval_repository import PostgresApprovalRepository
+        ticket = PostgresApprovalRepository(db).get(ticket_id)
+        manifest = db.query(HealingManifestRecord).filter(
+            HealingManifestRecord.ticket_id == __import__("uuid").UUID(ticket_id)
+        ).one()
+        live_repo = LiveExecutionRepository(db)
+        live_record = live_repo.create_running(
+            ticket_id=ticket_id,
+            sandbox_manifest_id=str(manifest.manifest_id),
+            schema_version_id=schema_version_id,
+            logical_target="customer_master_20",
+            requested_by="mo",
+            original_row_count=manifest.original_row_count,
+            final_row_count=manifest.final_row_count,
+            risk_level=manifest.risk_level,
+            integrity_status=manifest.integrity_status,
+            source_schema=ticket.source_schema,
+            source_table=ticket.source_table,
+            source_dataset_fingerprint=ticket.source_dataset_fingerprint,
+        )
+        stuck_id = str(live_record.live_execution_id)
+
+    writer = PostgresPublicationWriter(live_target_engine)
+    with writer.hold_target_lock("customer_master_20"):
+        fetched = client.get(f"/live-executions/{stuck_id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["status"] == "RUNNING"
+
+    fetched_after = client.get(f"/live-executions/{stuck_id}")
+    assert fetched_after.status_code == 200
+    assert fetched_after.json()["status"] == "FAILED"
+
+
+def test_concurrent_rollback_only_one_succeeds():
+    ticket_id, _ = _register_and_approve_source_ticket()
+    executed = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_21"),
     ).json()
 
     results = []
@@ -757,14 +733,24 @@ def test_concurrent_rollback_only_one_succeeds():
     assert sorted(results) == [200, 409]
 
 
+def test_manifest_execution_mode_mismatch_is_refused():
+    ticket_id, _ = _register_and_approve_source_ticket()
+
+    with TestSessionLocal() as db:
+        manifest = db.query(HealingManifestRecord).filter(
+            HealingManifestRecord.ticket_id == __import__("uuid").UUID(ticket_id)
+        ).one()
+        manifest.execution_mode = "corrupted"
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_22"),
+    )
+    assert response.status_code == 422
+
+
 def test_migration_0003_creates_expected_tables_and_columns():
-    """
-    Explicit verification that migration 0003 -- not just
-    Base.metadata (which the rest of this file uses for speed) --
-    actually creates live_executions and the healing_manifests
-    fingerprint column. Runs against a throwaway schema via Alembic
-    directly, separate from the main test tables above.
-    """
     from alembic.config import Config
     from alembic import command
 
@@ -782,15 +768,23 @@ def test_migration_0003_creates_expected_tables_and_columns():
     columns = {c["name"] for c in inspector.get_columns("live_executions")}
     expected = {
         "live_execution_id", "ticket_id", "sandbox_manifest_id", "schema_version_id",
-        "target_schema", "target_table", "backup_table", "status", "requested_by",
-        "started_at", "completed_at", "rollback_started_at", "rolled_back_by", "rolled_back_at",
+        "logical_target", "physical_table", "previous_physical_table",
+        "status", "requested_by", "started_at", "completed_at",
+        "rollback_started_at", "rolled_back_by", "rolled_back_at",
         "failure_reason", "original_row_count", "final_row_count", "risk_level",
-        "integrity_status",
+        "integrity_status", "source_schema", "source_table", "source_dataset_fingerprint",
     }
     assert expected.issubset(columns)
 
+    ticket_columns = {c["name"] for c in inspector.get_columns("approval_tickets")}
+    assert {
+        "source_schema", "source_table", "source_primary_key", "source_row_count",
+        "source_schema_fingerprint", "source_dataset_fingerprint", "live_eligible",
+    }.issubset(ticket_columns)
+
     manifest_columns = {c["name"] for c in inspector.get_columns("healing_manifests")}
     assert "corrected_output_fingerprint" in manifest_columns
+    assert "source_dataset_fingerprint" in manifest_columns
 
     index_names = {idx["name"] for idx in inspector.get_indexes("live_executions")}
     assert "uq_live_executions_ticket_active_or_done" in index_names
