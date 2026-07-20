@@ -284,18 +284,14 @@ class LiveExecutionRepository:
 
     def reconcile_running(self, live_execution_id, writer) -> LiveExecutionRecord:
         """
-        Recovers a stuck RUNNING record's true state using the
-        target-side marker: if the target transaction actually
-        committed a PROMOTE before the API crashed (or otherwise never
-        reached mark_completed()), the marker proves it. Two
-        conditions must BOTH hold before acting, not just the
-        staleness threshold: a timeout alone can only ever prove "a
-        while has passed," never "nothing is still active" -- a
-        legitimately long-running publication could still be mid-
-        transaction past the threshold. The advisory lock is what
-        actually proves exclusivity: if it can't be acquired, something
-        genuinely still holds it, and the record is left alone
-        regardless of how stale it looks.
+        Recovers a stuck RUNNING record's true state. Staleness is a
+        cheap first filter (skip the lock/marker check entirely for a
+        record that's still fresh); the actual proof comes from
+        writer.determine_outcome_under_lock(), which acquires the same
+        session-level lock genuine operations hold and checks the
+        marker WHILE holding it -- closing the gap where testing the
+        lock and checking the marker as two separate steps could let
+        something else start in between.
         """
         record = self._get(live_execution_id)
         if record.status != "RUNNING":
@@ -305,25 +301,34 @@ class LiveExecutionRepository:
         if age_seconds < _stale_threshold_seconds():
             return record
 
-        if writer.is_target_currently_locked(record.target_schema, record.target_table):
+        outcome = writer.determine_outcome_under_lock(
+            record.target_schema, record.target_table, record.live_execution_id, "PROMOTE"
+        )
+
+        if outcome == "active":
             # Something genuinely still holds the lock -- definitive
             # proof of activity a timeout alone could never provide.
-            # Leave it RUNNING no matter how stale it looks.
             return record
-
-        markers = writer.get_marker_for_execution(record.target_schema, record.live_execution_id)
-        promote_marker = next((m for m in markers if m["operation"] == "PROMOTE"), None)
-
-        if promote_marker is not None:
+        if outcome == "unknown":
+            record.failure_reason = (
+                f"Reconciliation attempted after {age_seconds:.0f}s but the target-side "
+                f"marker could not be checked -- left RUNNING for a later attempt."
+            )
+            self.db.commit()
+            self.db.refresh(record)
+            return record
+        if outcome == "completed":
+            markers = writer.get_marker_for_execution(record.target_schema, record.live_execution_id)
+            promote_marker = next((m for m in markers if m["operation"] == "PROMOTE"), None)
             record.status = "COMPLETED"
-            record.backup_table = promote_marker["backup_table"]
+            record.backup_table = promote_marker["backup_table"] if promote_marker else None
             record.completed_at = datetime.now(UTC)
-        else:
+        else:  # "not_committed"
             record.status = "FAILED"
             record.failure_reason = (
-                f"Reconciled after {age_seconds:.0f}s with the target lock free and "
-                f"no target-side PROMOTE marker -- treating as failed rather than "
-                f"left stuck RUNNING."
+                f"Reconciled after {age_seconds:.0f}s: the target lock was free (proving "
+                f"nothing is active) and no target-side PROMOTE marker exists -- treating "
+                f"as failed rather than left stuck RUNNING."
             )
             record.completed_at = datetime.now(UTC)
 
@@ -333,11 +338,8 @@ class LiveExecutionRepository:
 
     def reconcile_rolling_back(self, live_execution_id, writer) -> LiveExecutionRecord:
         """
-        Rollback counterpart to reconcile_running(): if the target-side
-        ROLLBACK marker exists, the rollback actually committed even
-        though the API may have crashed before mark_rolled_back() ran.
-        Same two-condition gate: staleness AND a free advisory lock,
-        not staleness alone.
+        Rollback counterpart to reconcile_running() -- same staleness
+        pre-filter, same lock-proven outcome determination.
         """
         record = self._get(live_execution_id)
         if record.status != "ROLLING_BACK":
@@ -348,22 +350,31 @@ class LiveExecutionRepository:
         if age_seconds < _stale_threshold_seconds():
             return record
 
-        if writer.is_target_currently_locked(record.target_schema, record.target_table):
+        outcome = writer.determine_outcome_under_lock(
+            record.target_schema, record.target_table, record.live_execution_id, "ROLLBACK"
+        )
+
+        if outcome == "active":
             return record
-
-        markers = writer.get_marker_for_execution(record.target_schema, record.live_execution_id)
-        rollback_marker = next((m for m in markers if m["operation"] == "ROLLBACK"), None)
-
-        if rollback_marker is not None:
+        if outcome == "unknown":
+            record.failure_reason = (
+                f"Reconciliation attempted after {age_seconds:.0f}s but the target-side "
+                f"marker could not be checked -- left ROLLING_BACK for a later attempt."
+            )
+            self.db.commit()
+            self.db.refresh(record)
+            return record
+        if outcome == "completed":
             record.status = "ROLLED_BACK"
             record.rolled_back_at = datetime.now(UTC)
             self.db.commit()
             self.db.refresh(record)
-        # If no ROLLBACK marker exists yet (and the lock is free, so
-        # nothing is actively retrying it either), leave it in
-        # ROLLING_BACK -- this needs manual investigation, same as the
-        # synchronous failure path; guessing wrong here (e.g.
-        # reverting to COMPLETED) could be worse than leaving it for a
-        # human.
+        # "not_committed": leave it in ROLLING_BACK -- this needs
+        # manual investigation, same as the synchronous failure path;
+        # guessing wrong here (e.g. reverting to COMPLETED) could be
+        # worse than leaving it for a human. The lock being free here
+        # DOES prove nothing is actively retrying it, but that alone
+        # doesn't tell us it's safe to assume any particular resting
+        # state beyond what it already is.
 
         return record

@@ -340,3 +340,65 @@ which isn't a call I think is mine to make alone.
 Both are real, and both are more architecturally significant than
 anything fixed in the three correction passes so far. They need your
 decision on direction before any code changes, not my guess at one.
+
+## Fourth correction pass -- session-level locking
+
+A further review found the transaction-scoped lock from the third
+pass still left a real gap, plus two related ordering issues. Fixed:
+
+1. **The advisory lock began too late.** It only existed inside
+   promote()'s own transaction -- meaning a slow Surgeon call (between
+   create_running() and promote() being reached) had NO lock
+   protection at all. If that took longer than the staleness
+   threshold, reconciliation could see "no lock, no marker" and
+   incorrectly conclude FAILED while the original request was still
+   legitimately working. Locking is now SESSION-level
+   (pg_advisory_lock/pg_advisory_unlock, not pg_advisory_xact_lock),
+   held by the CALLER via writer.hold_target_lock() for the entire
+   flow -- acquired before create_running(), released only after
+   mark_completed()/mark_failed(). promote()/rollback() no longer
+   acquire their own lock; they require the caller to already hold it.
+2. **Ambiguous-commit resolution needed to hold the lock while
+   checking the marker**, not test-then-separately-check as two
+   steps (which left its own small window). writer now exposes two
+   distinct methods for two distinct situations: check_operation_outcome()
+   -- a plain marker check, for use when the caller already holds the
+   lock itself (execute_live's and rollback's own exception handlers,
+   still inside their `with hold_target_lock(...)` block -- trying to
+   re-acquire the SAME lock from a different connection there would
+   just see the caller's own hold and misreport "active" for the
+   wrong reason); and determine_outcome_under_lock() -- acquires the
+   lock and checks the marker together, atomically, for reconciliation
+   from a SEPARATE later request that does not already hold it.
+3. **Rollback's identity check now runs inside the same transaction
+   and connection that performs the mutation**, not on a separate
+   connection before the transaction even opens. With the caller
+   already holding the session lock for the whole operation this
+   window was already closed in practice, but checking on the same
+   connection removes any doubt.
+
+Added a test that directly holds a target's lock on a separate
+connection (simulating a still-in-progress Surgeon call) and confirms
+GET does not mark the record FAILED while genuinely active, even past
+the staleness threshold -- the exact race this pass closes.
+
+## Two issues still not implemented -- explicitly awaiting the user's
+## own confirmation, not inferred from a review document
+
+A subsequent review proposed detailed "locked architecture decisions"
+for blockers 4 (trusted source ingestion: a new SOURCE_DATABASE_URL,
+a new `/simulate-migration-from-source` endpoint, source fingerprint
+verification) and 5 (a publication redesign: dedicated
+aegis_publish/aegis_publish_data schemas, stable views over versioned
+physical tables, replacing the rename-to-backup mechanism entirely).
+
+Both proposals are thorough and directly responsive to the concerns
+raised. Neither has been implemented. The user was explicitly asked,
+in the prior turn, to weigh in on exactly this decision -- a review
+document proposing a specific design is not the same thing as the
+user confirming they want it built, especially at this scope (roughly
+a second Phase 2.5's worth of new work) and especially for blocker 5,
+which would reverse a mechanism the user explicitly locked in at the
+start of Phase 2.5. This is called out here so the gap is never
+ambiguous: implementation of 4 and 5 starts only after the user says
+so directly.

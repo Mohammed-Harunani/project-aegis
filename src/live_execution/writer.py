@@ -13,22 +13,30 @@ validate/backup/promote sequence:
   This is what makes crash recovery possible: the governance database
   and the target database are two separate connections that cannot
   share one literal commit (see Docs/phase2_5_live_execution_spec.md).
-- Table IDENTITY, not just name, proves Aegis manages a target. A
-  historical PROMOTE marker matching the table NAME is not enough --
-  if the table were dropped and something unrelated recreated with
-  the same name, a name-only check would wrongly treat it as
-  Aegis-managed. Each PROMOTE marker records the table's Postgres OID
-  (via to_regclass()) at the moment of promotion; both the
-  managed-target check and rollback's staleness check compare the
-  CURRENT table's OID against what's recorded, not just its name.
-- Rollback refuses to proceed unless the target-side marker confirms
-  this execution is still the most recent PROMOTE for that exact
-  table (by OID, not just name) -- otherwise a newer execution (or an
-  external change) may have since superseded it.
+- Table IDENTITY, not just name, proves Aegis manages a target. Each
+  PROMOTE marker records the table's Postgres OID (via to_regclass())
+  at the moment of promotion; both the managed-target check and
+  rollback's staleness check compare the CURRENT table's OID against
+  the latest MANAGEMENT event (PROMOTE or ROLLBACK, whichever is more
+  recent) -- a rollback's restored OID is just as authoritative as a
+  promotion's.
+- Locking is SESSION-level (pg_advisory_lock/pg_advisory_unlock), held
+  by the CALLER (app.py) via hold_target_lock() for the ENTIRE
+  operation -- Surgeon recomputation, fingerprint verification, AND
+  the target-database transaction -- not just the DDL transaction
+  inside promote()/rollback(). A transaction-scoped lock acquired only
+  inside promote() left a real gap: a slow Surgeon call (longer than
+  the staleness threshold) meant reconciliation could see "no lock
+  held yet, no marker yet" and wrongly conclude FAILED while the
+  original request was still legitimately working. promote()/
+  rollback() no longer acquire their own lock -- they rely entirely on
+  the caller already holding it, and check target identity using the
+  SAME connection that performs the mutation, closing any window
+  between the identity check and the write.
 """
 
-import hashlib
 import uuid as uuid_module
+from contextlib import contextmanager
 
 import pandas as pd
 from sqlalchemy import MetaData, Table, Column, text
@@ -56,90 +64,87 @@ _POSTGRES_TYPE_TO_SA = {
 _EXECUTION_LOG_TABLE = "_aegis_execution_log"
 
 
-def _advisory_lock_key(target_schema: str, target_table: str) -> int:
-    """
-    Deterministic signed 64-bit key for Postgres advisory locks (bigint
-    is signed 64-bit), derived from the fully-qualified target name.
-    Confirmed via Postgres docs: pg_advisory_xact_lock is transaction-
-    scoped and releases automatically on commit OR rollback, which is
-    exactly what makes this usable as a liveness proof -- if a process
-    crashes mid-operation, its connection drops, its transaction never
-    commits, and the lock is released, so a LATER attempt to acquire it
-    succeeding proves nothing is currently active for this target.
-    """
-    digest = hashlib.sha256(f"{target_schema}.{target_table}".encode("utf-8")).digest()
-    return int.from_bytes(digest[:8], byteorder="big", signed=True)
-
-
 class LiveWriteValidationError(Exception):
     """Post-write validation failed inside the transaction; it has been rolled back."""
 
 
 class UnmanagedTargetTableError(Exception):
-    """The target table already exists with no matching Aegis PROMOTE
+    """The target table already exists with no matching Aegis management
     marker (by current table identity, not just name) proving Aegis
     created/manages it -- refusing to silently take it over."""
 
 
 class StaleRollbackError(Exception):
-    """This execution is not the most recent PROMOTE for its target (by
-    current table identity) -- something newer has superseded it, so
-    rolling back would destroy valid, newer data."""
+    """This execution is not the most recent management event for its
+    target (by current table identity) -- something newer has
+    superseded it, so rolling back would destroy valid, newer data."""
 
 
 class TargetLockUnavailableError(Exception):
-    """Another operation currently holds the advisory lock for this
-    target -- something is genuinely still active against it."""
+    """Another operation currently holds the session-level advisory lock
+    for this target -- something is genuinely still active against it."""
 
 
 class PostgresLiveWriter:
     def __init__(self, engine: Engine):
         self.engine = engine
 
-    def _try_acquire_target_lock(self, conn, target_schema: str, target_table: str) -> bool:
+    @contextmanager
+    def hold_target_lock(self, target_schema: str, target_table: str):
         """
-        Transaction-scoped Postgres advisory lock unique to this
-        (schema, table) pair -- automatically released when the
-        transaction commits or rolls back, no manual unlock needed.
-        This is what actually proves mutual exclusion, unlike a
-        timeout alone: a timeout can only ever prove "a while has
-        passed," never "nothing is still active." Used to serialize
-        promote()/rollback() against each other for the same target,
-        and by reconciliation to prove a markerless RUNNING/
-        ROLLING_BACK record's target transaction is genuinely no
-        longer active (if the lock CAN be acquired, nothing else
-        holds it).
+        Session-level advisory lock (pg_advisory_lock), held on a
+        dedicated connection for the FULL duration of the caller's
+        `with` block -- meant to wrap the entire execute-live or
+        rollback flow, not just the target-database transaction.
+        Non-blocking acquire: raises TargetLockUnavailableError
+        immediately if something else already holds it, rather than
+        blocking the HTTP request. Always released (pg_advisory_unlock)
+        and the connection closed on the way out, success or failure --
+        the `finally` blocks guarantee this even if the caller's code
+        raises. If the PROCESS crashes instead of exiting normally,
+        Postgres releases all of a backend's session-level advisory
+        locks when its connection terminates, which is what makes this
+        a reliable liveness signal for reconciliation even across a
+        hard crash, not just a clean exit.
         """
-        return bool(conn.execute(
-            text("SELECT pg_try_advisory_xact_lock(hashtext(:schema), hashtext(:table))"),
-            {"schema": target_schema, "table": target_table},
-        ).scalar())
-
-    def is_target_currently_locked(self, target_schema: str, target_table: str) -> bool:
-        """
-        True if a DIFFERENT active transaction currently holds the
-        lock for this target (a promote/rollback is genuinely still
-        in progress there right now) -- False if the lock is free.
-        Opens its own short-lived transaction purely to test the lock,
-        which releases it immediately upon exit if acquired.
-        """
-        with self.engine.connect() as conn:
-            with conn.begin():
-                acquired = self._try_acquire_target_lock(conn, target_schema, target_table)
-        return not acquired
+        conn = self.engine.connect()
+        try:
+            acquired = conn.execute(
+                text("SELECT pg_try_advisory_lock(hashtext(:schema), hashtext(:table))"),
+                {"schema": target_schema, "table": target_table},
+            ).scalar()
+            conn.commit()
+            if not acquired:
+                raise TargetLockUnavailableError(
+                    f"Another operation is currently active against "
+                    f'"{target_schema}"."{target_table}" -- refusing to proceed '
+                    f"concurrently rather than racing it."
+                )
+            try:
+                yield
+            finally:
+                conn.execute(
+                    text("SELECT pg_advisory_unlock(hashtext(:schema), hashtext(:table))"),
+                    {"schema": target_schema, "table": target_table},
+                )
+                conn.commit()
+        finally:
+            conn.close()
 
     def check_operation_outcome(self, target_schema: str, execution_id, operation: str) -> str:
         """
-        Used after an AMBIGUOUS exception (e.g. the target transaction
-        may have committed but the connection dropped before
-        acknowledging it) to determine what actually happened,
-        target-side. `operation` is "PROMOTE" or "ROLLBACK". Returns:
-        "completed" -- a matching marker exists, so it committed
-        despite the exception; "not_committed" -- the marker table was
-        reachable and has no such marker, so it's provable this did
-        NOT commit; "unknown" -- the marker table itself couldn't even
-        be checked (e.g. the connection is still down), so nothing can
-        be concluded and the caller must not guess either way.
+        Marker-only check, with NO lock acquisition -- for use when the
+        CALLER already holds this target's session-level lock (e.g.
+        execute_live's own exception handler, still inside its
+        `with hold_target_lock(...)` block). Trying to acquire the
+        lock again from a different connection in that situation would
+        just see the caller's OWN lock and misreport "active" for the
+        wrong reason. Returns "completed" if a matching marker exists,
+        "not_committed" if the marker table is reachable and doesn't,
+        "unknown" if the marker table itself couldn't be checked.
+        Compare to determine_outcome_under_lock(), which DOES acquire
+        the lock -- that one is for reconciliation, called from a
+        separate, later request that does not already hold it.
         """
         try:
             markers = self.get_marker_for_execution(target_schema, execution_id)
@@ -147,6 +152,56 @@ class PostgresLiveWriter:
             return "unknown"
         has_marker = any(m["operation"] == operation for m in markers)
         return "completed" if has_marker else "not_committed"
+
+    def determine_outcome_under_lock(
+        self, target_schema: str, target_table: str, execution_id, operation: str
+    ) -> str:
+        """
+        The definitive way to resolve an ambiguous or stale execution's
+        true outcome -- used both by app.py's exception handlers (an
+        exception from promote()/rollback() doesn't by itself prove
+        the target transaction failed) and by reconciliation (a stale
+        RUNNING/ROLLING_BACK record). Tries to acquire the SAME
+        session-level lock genuine operations hold:
+
+        - Lock unavailable -> "active": something else genuinely still
+          holds it, regardless of how long it's been or what the
+          exception said. Do not conclude anything.
+        - Lock acquired, no matching marker -> "not_committed":
+          provably safe, since nothing else can be running against
+          this target while we hold the lock, and the marker table
+          would already show a commit if one had happened.
+        - Lock acquired, matching marker exists -> "completed": the
+          operation actually succeeded (e.g. a lost connection
+          acknowledgment), whatever exception the caller saw.
+        - Lock acquired, marker table itself unreachable -> "unknown":
+          can't be checked right now; don't guess either way.
+
+        The marker lookup happens WHILE holding the lock, closing the
+        window where a different operation could start between
+        testing the lock and checking the marker.
+        """
+        with self.engine.connect() as conn:
+            acquired = conn.execute(
+                text("SELECT pg_try_advisory_lock(hashtext(:schema), hashtext(:table))"),
+                {"schema": target_schema, "table": target_table},
+            ).scalar()
+            conn.commit()
+            if not acquired:
+                return "active"
+            try:
+                try:
+                    markers = self.get_marker_for_execution(target_schema, execution_id)
+                except Exception:
+                    return "unknown"
+                has_marker = any(m["operation"] == operation for m in markers)
+                return "completed" if has_marker else "not_committed"
+            finally:
+                conn.execute(
+                    text("SELECT pg_advisory_unlock(hashtext(:schema), hashtext(:table))"),
+                    {"schema": target_schema, "table": target_table},
+                )
+                conn.commit()
 
     def _sa_type_for(self, pandas_dtype: str):
         postgres_type_name = pandas_dtype_to_postgres_type(pandas_dtype)
@@ -234,16 +289,7 @@ class PostgresLiveWriter:
         ROLLBACK) for this exact table name, or None. A ROLLBACK is
         also a legitimate management event: it restores a table to a
         known OID, and that restoration must become the new
-        authoritative "current identity" for future checks. Confirmed
-        this was a real bug when it only considered PROMOTE markers:
-        publish A (oid 100) -> publish B (renames A's table to backup,
-        oid 100, promotes a new table, oid 200) -> roll back B
-        (restores oid 100 as the target, records a ROLLBACK marker
-        with oid 100) -> publish C. Looking only at the latest PROMOTE
-        marker would still see B's oid 200, mismatching the restored
-        table's actual oid 100, and incorrectly refuse C as targeting
-        an "unmanaged" table -- even though it's the same table A
-        originally created, correctly restored by B's rollback.
+        authoritative "current identity" for future checks.
         """
         validate_identifier(target_schema, "target schema")
         validate_identifier(target_table, "target table")
@@ -289,6 +335,14 @@ class PostgresLiveWriter:
         on success. Raises on any failure -- by the time an exception
         propagates, the target transaction has already rolled back to
         its pre-execution state.
+
+        REQUIRES the caller to already be holding this target's
+        session-level lock (via hold_target_lock()) -- this method no
+        longer acquires its own, since a transaction-scoped lock
+        acquired only here left a gap during Surgeon recomputation
+        before this was ever called. The identity check below runs
+        inside THIS transaction, on this same connection, so there is
+        no window between checking and mutating.
         """
         validate_identifier(target_schema, "target schema")
         validate_identifier(target_table, "target table")
@@ -299,13 +353,6 @@ class PostgresLiveWriter:
         backup_name = backup_table_name(target_table, execution_id)
 
         with self.engine.begin() as conn:
-            if not self._try_acquire_target_lock(conn, target_schema, target_table):
-                raise TargetLockUnavailableError(
-                    f"Another operation is currently active against "
-                    f'"{target_schema}"."{target_table}" -- refusing to proceed '
-                    f"concurrently rather than racing it."
-                )
-
             self._ensure_execution_log_table(conn, target_schema)
 
             target_exists = self._table_exists(conn, target_schema, target_table)
@@ -388,39 +435,49 @@ class PostgresLiveWriter:
         Restores the previous target table from its backup. Refuses
         (StaleRollbackError) unless this execution's own PROMOTE is
         still the most recent management event (PROMOTE or ROLLBACK)
-        for this exact table BY IDENTITY (OID), not just name -- if a
-        newer execution has since promoted over it, or something else
-        has already rolled it back, rolling back this older one would
-        destroy valid, newer data (or touch nothing meaningful at all).
+        for this exact table BY IDENTITY (OID), not just name.
+
+        REQUIRES the caller to already be holding this target's
+        session-level lock. The identity check (marker + current OID)
+        now runs INSIDE the same transaction and on the same
+        connection that performs the mutation -- previously it ran on
+        a separate connection before the transaction even opened,
+        leaving a window where the target could theoretically change
+        between the check and the write. With the caller already
+        holding the lock for the whole operation, that window is
+        closed by construction, but checking on the same connection
+        removes any doubt.
         """
         validate_identifier(target_schema, "target schema")
         validate_identifier(target_table, "target table")
 
-        marker = self.get_latest_management_marker(target_schema, target_table)
-        with self.engine.connect() as conn:
+        with self.engine.begin() as conn:
+            self._ensure_execution_log_table(conn, target_schema)
+
+            marker = conn.execute(
+                text(
+                    f'SELECT live_execution_id, table_oid, backup_table '
+                    f'FROM "{target_schema}"."{_EXECUTION_LOG_TABLE}" '
+                    f"WHERE target_table = :table AND operation IN ('PROMOTE', 'ROLLBACK') "
+                    f'ORDER BY recorded_at DESC LIMIT 1'
+                ),
+                {"table": target_table},
+            ).mappings().first()
             current_oid = self._current_oid(conn, target_schema, target_table)
 
-        stale = (
-            marker is None
-            or str(marker["live_execution_id"]) != str(execution_id)
-            or marker["table_oid"] != current_oid
-        )
-        if stale:
-            raise StaleRollbackError(
-                f'"{target_schema}"."{target_table}" has since been replaced by a '
-                f"different live execution, externally modified, or has no recorded "
-                f"Aegis history at all -- refusing to roll back an execution that is "
-                f"not provably the latest PROMOTE for this target."
+            stale = (
+                marker is None
+                or str(marker["live_execution_id"]) != str(execution_id)
+                or marker["table_oid"] != current_oid
             )
-
-        with self.engine.begin() as conn:
-            if not self._try_acquire_target_lock(conn, target_schema, target_table):
-                raise TargetLockUnavailableError(
-                    f"Another operation is currently active against "
-                    f'"{target_schema}"."{target_table}" -- refusing to roll back '
-                    f"concurrently rather than racing it."
+            if stale:
+                raise StaleRollbackError(
+                    f'"{target_schema}"."{target_table}" has since been replaced by a '
+                    f"different live execution, externally modified, or has no recorded "
+                    f"Aegis history at all -- refusing to roll back an execution that is "
+                    f"not provably the latest PROMOTE for this target."
                 )
-            self._ensure_execution_log_table(conn, target_schema)
+
             conn.execute(text(f'DROP TABLE IF EXISTS "{target_schema}"."{target_table}"'))
             if backup_table:
                 validate_identifier(backup_table, "backup table")

@@ -524,6 +524,63 @@ def test_new_publication_blocked_while_rollback_in_flight():
     assert response.status_code == 409
 
 
+def test_reconciliation_respects_lock_held_before_promote_even_starts():
+    """
+    Issue 1 (fourth correction pass): the session lock is now held for
+    the WHOLE flow (acquired before create_running(), not just inside
+    promote()'s DDL transaction). Simulates a slow Surgeon call by
+    directly holding the target's lock on a separate connection while
+    a RUNNING record with no marker exists yet. Reconciliation must
+    NOT conclude FAILED just because the staleness threshold has
+    passed and no marker exists -- the held lock must prove the
+    operation is still genuinely active, closing the exact race a
+    transaction-scoped lock (acquired only inside promote()) left
+    open.
+    """
+    ticket_id, schema_version_id = _register_and_approve_registry_ticket()
+
+    with TestSessionLocal() as db:
+        manifest = db.query(HealingManifestRecord).filter(
+            HealingManifestRecord.ticket_id == __import__("uuid").UUID(ticket_id)
+        ).one()
+        live_repo = LiveExecutionRepository(db)
+        live_record = live_repo.create_running(
+            ticket_id=ticket_id,
+            sandbox_manifest_id=str(manifest.manifest_id),
+            schema_version_id=schema_version_id,
+            target_schema="public",
+            target_table="customer_master_live_25",
+            requested_by="mo",
+            original_row_count=manifest.original_row_count,
+            final_row_count=manifest.final_row_count,
+            risk_level=manifest.risk_level,
+            integrity_status=manifest.integrity_status,
+        )
+        stuck_id = str(live_record.live_execution_id)
+        # Deliberately no writer.promote() call -- no marker exists,
+        # simulating Surgeon still mid-recomputation, before promote()
+        # would ever be reached.
+
+    writer = PostgresLiveWriter(live_target_engine)
+    with writer.hold_target_lock("public", "customer_master_live_25"):
+        fetched = client.get(f"/live-executions/{stuck_id}")
+        assert fetched.status_code == 200
+        assert fetched.json()["status"] == "RUNNING", (
+            "must not be marked FAILED while the lock is genuinely held, "
+            "even past the staleness threshold and with no marker yet -- "
+            "this is exactly the race a transaction-scoped lock (acquired "
+            "only inside promote()) would have missed"
+        )
+
+    # Lock released (as if Surgeon finished but the process then
+    # crashed before promote() ever ran) -- reconciliation can now
+    # safely conclude, since the lock being free plus no marker
+    # together prove it genuinely didn't commit.
+    fetched_after = client.get(f"/live-executions/{stuck_id}")
+    assert fetched_after.status_code == 200
+    assert fetched_after.json()["status"] == "FAILED"
+
+
 def test_manifest_execution_mode_mismatch_is_refused():
     """
     Issue 7: defensive consistency check -- if the sandbox manifest
