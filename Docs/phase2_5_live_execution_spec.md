@@ -1,5 +1,19 @@
 # Aegis Phase 2.5 -- Live Execution Mode Spec
 
+**Read this first: this document is written in the order it was
+built, not in order of what's currently true.** The sections below
+titled "Purpose" through the early correction passes describe the
+ORIGINAL rename-to-backup, caller-supplied-sample_data design, which
+is retired. Jump to **"FINAL LOCKED ARCHITECTURE"** for what the
+system actually does today (trusted-source ingestion + stable-view
+publication), and to the correction-pass sections after it for what's
+been fixed since. A full reorganization putting the current
+architecture first was requested in review and is a reasonable ask --
+it hasn't been done yet, since restructuring a document this size
+under time pressure risks losing or garbling content by transcription
+error more than it risks a reader scrolling past some history. This
+pointer is the interim fix.
+
 ## Purpose
 
 Adds controlled, PostgreSQL-only publication of a Surgeon-corrected
@@ -548,3 +562,106 @@ first container init). None of the Postgres-dependent pieces have run
 against a real database in this environment -- everything here is
 written, syntax-checked, and reasoned through as carefully as the
 rest of this project, but unexecuted until run for real.
+
+## Fifth correction pass
+
+A further review found genuine implementation-level gaps in the final
+architecture. Fixed:
+
+1. **Source snapshot wasn't atomic** -- table existence, primary-key
+   lookup, column metadata, and the complete ordered read now all
+   happen inside one connection and one REPEATABLE READ transaction
+   in source_connector.py. Previously these were three separate
+   connections; a concurrent schema/constraint change between them
+   could have produced a ticket whose primary key, row data, and
+   schema fingerprint came from three different states of the table.
+2. **Primary-key lookup could mix columns from another table** -- the
+   information_schema join only matched on constraint_name/
+   constraint_schema, not table_name. Two different tables in the
+   same schema sharing an identically-named PRIMARY KEY constraint
+   could have had their key_column_usage rows cross-matched. Fixed by
+   joining on table_schema/table_name too; added a test with two
+   tables sharing a constraint name to prove it.
+3. **Ambiguous commit handling could still mark a committed
+   publication as FAILED** -- a bare "marker absent" check doesn't
+   prove a transaction has finished failing (the commit acknowledgment
+   could simply be delayed). Removed FAILED as a possible synchronous
+   conclusion for a generic exception entirely -- only "marker found"
+   (COMPLETED) is decided synchronously now; everything else is left
+   RUNNING/ROLLING_BACK for the lock-gated reconciliation path, which
+   additionally proves the session lock is free before it will ever
+   conclude failure.
+4. **Financial datatype fidelity was unsafe** -- confirmed the writer
+   had no explicit support for NUMERIC, DATE, TIMESTAMPTZ, UUID, or
+   JSONB at all, mapping everything object-dtype to TEXT regardless of
+   actual content. Source reads now build the DataFrame from raw
+   fetched rows with dtype=object forced throughout (verified directly
+   against real pandas: Decimal, date, timezone-aware datetime, UUID,
+   and dict all survive completely untouched -- pd.read_sql's own
+   inference was never trusted to guarantee this). The writer now
+   infers each column's Postgres type from its actual values rather
+   than a meaningless dtype label, with explicit handling for Decimal
+   (unconstrained NUMERIC, preserving arbitrary precision exactly),
+   date, timezone-aware/naive timestamps, UUID, and JSONB. Order
+   matters in that inference (bool before int, since bool is an int
+   subclass in Python; datetime.datetime before datetime.date, since
+   datetime IS a date subclass) and is commented accordingly. Could
+   not verify SQLAlchemy's exact type-class hierarchy in this
+   environment (no working install to introspect) -- used exact
+   type() equality rather than isinstance() specifically to avoid
+   depending on an inheritance assumption that couldn't be confirmed.
+5. **Appended columns broke rollback** -- the earlier design allowed
+   publishing with extra columns appended at the end (Postgres's
+   CREATE OR REPLACE VIEW permits this going forward), but rollback
+   repoints to the PREVIOUS, narrower physical table, and Postgres
+   will not allow CREATE OR REPLACE VIEW to remove existing output
+   columns. That meant publish-then-rollback with an appended column
+   would fail specifically on the rollback. Phase 2.5 now requires an
+   EXACT publication signature (same names, order, types, count) in
+   both directions -- schema evolution belongs in a later, dedicated
+   publication-versioning phase.
+6. **View compatibility checks ignored types** -- folded into the
+   same exact-signature check as #5; comparing names alone let a
+   type-changed-but-same-named column reach Postgres and fail with a
+   raw database error instead of a controlled 422.
+7. **A test could pass without testing anything** -- the incompatible-
+   schema test's source/Gold pair matched exactly, so no repair plan
+   was ever proposed, and an early `if "ticket_id" not in submit:
+   return` let it report passed regardless. Rewrote it with a
+   guaranteed repair scenario (the same proven rename pattern used
+   throughout this file) and an explicit assertion that fails loudly
+   if no ticket is produced. Added a companion test proving appended
+   columns are refused, not silently accepted.
+9. **Migration 0003 created schemas in the wrong database** -- it runs
+   against DATABASE_URL (governance), but was creating aegis_publish/
+   aegis_publish_data there via CREATE SCHEMA, even though publication
+   happens in LIVE_DATABASE_URL entirely separately. The writer's own
+   _ensure_publish_schemas_and_log() already creates both correctly,
+   idempotently, in the right database, the first time anything is
+   published -- the migration's version was not just wrong but
+   entirely redundant. Removed from both upgrade() and downgrade()
+   (the downgrade's DROP SCHEMA CASCADE was run against the
+   governance database too, which is now correctly gone as well).
+
+Item 8 (docs/env) partially addressed: .env.example now includes
+SOURCE_DATABASE_URL/SOURCE_TEST_DATABASE_URL and
+AEGIS_LIVE_EXECUTION_STALE_SECONDS, and no longer references the
+retired AEGIS_LIVE_TARGET_SCHEMA_ALLOWLIST. A full reorganization of
+this document (active architecture first, history in an appendix) was
+not done -- restructuring ~30KB of accumulated correction-pass history
+under time pressure risked losing or garbling content by transcription
+error more than a reader scrolling past some history costs. A "read
+this first" pointer was added at the top instead, naming this
+explicitly as an interim fix, not a complete one.
+
+**Additional design concern, acknowledged but not resolved:** the
+complete source DataFrame is still persisted as JSONB on
+approval_tickets.target_dataset. For a genuinely large source table
+this duplicates significant data into the governance database and
+makes ticket storage/retrieval more expensive than it needs to be.
+This does not create an unsafe publication by itself, but it needs
+either a documented size boundary or a dedicated immutable-snapshot
+storage strategy (separate from the governance database) before this
+system takes real production traffic against large source tables.
+Flagging this rather than guessing at a boundary number or design
+without your input on what "large" means for actual expected usage.

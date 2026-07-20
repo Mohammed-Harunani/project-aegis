@@ -437,44 +437,165 @@ def test_stale_rollback_refused_when_a_newer_execution_supersedes():
 
 def test_incompatible_view_schema_rejected():
     """
-    Postgres requires a replacement view to retain the same output
-    column names/order/types (columns may be added at the end). A
-    structurally incompatible republish must be refused, not silently
-    break the view.
+    Phase 2.5 requires an exact publication signature. A structurally
+    incompatible republish to the SAME logical target must be
+    refused, not silently break the view (or succeed and leave
+    rollback broken later).
     """
     first_ticket, _ = _register_and_approve_source_ticket()
     client.post(
         f"/approvals/{first_ticket}/execute-live",
-        json=_execute_live_body("customer_master_12"),
+        json=_execute_live_body("customer_master_incompatible_target"),
     )
 
-    # A different Gold schema with a totally different column set,
-    # published to the SAME logical target.
-    client.post("/schemas/customer_master_incompatible_test/versions", json={
+    # A genuinely different repair scenario, guaranteed to produce a
+    # repair plan (Order_ID -> order_id, the same proven rename
+    # pattern _register_and_approve_source_ticket uses), whose
+    # corrected output has a completely different column signature
+    # than the first ticket's (customer_id, name).
+    client.post("/schemas/orders_incompatible_test/versions", json={
         "format_version": 1, "created_by": "mo",
-        "columns": [{"name": "totally_different_column", "dtype": "int64"}],
+        "columns": [{"name": "order_id", "dtype": "int64"}, {"name": "amount", "dtype": "object"}],
     })
     with source_engine.begin() as conn:
-        conn.execute(text('DROP TABLE IF EXISTS customers'))
-        conn.execute(text('CREATE TABLE customers ("totally_different_column" BIGINT PRIMARY KEY)'))
-        conn.execute(text('INSERT INTO customers VALUES (1), (2)'))
+        conn.execute(text('DROP TABLE IF EXISTS orders_incompatible'))
+        conn.execute(text(
+            'CREATE TABLE orders_incompatible ("Order_ID" BIGINT PRIMARY KEY, amount TEXT)'
+        ))
+        conn.execute(text("INSERT INTO orders_incompatible VALUES (1, '100.00'), (2, '200.00')"))
     submit = client.post("/simulate-migration-from-source", json={
-        "schema_name": "customer_master_incompatible_test",
-        "source_schema": "public", "source_table": "customers",
+        "schema_name": "orders_incompatible_test",
+        "source_schema": "public", "source_table": "orders_incompatible",
     }).json()
-    if "ticket_id" not in submit:
-        # No repair plan needed (matches Gold already) -- nothing to
-        # approve/execute; this specific scenario needs a repair plan
-        # to reach a ticket, so skip gracefully if none was proposed.
-        return
+    assert "ticket_id" in submit, (
+        f"test setup must guarantee a repair plan is proposed -- got: {submit}"
+    )
     second_ticket = submit["ticket_id"]
     client.post(f"/approvals/{second_ticket}/approve", json={"operator": "mo"})
 
     response = client.post(
         f"/approvals/{second_ticket}/execute-live",
-        json=_execute_live_body("customer_master_12"),
+        json=_execute_live_body("customer_master_incompatible_target"),
     )
     assert response.status_code == 422
+
+
+def test_appended_column_rejected_not_just_removed_column():
+    """
+    Issue 5: the earlier design allowed appending columns (Postgres's
+    CREATE OR REPLACE VIEW permits it going forward), but rollback
+    repoints to the PREVIOUS, narrower physical table, which Postgres
+    will not allow via CREATE OR REPLACE VIEW (it cannot remove
+    existing output columns). Phase 2.5 requires an EXACT signature in
+    both directions -- appending is refused too, not just removing.
+    """
+    first_ticket, _ = _register_and_approve_source_ticket()
+    client.post(
+        f"/approvals/{first_ticket}/execute-live",
+        json=_execute_live_body("customer_master_append_test"),
+    )
+
+    client.post("/schemas/customer_master_append_test_schema/versions", json={
+        "format_version": 1, "created_by": "mo",
+        "columns": [
+            {"name": "customer_id", "dtype": "int64"},
+            {"name": "name", "dtype": "object"},
+            {"name": "extra_column", "dtype": "int64"},
+        ],
+    })
+    with source_engine.begin() as conn:
+        conn.execute(text('DROP TABLE IF EXISTS customers'))
+        conn.execute(text(
+            'CREATE TABLE customers ("Customer_ID" BIGINT PRIMARY KEY, name TEXT, extra_column BIGINT)'
+        ))
+        conn.execute(text("INSERT INTO customers VALUES (1, 'alice', 100), (2, 'bob', 200)"))
+    submit = client.post("/simulate-migration-from-source", json={
+        "schema_name": "customer_master_append_test_schema",
+        "source_schema": "public", "source_table": "customers",
+    }).json()
+    assert "ticket_id" in submit, f"test setup must guarantee a repair plan -- got: {submit}"
+    second_ticket = submit["ticket_id"]
+    client.post(f"/approvals/{second_ticket}/approve", json={"operator": "mo"})
+
+    response = client.post(
+        f"/approvals/{second_ticket}/execute-live",
+        json=_execute_live_body("customer_master_append_test"),
+    )
+    assert response.status_code == 422, "appending a column must be refused, not silently accepted"
+
+
+def test_primary_key_lookup_does_not_mix_columns_from_a_same_named_constraint_on_another_table():
+    """
+    Issue 2: the primary-key lookup originally joined
+    information_schema.key_column_usage to table_constraints on
+    constraint_name/constraint_schema alone -- two DIFFERENT tables in
+    the same schema sharing an identically-named PRIMARY KEY
+    constraint could have their key_column_usage rows cross-matched.
+    """
+    from src.live_execution.source_connector import get_primary_key_columns
+
+    with source_engine.begin() as conn:
+        conn.execute(text('DROP TABLE IF EXISTS table_a'))
+        conn.execute(text('DROP TABLE IF EXISTS table_b'))
+        conn.execute(text(
+            'CREATE TABLE table_a (a_id BIGINT, CONSTRAINT shared_pk_name PRIMARY KEY (a_id))'
+        ))
+        conn.execute(text(
+            'CREATE TABLE table_b (b_id_one BIGINT, b_id_two BIGINT, '
+            'CONSTRAINT shared_pk_name_b PRIMARY KEY (b_id_one, b_id_two))'
+        ))
+
+    pk_a = get_primary_key_columns(source_engine, "public", "table_a")
+    pk_b = get_primary_key_columns(source_engine, "public", "table_b")
+    assert pk_a == ["a_id"], f"table_a's PK lookup must not pick up table_b's columns, got {pk_a}"
+    assert pk_b == ["b_id_one", "b_id_two"], f"table_b's PK lookup returned {pk_b}"
+
+    with source_engine.begin() as conn:
+        conn.execute(text('DROP TABLE IF EXISTS table_a'))
+        conn.execute(text('DROP TABLE IF EXISTS table_b'))
+
+
+def test_high_precision_numeric_and_temporal_types_survive_publication():
+    """
+    Issue 4: precise PostgreSQL NUMERIC values must not be silently
+    coerced to float before fingerprinting or publication, and
+    DATE/TIMESTAMPTZ must be preserved as their real types, not
+    collapsed to TEXT.
+    """
+    from src.live_execution.source_connector import read_complete_source_table
+
+    with source_engine.begin() as conn:
+        conn.execute(text('DROP TABLE IF EXISTS financial_precision_test'))
+        conn.execute(text(
+            'CREATE TABLE financial_precision_test ('
+            'id BIGINT PRIMARY KEY, '
+            'amount NUMERIC(20, 9), '
+            'effective_date DATE, '
+            'recorded_at TIMESTAMPTZ)'
+        ))
+        conn.execute(text(
+            "INSERT INTO financial_precision_test VALUES "
+            "(1, 12345678901.123456789, '2026-01-15', '2026-01-15 10:30:00+00')"
+        ))
+
+    result = read_complete_source_table(source_engine, "public", "financial_precision_test")
+    df = result["dataframe"]
+
+    import decimal
+    import datetime
+    amount = df["amount"].iloc[0]
+    assert isinstance(amount, decimal.Decimal), f"amount should be Decimal, got {type(amount)}"
+    assert str(amount) == "12345678901.123456789", f"NUMERIC precision was not preserved: {amount}"
+
+    effective_date = df["effective_date"].iloc[0]
+    assert isinstance(effective_date, datetime.date)
+
+    recorded_at = df["recorded_at"].iloc[0]
+    assert isinstance(recorded_at, datetime.datetime)
+    assert recorded_at.tzinfo is not None, "TIMESTAMPTZ must preserve timezone awareness"
+
+    with source_engine.begin() as conn:
+        conn.execute(text('DROP TABLE IF EXISTS financial_precision_test'))
 
 
 def test_source_changed_since_approval_blocks_execution():

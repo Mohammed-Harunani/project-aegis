@@ -27,16 +27,19 @@ to how concurrent operations on the same logical_target are
 serialized.
 """
 
+import decimal
+import datetime
 import uuid as uuid_module
 from contextlib import contextmanager
 
 import pandas as pd
 from sqlalchemy import MetaData, Table, Column, text
-from sqlalchemy import BigInteger, Integer, Float, Text, Boolean, TIMESTAMP
+from sqlalchemy import BigInteger, Integer, Float, Text, Boolean, TIMESTAMP, Date, Numeric
+from sqlalchemy.dialects.postgresql import UUID as SA_UUID, JSONB as SA_JSONB
 from sqlalchemy.engine import Engine
 
 from src.live_execution.identifiers import validate_identifier, physical_version_table_name
-from src.live_execution.dtype_mapping import pandas_dtype_to_postgres_type
+from src.live_execution.dtype_mapping import pandas_dtype_to_postgres_type, UnsupportedDtypeError
 
 
 AEGIS_PUBLISH_SCHEMA = "aegis_publish"
@@ -53,6 +56,12 @@ _POSTGRES_TYPE_TO_SA = {
 }
 
 _EXECUTION_LOG_TABLE = "_aegis_execution_log"
+
+
+class UnsupportedColumnValueError(Exception):
+    """A column's actual values (not just its pandas dtype label) have
+    no safe, explicit Postgres type mapping -- refusing to silently
+    fall back to TEXT for something we can't identify."""
 
 
 class LiveWriteValidationError(Exception):
@@ -178,9 +187,62 @@ class PostgresPublicationWriter:
 
     # ---- Internals ----
 
-    def _sa_type_for(self, pandas_dtype: str):
-        postgres_type_name = pandas_dtype_to_postgres_type(pandas_dtype)
-        return _POSTGRES_TYPE_TO_SA[postgres_type_name]()
+    def _sa_type_for_column(self, series: pd.Series):
+        """
+        Two paths, deliberately: a column with a genuine native numpy
+        dtype (e.g. Surgeon cast it via .astype("int64")) uses the
+        existing, proven pandas-dtype mapping -- unambiguous. A column
+        with dtype=object (which is EVERY column coming out of the
+        trusted-source read, forced there specifically to protect
+        Decimal/date/datetime/UUID precision -- see source_connector.py)
+        has a meaningless dtype label, so its Postgres type is decided
+        by inspecting the actual Python values instead.
+        """
+        dtype_str = str(series.dtype)
+        if dtype_str != "object":
+            postgres_type_name = pandas_dtype_to_postgres_type(dtype_str)
+            return _POSTGRES_TYPE_TO_SA[postgres_type_name]()
+        return self._infer_sa_type_from_values(series)
+
+    def _infer_sa_type_from_values(self, series: pd.Series):
+        """
+        Looks at the first non-null value in an object-dtype column to
+        decide its Postgres column type. Order matters: bool is
+        checked before int (bool IS an int subclass in Python --
+        isinstance(True, int) is True), and datetime.datetime is
+        checked before datetime.date (datetime.datetime IS a
+        datetime.date subclass).
+        """
+        first_value = next((v for v in series if v is not None and not (isinstance(v, float) and pd.isna(v))), None)
+        if first_value is None:
+            # Fully-null column -- nothing to infer a more specific
+            # type from; TEXT is the honest fallback, not a guess.
+            return Text()
+        if isinstance(first_value, bool):
+            return Boolean()
+        if isinstance(first_value, decimal.Decimal):
+            # Unconstrained precision/scale -- preserves whatever the
+            # source had exactly, rather than guessing a fixed
+            # precision that could truncate it.
+            return Numeric()
+        if isinstance(first_value, datetime.datetime):
+            return TIMESTAMP(timezone=first_value.tzinfo is not None)
+        if isinstance(first_value, datetime.date):
+            return Date()
+        if isinstance(first_value, uuid_module.UUID):
+            return SA_UUID()
+        if isinstance(first_value, (dict, list)):
+            return SA_JSONB()
+        if isinstance(first_value, int):
+            return BigInteger()
+        if isinstance(first_value, float):
+            return Float()
+        if isinstance(first_value, str):
+            return Text()
+        raise UnsupportedColumnValueError(
+            f"No safe Postgres type mapping for column values of Python type "
+            f"{type(first_value).__name__!r} -- refusing to silently fall back to TEXT."
+        )
 
     def _table_exists(self, conn, schema: str, table: str) -> bool:
         return bool(conn.execute(
@@ -270,33 +332,94 @@ class PostgresPublicationWriter:
             ).mappings().first()
             return dict(row) if row else None
 
-    def _get_physical_table_columns(self, conn, physical_table: str) -> list:
+    def _get_physical_table_column_signature(self, conn, physical_table: str) -> list:
+        """[(column_name, data_type), ...] in ordinal order."""
         rows = conn.execute(
             text(
-                "SELECT column_name FROM information_schema.columns "
+                "SELECT column_name, data_type FROM information_schema.columns "
                 "WHERE table_schema = :schema AND table_name = :table "
                 "ORDER BY ordinal_position"
             ),
             {"schema": AEGIS_PUBLISH_DATA_SCHEMA, "table": physical_table},
         ).fetchall()
-        return [r[0] for r in rows]
+        return [(r[0], r[1]) for r in rows]
 
-    def _check_structural_compatibility(self, conn, previous_physical_table: str, new_columns: list) -> None:
+    def _check_structural_compatibility(
+        self, conn, previous_physical_table: str, new_dataframe: pd.DataFrame
+    ) -> None:
         """
-        Postgres requires a replacement view to retain the same output
-        column names, order, and types -- columns may be added at the
-        end. Checked here at the name/order level before attempting
-        CREATE OR REPLACE VIEW, so an incompatible change gets a clear
-        Aegis-level error instead of a raw Postgres one.
+        Phase 2.5 requires an EXACT publication signature: same column
+        names, same order, same count, same Postgres types. Appending
+        columns is NOT allowed, even though Postgres's CREATE OR
+        REPLACE VIEW would accept it going forward -- the earlier
+        design allowed appending, but rollback repoints the view back
+        to the PREVIOUS (narrower) physical table, and Postgres does
+        not allow CREATE OR REPLACE VIEW to remove existing output
+        columns. That meant a publish-then-rollback sequence with an
+        appended column would fail specifically when rolling back,
+        which is exactly the operation this system exists to make
+        safe. Requiring an exact match in both directions removes that
+        asymmetry entirely.
         """
-        existing_columns = self._get_physical_table_columns(conn, previous_physical_table)
-        if new_columns[: len(existing_columns)] != existing_columns:
+        existing_signature = self._get_physical_table_column_signature(conn, previous_physical_table)
+        new_signature = [
+            (col, self._postgres_type_name_for_column(new_dataframe[col]))
+            for col in new_dataframe.columns
+        ]
+        if new_signature != existing_signature:
             raise IncompatibleViewSchemaError(
-                f"New publication's columns {new_columns} are not compatible "
-                f"with the currently published columns {existing_columns} -- a "
-                f"replacement view must retain the same column names and order "
-                f"(new columns may only be added at the end)."
+                f"New publication's column signature {new_signature} does not "
+                f"exactly match the currently published signature "
+                f"{existing_signature} -- Phase 2.5 requires an exact match "
+                f"(same names, same order, same types, same count). Appending "
+                f"columns is not permitted: Postgres will not allow rollback to "
+                f"repoint the view back to a physical table with fewer columns, "
+                f"so allowing the append in one direction but not the other "
+                f"would leave rollback broken for exactly this case."
             )
+
+    def _postgres_type_name_for_column(self, series: pd.Series) -> str:
+        """
+        The Postgres type NAME (not the SQLAlchemy type object) for a
+        column, used only for signature comparison against
+        information_schema's own data_type strings. Must stay
+        consistent with _sa_type_for_column()/_infer_sa_type_from_values()
+        -- same decision, described in Postgres's own vocabulary.
+
+        Uses exact type() equality rather than isinstance() --
+        deliberately sidesteps needing to know SQLAlchemy's exact
+        subclass hierarchy (e.g. whether BigInteger extends Integer,
+        or Float extends Numeric), which could not be verified in this
+        environment (no working SQLAlchemy install to introspect).
+        Since these objects are only ever constructed by
+        _infer_sa_type_from_values()/_sa_type_for_column() immediately
+        above, exact-type matching is sufficient and removes any
+        dependency on an inheritance assumption that couldn't be
+        checked directly.
+        """
+        sa_type = self._sa_type_for_column(series)
+        exact_type = type(sa_type)
+        if exact_type is BigInteger:
+            return "bigint"
+        if exact_type is Integer:
+            return "integer"
+        if exact_type is Float:
+            return "double precision"
+        if exact_type is Boolean:
+            return "boolean"
+        if exact_type is Numeric:
+            return "numeric"
+        if exact_type is TIMESTAMP:
+            return "timestamp with time zone" if sa_type.timezone else "timestamp without time zone"
+        if exact_type is Date:
+            return "date"
+        if exact_type is SA_UUID:
+            return "uuid"
+        if exact_type is SA_JSONB:
+            return "jsonb"
+        if exact_type is Text:
+            return "text"
+        return str(sa_type).lower()
 
     # ---- Publication ----
 
@@ -334,13 +457,13 @@ class PostgresPublicationWriter:
 
             if previous_physical_table:
                 self._check_structural_compatibility(
-                    conn, previous_physical_table, list(dataframe.columns)
+                    conn, previous_physical_table, dataframe
                 )
 
             # 1. Create the new immutable physical version table.
             metadata = MetaData(schema=AEGIS_PUBLISH_DATA_SCHEMA)
             columns = [
-                Column(col, self._sa_type_for(str(dataframe[col].dtype)))
+                Column(col, self._sa_type_for_column(dataframe[col]))
                 for col in dataframe.columns
             ]
             Table(physical_table, metadata, *columns).create(bind=conn)
@@ -430,8 +553,8 @@ class PostgresPublicationWriter:
                     f'DROP VIEW IF EXISTS "{AEGIS_PUBLISH_SCHEMA}"."{logical_target}"'
                 ))
             else:
-                columns = self._get_physical_table_columns(conn, previous_physical_table)
-                column_list = ", ".join(f'"{c}"' for c in columns)
+                signature = self._get_physical_table_column_signature(conn, previous_physical_table)
+                column_list = ", ".join(f'"{name}"' for name, _pg_type in signature)
                 conn.execute(text(
                     f'CREATE OR REPLACE VIEW "{AEGIS_PUBLISH_SCHEMA}"."{logical_target}" AS '
                     f'SELECT {column_list} FROM "{AEGIS_PUBLISH_DATA_SCHEMA}"."{previous_physical_table}"'

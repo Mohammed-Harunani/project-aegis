@@ -22,12 +22,17 @@ depends_on = None
 
 
 def upgrade() -> None:
-    # Fixed, dedicated schemas for the stable-view publication model --
-    # aegis_publish_data holds immutable physical version tables and
-    # the target-side marker table; aegis_publish holds the
-    # consumer-facing stable views. Neither is caller-configurable.
-    op.execute("CREATE SCHEMA IF NOT EXISTS aegis_publish_data")
-    op.execute("CREATE SCHEMA IF NOT EXISTS aegis_publish")
+    # NOTE: aegis_publish / aegis_publish_data are NOT created here.
+    # This migration runs against DATABASE_URL (the governance
+    # database) -- but those two schemas belong in LIVE_DATABASE_URL
+    # (the actual publication target), a different database entirely.
+    # Creating them here would put two permanently-empty, unused
+    # schemas in governance while the real ones the writer actually
+    # publishes into live somewhere else. PostgresPublicationWriter's
+    # own _ensure_publish_schemas_and_log() already creates both,
+    # idempotently (CREATE SCHEMA IF NOT EXISTS), in the correct
+    # database, the first time anything is ever published -- that is
+    # the only place these schemas are initialized.
 
     # Trusted-source provenance on approval_tickets -- NULL for
     # sample_data tickets, populated for /simulate-migration-from-source
@@ -173,6 +178,6 @@ def downgrade() -> None:
     op.drop_column("approval_tickets", "source_primary_key")
     op.drop_column("approval_tickets", "source_table")
     op.drop_column("approval_tickets", "source_schema")
-
-    op.execute("DROP SCHEMA IF EXISTS aegis_publish CASCADE")
-    op.execute("DROP SCHEMA IF EXISTS aegis_publish_data CASCADE")
+    # No DROP SCHEMA here -- upgrade() never creates aegis_publish /
+    # aegis_publish_data in this (governance) database; see the note
+    # in upgrade().

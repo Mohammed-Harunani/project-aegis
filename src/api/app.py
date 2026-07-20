@@ -948,33 +948,42 @@ def execute_live(
                             "that, not a new attempt."
                         ),
                     }
-                elif outcome == "not_committed":
-                    live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
-                    raise HTTPException(
-                        status_code=500,
-                        detail=(
-                            f"Live execution failed and was rolled back at the target "
-                            f"database -- the previously published version is unchanged. "
-                            f"Reason: {e}"
-                        ),
-                    )
                 else:
+                    # "not_committed" and "unknown" are treated the
+                    # SAME way here, deliberately: a marker being
+                    # absent at this exact instant does not prove the
+                    # target transaction has finished failing -- the
+                    # commit acknowledgment could simply be delayed,
+                    # independent of whether the underlying commit
+                    # itself succeeds moments later. Concluding FAILED
+                    # here would make the ticket retryable while the
+                    # original publication might still land, risking a
+                    # duplicate. Only the staleness+lock-gated
+                    # reconciliation path (reconcile_running, via a
+                    # later GET) is allowed to conclude FAILED, because
+                    # it additionally proves the session lock is free
+                    # -- not just that a marker happens to be absent
+                    # right now.
                     live_repo.mark_outcome_unknown(
                         live_record.live_execution_id,
                         reason=(
-                            f"Connection error during publication, and the target-side "
-                            f"marker could not be checked either -- outcome unknown. "
-                            f"Reason: {e}"
+                            f"Connection error during publication -- outcome not yet "
+                            f"provable ({outcome}). Left RUNNING; GET "
+                            f"/live-executions/{{id}} will reconcile it once the "
+                            f"staleness threshold passes and the target lock can be "
+                            f"proven free. Reason: {e}"
                         ),
                     )
                     raise HTTPException(
-                        status_code=500,
+                        status_code=503,
                         detail=(
-                            f"Live execution outcome is UNKNOWN -- a connection error "
-                            f"occurred and the target-side marker could not be checked "
-                            f"either. This execution remains RUNNING and needs manual "
-                            f"investigation before any retry; retrying blindly risks a "
-                            f"duplicate publication. Reason: {e}"
+                            f"Live execution outcome is not yet provable -- a connection "
+                            f"error occurred and the target-side marker was absent or "
+                            f"unreachable, but that alone doesn't prove the publication "
+                            f"failed. This execution remains RUNNING; poll GET "
+                            f"/live-executions/{{live_execution_id}} for the reconciled "
+                            f"outcome once the staleness threshold passes. Retrying "
+                            f"blindly risks a duplicate publication. Reason: {e}"
                         ),
                     )
 
@@ -1134,13 +1143,33 @@ def rollback_live_execution(
                         ),
                     }
                 elif outcome == "not_committed":
-                    live_repo.mark_rollback_failed(live_execution_id, failure_reason=str(e))
+                    # A missing marker at this instant does not prove
+                    # the rollback transaction has finished failing --
+                    # same reasoning as execute_live's generic handler.
+                    # Leave it in ROLLING_BACK (mark_rollback_failed
+                    # only annotates the reason, it does not change
+                    # status) for reconcile_rolling_back to resolve
+                    # once it can additionally prove the target lock
+                    # is free.
+                    live_repo.mark_rollback_failed(
+                        live_execution_id,
+                        failure_reason=(
+                            f"Connection error during rollback -- outcome not yet "
+                            f"provable (marker absent). Left in ROLLING_BACK; GET "
+                            f"/live-executions/{{id}} will reconcile it once the "
+                            f"staleness threshold passes and the target lock can be "
+                            f"proven free. Reason: {e}"
+                        ),
+                    )
                     raise HTTPException(
-                        status_code=500,
+                        status_code=503,
                         detail=(
-                            f"Rollback failed and was rolled back at the target "
-                            f"database -- the published view is unchanged from before "
-                            f"this rollback attempt. Reason: {e}"
+                            f"Rollback outcome is not yet provable -- a connection error "
+                            f"occurred and the target-side marker was absent, but that "
+                            f"alone doesn't prove the rollback failed. This execution "
+                            f"remains in ROLLING_BACK; poll GET "
+                            f"/live-executions/{{live_execution_id}} for the reconciled "
+                            f"outcome once the staleness threshold passes. Reason: {e}"
                         ),
                     )
                 else:
@@ -1153,7 +1182,7 @@ def rollback_live_execution(
                         ),
                     )
                     raise HTTPException(
-                        status_code=500,
+                        status_code=503,
                         detail=(
                             f"Rollback outcome is UNKNOWN -- a connection error occurred "
                             f"and the target-side marker could not be checked either. "

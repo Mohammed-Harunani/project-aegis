@@ -7,11 +7,26 @@ before a live execution publishes.
 
 This exists because the prior design -- caller-supplied `sample_data`
 in the request body -- had no connection to any real, complete
-dataset at all. A three-row simulation sample could be approved and
-then published live as if it were the whole table. This module is
-what actually closes that gap: it reads the real table itself,
-server-side, deterministically, and produces the fingerprints that
-prove later reads match what was approved.
+dataset at all. This module is what actually closes that gap: it
+reads the real table itself, server-side, deterministically, and
+produces the fingerprints that prove later reads match what was
+approved.
+
+Correction pass: table existence, primary-key metadata, column
+metadata, and the complete ordered read now all happen inside ONE
+connection and ONE REPEATABLE READ transaction. Originally these were
+three separate connections/queries -- a concurrent schema or
+constraint change between them could produce a ticket whose primary
+key, row data, and schema fingerprint were captured from three
+different states of the table. Also switched the read away from
+pd.read_sql's own type inference, which cannot be trusted not to
+coerce precise NUMERIC values (returned by the driver as Python
+Decimal) into float64 -- exactly the kind of silent precision loss
+this project exists to catch elsewhere. Rows are now read directly
+and the DataFrame is built with dtype=object forced throughout,
+keeping whatever native Python type the driver already produced per
+cell (Decimal, date, timezone-aware datetime, UUID, dict/list for
+JSONB) completely untouched.
 """
 
 import hashlib
@@ -37,83 +52,97 @@ class SourceChangedError(Exception):
     execution. Raised at execute-live time, never silently ignored."""
 
 
+def _get_primary_key_columns(conn, source_schema: str, source_table: str) -> list:
+    """
+    Connection-scoped version -- used INSIDE the one atomic snapshot
+    transaction in read_complete_source_table(), so the PK lookup
+    shares the exact same REPEATABLE READ view of the catalog as
+    everything else.
+
+    Joins key_column_usage to table_constraints on table_schema AND
+    table_name as well as constraint_name/constraint_schema --
+    originally joined on constraint identity alone, which meant two
+    DIFFERENT tables in the same schema sharing an identically-named
+    PRIMARY KEY constraint could have their key_column_usage rows
+    cross-matched, silently mixing columns from the wrong table into
+    the result.
+    """
+    rows = conn.execute(
+        text(
+            "SELECT kcu.column_name FROM information_schema.table_constraints tco "
+            "JOIN information_schema.key_column_usage kcu "
+            "ON kcu.constraint_name = tco.constraint_name "
+            "AND kcu.constraint_schema = tco.constraint_schema "
+            "AND kcu.table_schema = tco.table_schema "
+            "AND kcu.table_name = tco.table_name "
+            "WHERE tco.constraint_type = 'PRIMARY KEY' "
+            "AND tco.table_schema = :schema AND tco.table_name = :table "
+            "ORDER BY kcu.ordinal_position"
+        ),
+        {"schema": source_schema, "table": source_table},
+    ).fetchall()
+    return [row[0] for row in rows]
+
+
 def get_primary_key_columns(engine: Engine, source_schema: str, source_table: str) -> list:
     """
-    Returns the primary key column names, in their defined order, for
-    the given table. Empty list if the table has no primary key --
-    the caller (read_complete_source_table) turns that into a hard
-    SourceValidationError; a source table without a primary key has no
-    way to be ordered deterministically, which is required for the
-    dataset fingerprint to be meaningful (two reads of an unordered
-    table with unstable output order would fingerprint differently
-    even with identical data).
-
-    Uses information_schema (ANSI-standard, not a Postgres catalog
-    internal) specifically because key_column_usage.ordinal_position
-    is explicitly documented as the column's position within the
-    constraint -- more certain to be correct than decoding pg_index's
-    internal int2vector representation by hand.
+    Standalone convenience wrapper (its own connection) for callers
+    that just want a quick PK check outside the atomic snapshot flow.
+    read_complete_source_table() does NOT call this -- it uses
+    _get_primary_key_columns() directly inside its own transaction, so
+    the PK lookup, the column metadata, and the data read all come
+    from exactly the same snapshot.
     """
     try:
         validate_identifier(source_schema, "source schema")
         validate_identifier(source_table, "source table")
     except InvalidIdentifierError as e:
         raise SourceValidationError(str(e))
-
     with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT kcu.column_name FROM information_schema.table_constraints tco "
-                "JOIN information_schema.key_column_usage kcu "
-                "ON kcu.constraint_name = tco.constraint_name "
-                "AND kcu.constraint_schema = tco.constraint_schema "
-                "WHERE tco.constraint_type = 'PRIMARY KEY' "
-                "AND tco.table_schema = :schema AND tco.table_name = :table "
-                "ORDER BY kcu.ordinal_position"
-            ),
-            {"schema": source_schema, "table": source_table},
-        ).fetchall()
-    return [row[0] for row in rows]
+        return _get_primary_key_columns(conn, source_schema, source_table)
+
+
+def _get_column_metadata(conn, source_schema: str, source_table: str) -> list:
+    """[(column_name, data_type), ...] in ordinal order, from the SAME
+    connection/transaction as everything else in the snapshot."""
+    rows = conn.execute(
+        text(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = :table "
+            "ORDER BY ordinal_position"
+        ),
+        {"schema": source_schema, "table": source_table},
+    ).fetchall()
+    return [(r[0], r[1]) for r in rows]
+
+
+def _schema_fingerprint_from_metadata(column_metadata: list) -> str:
+    canonical = json.dumps([[name, dtype] for name, dtype in column_metadata], separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def compute_source_schema_fingerprint(engine: Engine, source_schema: str, source_table: str) -> str:
-    """
-    SHA-256 over the source table's (column_name, data_type) pairs, in
-    ordinal position order, as Postgres's own catalog reports them
-    right now. Distinct from output_fingerprint's DATA fingerprint --
-    this one is about the table's STRUCTURE, checked once at
-    simulation time and stored for audit; the DATASET fingerprint
-    below is what's actually re-verified before live execution.
-    """
+    """Standalone convenience wrapper (own connection). Not used by
+    read_complete_source_table(), which computes this from the same
+    transaction's column metadata instead -- kept for any caller that
+    wants a schema fingerprint without a full table read."""
     with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT column_name, data_type FROM information_schema.columns "
-                "WHERE table_schema = :schema AND table_name = :table "
-                "ORDER BY ordinal_position"
-            ),
-            {"schema": source_schema, "table": source_table},
-        ).fetchall()
-    canonical = json.dumps([[r[0], r[1]] for r in rows], separators=(",", ":"))
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        column_metadata = _get_column_metadata(conn, source_schema, source_table)
+    return _schema_fingerprint_from_metadata(column_metadata)
 
 
 def read_complete_source_table(engine: Engine, source_schema: str, source_table: str) -> dict:
     """
-    Reads the ENTIRE source table in one read-only, REPEATABLE READ
-    transaction, ordered deterministically by its primary key.
-    Returns a dict: dataframe, primary_key (list of column names),
-    row_count, schema_fingerprint, dataset_fingerprint.
+    Reads the ENTIRE source table in ONE read-only, REPEATABLE READ
+    transaction and ONE connection -- table existence, primary-key
+    metadata, column metadata, and the complete ordered read all come
+    from the exact same snapshot. Returns a dict: dataframe,
+    primary_key, row_count, schema_fingerprint, column_types (dict of
+    column_name -> Postgres data_type, as this exact snapshot saw it),
+    dataset_fingerprint.
 
-    REPEATABLE READ + READ ONLY: the whole read sees one consistent
-    snapshot of the table (no phantom rows from concurrent writes
-    partway through a large read) and can't itself write anything.
-    Ordering by the primary key is what makes the dataset fingerprint
-    reproducible -- an unordered read of the same data could return
-    rows in a different physical order between two reads even with no
-    actual changes, which would fingerprint as a false mismatch.
-
-    Raises SourceValidationError if the table has no primary key.
+    Raises SourceValidationError if the table doesn't exist or has no
+    primary key.
     """
     try:
         validate_identifier(source_schema, "source schema")
@@ -121,28 +150,52 @@ def read_complete_source_table(engine: Engine, source_schema: str, source_table:
     except InvalidIdentifierError as e:
         raise SourceValidationError(str(e))
 
-    primary_key = get_primary_key_columns(engine, source_schema, source_table)
-    if not primary_key:
-        raise SourceValidationError(
-            f'"{source_schema}"."{source_table}" has no primary key -- a '
-            f"live-capable source table must have one, so the complete read "
-            f"can be ordered deterministically and the dataset fingerprint "
-            f"is reproducible across reads."
-        )
-    for col in primary_key:
-        validate_identifier(col, "primary key column")
-
-    order_clause = ", ".join(f'"{col}"' for col in primary_key)
-
     with engine.connect() as conn:
         with conn.begin():
             conn.execute(text("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"))
-            dataframe = pd.read_sql(
-                text(f'SELECT * FROM "{source_schema}"."{source_table}" ORDER BY {order_clause}'),
-                conn,
-            )
 
-    schema_fingerprint = compute_source_schema_fingerprint(engine, source_schema, source_table)
+            exists = conn.execute(
+                text(
+                    "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+                    "WHERE table_schema = :schema AND table_name = :table)"
+                ),
+                {"schema": source_schema, "table": source_table},
+            ).scalar()
+            if not exists:
+                raise SourceValidationError(f'"{source_schema}"."{source_table}" does not exist.')
+
+            primary_key = _get_primary_key_columns(conn, source_schema, source_table)
+            if not primary_key:
+                raise SourceValidationError(
+                    f'"{source_schema}"."{source_table}" has no primary key -- a '
+                    f"live-capable source table must have one, so the complete read "
+                    f"can be ordered deterministically and the dataset fingerprint "
+                    f"is reproducible across reads."
+                )
+            for col in primary_key:
+                validate_identifier(col, "primary key column")
+
+            column_metadata = _get_column_metadata(conn, source_schema, source_table)
+            schema_fingerprint = _schema_fingerprint_from_metadata(column_metadata)
+
+            order_clause = ", ".join(f'"{col}"' for col in primary_key)
+            result = conn.execute(
+                text(f'SELECT * FROM "{source_schema}"."{source_table}" ORDER BY {order_clause}')
+            )
+            column_names = list(result.keys())
+            rows = [tuple(r) for r in result.fetchall()]
+
+    # dtype=object forced throughout -- NOT pd.read_sql's own type
+    # inference, which cannot be trusted not to coerce precise NUMERIC
+    # values (returned by the driver as Python Decimal) into float64.
+    # This keeps whatever native Python type the driver already gave
+    # each cell (Decimal, datetime.date, timezone-aware
+    # datetime.datetime, uuid.UUID, dict/list for JSONB, bool, int,
+    # str) completely untouched all the way through to publication --
+    # see writer.py's value-based type inference for the other half of
+    # this fix.
+    dataframe = pd.DataFrame(rows, columns=column_names, dtype=object)
+
     dataset_fingerprint = compute_dataframe_fingerprint(dataframe)
 
     return {
@@ -150,6 +203,7 @@ def read_complete_source_table(engine: Engine, source_schema: str, source_table:
         "primary_key": primary_key,
         "row_count": len(dataframe),
         "schema_fingerprint": schema_fingerprint,
+        "column_types": {name: pg_type for name, pg_type in column_metadata},
         "dataset_fingerprint": dataset_fingerprint,
     }
 
