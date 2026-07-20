@@ -21,6 +21,20 @@ Base = declarative_base()
 
 class ApprovalTicketRecord(Base):
     __tablename__ = "approval_tickets"
+    __table_args__ = (
+        # Prevents a malformed or manually altered ticket from being
+        # live_eligible=true with no actual source provenance -- the
+        # API already enforces this at creation time, but a database-
+        # level constraint means it can never be true regardless of
+        # how a row got there.
+        CheckConstraint(
+            "NOT live_eligible OR ("
+            "source_schema IS NOT NULL AND source_table IS NOT NULL AND "
+            "source_primary_key IS NOT NULL AND source_dataset_fingerprint IS NOT NULL"
+            ")",
+            name="ck_approval_tickets_live_eligible_requires_provenance",
+        ),
+    )
 
     ticket_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     proposed_action = Column(Text, nullable=False)
@@ -220,6 +234,10 @@ class LiveExecutionRecord(Base):
     # (source re-read, fingerprint compared) immediately before
     # publishing -- a source change between approval and execution
     # blocks the execution rather than silently publishing stale data.
-    source_schema = Column(Text, nullable=True)
-    source_table = Column(Text, nullable=True)
-    source_dataset_fingerprint = Column(Text, nullable=True)
+    # NOT NULL: every row here is guaranteed to come from a
+    # live_eligible ticket (evaluate_safety_gates checks this before
+    # create_running() is ever called), so a null here could only mean
+    # a bug, never a legitimate case.
+    source_schema = Column(Text, nullable=False)
+    source_table = Column(Text, nullable=False)
+    source_dataset_fingerprint = Column(Text, nullable=False)

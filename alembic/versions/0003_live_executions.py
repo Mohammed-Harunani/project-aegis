@@ -54,6 +54,17 @@ def upgrade() -> None:
         "approval_tickets",
         sa.Column("live_eligible", sa.Boolean, nullable=False, server_default=sa.false()),
     )
+    # Prevents a malformed or manually altered ticket from being
+    # live_eligible=true with no actual source provenance -- a
+    # database-level guarantee, not just an API-layer one.
+    op.create_check_constraint(
+        "ck_approval_tickets_live_eligible_requires_provenance",
+        "approval_tickets",
+        "NOT live_eligible OR ("
+        "source_schema IS NOT NULL AND source_table IS NOT NULL AND "
+        "source_primary_key IS NOT NULL AND source_dataset_fingerprint IS NOT NULL"
+        ")",
+    )
 
     # Phase 2.5 correction -- proves a later live-execution
     # recomputation produces the exact same corrected output as what
@@ -124,9 +135,9 @@ def upgrade() -> None:
         # Copied from the ticket at execution time for an independent
         # audit trail, and re-verified (source re-read, fingerprint
         # compared) immediately before publishing.
-        sa.Column("source_schema", sa.Text, nullable=True),
-        sa.Column("source_table", sa.Text, nullable=True),
-        sa.Column("source_dataset_fingerprint", sa.Text, nullable=True),
+        sa.Column("source_schema", sa.Text, nullable=False),
+        sa.Column("source_table", sa.Text, nullable=False),
+        sa.Column("source_dataset_fingerprint", sa.Text, nullable=False),
         sa.CheckConstraint(
             "status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'ROLLING_BACK', 'ROLLED_BACK')",
             name="ck_live_executions_valid_status",
@@ -171,6 +182,7 @@ def downgrade() -> None:
     op.drop_column("healing_manifests", "source_schema")
     op.drop_column("healing_manifests", "corrected_output_fingerprint")
 
+    op.drop_constraint("ck_approval_tickets_live_eligible_requires_provenance", "approval_tickets")
     op.drop_column("approval_tickets", "live_eligible")
     op.drop_column("approval_tickets", "source_dataset_fingerprint")
     op.drop_column("approval_tickets", "source_schema_fingerprint")

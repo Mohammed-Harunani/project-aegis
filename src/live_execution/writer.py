@@ -27,33 +27,20 @@ to how concurrent operations on the same logical_target are
 serialized.
 """
 
-import decimal
-import datetime
-import uuid as uuid_module
 from contextlib import contextmanager
 
 import pandas as pd
 from sqlalchemy import MetaData, Table, Column, text
-from sqlalchemy import BigInteger, Integer, Float, Text, Boolean, TIMESTAMP, Date, Numeric
+from sqlalchemy import BigInteger, Float, Text, Boolean, TIMESTAMP, Date, Numeric
 from sqlalchemy.dialects.postgresql import UUID as SA_UUID, JSONB as SA_JSONB
 from sqlalchemy.engine import Engine
 
 from src.live_execution.identifiers import validate_identifier, physical_version_table_name
-from src.live_execution.dtype_mapping import pandas_dtype_to_postgres_type, UnsupportedDtypeError
+from src.live_execution.logical_dtype import aegis_dtype_to_postgres_type_name, UnsupportedSourceTypeError
 
 
 AEGIS_PUBLISH_SCHEMA = "aegis_publish"
 AEGIS_PUBLISH_DATA_SCHEMA = "aegis_publish_data"
-
-_POSTGRES_TYPE_TO_SA = {
-    "BIGINT": BigInteger,
-    "INTEGER": Integer,
-    "DOUBLE PRECISION": Float,
-    "REAL": Float,
-    "TEXT": Text,
-    "BOOLEAN": Boolean,
-    "TIMESTAMP": TIMESTAMP,
-}
 
 _EXECUTION_LOG_TABLE = "_aegis_execution_log"
 
@@ -107,6 +94,21 @@ class PostgresPublicationWriter:
         backend's session-level advisory locks when its connection
         terminates, which is what makes this a reliable liveness
         signal for reconciliation even across a hard crash.
+
+        Yields the connection itself -- publish()/rollback_to_previous()
+        must be given THIS SAME connection (not open their own via
+        self.engine.begin()). Originally they opened a separate
+        connection: reconciliation acquiring the lock later would then
+        only prove the LOCK-holding connection's session had ended, not
+        that the publication transaction on the OTHER connection had
+        actually resolved. Both connections are drawn from the same
+        pool but are otherwise independent -- something like an
+        intermediate proxy's idle timeout could in principle affect one
+        without affecting the other at the same moment, letting the
+        lock release while the publish transaction is still genuinely
+        in flight elsewhere. Sharing one connection removes that gap
+        entirely: there is no "part of it" that can die while another
+        part stays alive.
         """
         conn = self.engine.connect()
         try:
@@ -122,7 +124,7 @@ class PostgresPublicationWriter:
                     f"concurrently rather than racing it."
                 )
             try:
-                yield
+                yield conn
             finally:
                 conn.execute(
                     text("SELECT pg_advisory_unlock(hashtext(:target))"),
@@ -187,62 +189,39 @@ class PostgresPublicationWriter:
 
     # ---- Internals ----
 
-    def _sa_type_for_column(self, series: pd.Series):
+    def _sa_type_for_gold_dtype(self, logical_dtype: str):
         """
-        Two paths, deliberately: a column with a genuine native numpy
-        dtype (e.g. Surgeon cast it via .astype("int64")) uses the
-        existing, proven pandas-dtype mapping -- unambiguous. A column
-        with dtype=object (which is EVERY column coming out of the
-        trusted-source read, forced there specifically to protect
-        Decimal/date/datetime/UUID precision -- see source_connector.py)
-        has a meaningless dtype label, so its Postgres type is decided
-        by inspecting the actual Python values instead.
+        Derives the SQLAlchemy column type from the Gold schema's OWN
+        declared logical dtype -- NOT from inspecting the dataframe's
+        actual row values. verify_complete_schema_match() (called
+        before publish() ever runs, in app.py's execute_live) already
+        guarantees every column's post-repair logical dtype exactly
+        matches what Gold declares, so this is a reliable, explicit
+        publication-type contract rather than a guess: an all-null
+        NUMERIC column keeps its declared NUMERIC type instead of
+        falling back to TEXT (which value-inspection had no way to
+        avoid, since there's no value to inspect), and an unsupported
+        logical dtype is rejected outright rather than silently
+        defaulting to anything.
         """
-        dtype_str = str(series.dtype)
-        if dtype_str != "object":
-            postgres_type_name = pandas_dtype_to_postgres_type(dtype_str)
-            return _POSTGRES_TYPE_TO_SA[postgres_type_name]()
-        return self._infer_sa_type_from_values(series)
+        pg_type_name = aegis_dtype_to_postgres_type_name(logical_dtype)
+        return self._sa_type_for_postgres_type_name(pg_type_name)
 
-    def _infer_sa_type_from_values(self, series: pd.Series):
-        """
-        Looks at the first non-null value in an object-dtype column to
-        decide its Postgres column type. Order matters: bool is
-        checked before int (bool IS an int subclass in Python --
-        isinstance(True, int) is True), and datetime.datetime is
-        checked before datetime.date (datetime.datetime IS a
-        datetime.date subclass).
-        """
-        first_value = next((v for v in series if v is not None and not (isinstance(v, float) and pd.isna(v))), None)
-        if first_value is None:
-            # Fully-null column -- nothing to infer a more specific
-            # type from; TEXT is the honest fallback, not a guess.
-            return Text()
-        if isinstance(first_value, bool):
-            return Boolean()
-        if isinstance(first_value, decimal.Decimal):
-            # Unconstrained precision/scale -- preserves whatever the
-            # source had exactly, rather than guessing a fixed
-            # precision that could truncate it.
-            return Numeric()
-        if isinstance(first_value, datetime.datetime):
-            return TIMESTAMP(timezone=first_value.tzinfo is not None)
-        if isinstance(first_value, datetime.date):
-            return Date()
-        if isinstance(first_value, uuid_module.UUID):
-            return SA_UUID()
-        if isinstance(first_value, (dict, list)):
-            return SA_JSONB()
-        if isinstance(first_value, int):
-            return BigInteger()
-        if isinstance(first_value, float):
-            return Float()
-        if isinstance(first_value, str):
-            return Text()
-        raise UnsupportedColumnValueError(
-            f"No safe Postgres type mapping for column values of Python type "
-            f"{type(first_value).__name__!r} -- refusing to silently fall back to TEXT."
-        )
+    def _sa_type_for_postgres_type_name(self, pg_type_name: str):
+        if pg_type_name == "timestamp without time zone":
+            return TIMESTAMP(timezone=False)
+        if pg_type_name == "timestamp with time zone":
+            return TIMESTAMP(timezone=True)
+        try:
+            return {
+                "bigint": BigInteger, "double precision": Float, "text": Text,
+                "boolean": Boolean, "numeric": Numeric, "date": Date,
+                "uuid": SA_UUID, "jsonb": SA_JSONB,
+            }[pg_type_name]()
+        except KeyError:
+            raise UnsupportedColumnValueError(
+                f"No SQLAlchemy type mapping for PostgreSQL type name {pg_type_name!r}."
+            )
 
     def _table_exists(self, conn, schema: str, table: str) -> bool:
         return bool(conn.execute(
@@ -345,16 +324,18 @@ class PostgresPublicationWriter:
         return [(r[0], r[1]) for r in rows]
 
     def _check_structural_compatibility(
-        self, conn, previous_physical_table: str, new_dataframe: pd.DataFrame
+        self, conn, previous_physical_table: str, new_columns: list, gold_schema
     ) -> None:
         """
         Phase 2.5 requires an EXACT publication signature: same column
-        names, same order, same count, same Postgres types. Appending
-        columns is NOT allowed, even though Postgres's CREATE OR
-        REPLACE VIEW would accept it going forward -- the earlier
-        design allowed appending, but rollback repoints the view back
-        to the PREVIOUS (narrower) physical table, and Postgres does
-        not allow CREATE OR REPLACE VIEW to remove existing output
+        names, same order, same count, same Postgres types -- derived
+        from the Gold schema's OWN declared logical dtype for each
+        column, not inferred from row values. Appending columns is NOT
+        allowed, even though Postgres's CREATE OR REPLACE VIEW would
+        accept it going forward -- the earlier design allowed
+        appending, but rollback repoints the view back to the
+        PREVIOUS (narrower) physical table, and Postgres does not
+        allow CREATE OR REPLACE VIEW to remove existing output
         columns. That meant a publish-then-rollback sequence with an
         appended column would fail specifically when rolling back,
         which is exactly the operation this system exists to make
@@ -363,8 +344,8 @@ class PostgresPublicationWriter:
         """
         existing_signature = self._get_physical_table_column_signature(conn, previous_physical_table)
         new_signature = [
-            (col, self._postgres_type_name_for_column(new_dataframe[col]))
-            for col in new_dataframe.columns
+            (col, aegis_dtype_to_postgres_type_name(gold_schema.columns[col].dtype))
+            for col in new_columns
         ]
         if new_signature != existing_signature:
             raise IncompatibleViewSchemaError(
@@ -378,64 +359,37 @@ class PostgresPublicationWriter:
                 f"would leave rollback broken for exactly this case."
             )
 
-    def _postgres_type_name_for_column(self, series: pd.Series) -> str:
-        """
-        The Postgres type NAME (not the SQLAlchemy type object) for a
-        column, used only for signature comparison against
-        information_schema's own data_type strings. Must stay
-        consistent with _sa_type_for_column()/_infer_sa_type_from_values()
-        -- same decision, described in Postgres's own vocabulary.
-
-        Uses exact type() equality rather than isinstance() --
-        deliberately sidesteps needing to know SQLAlchemy's exact
-        subclass hierarchy (e.g. whether BigInteger extends Integer,
-        or Float extends Numeric), which could not be verified in this
-        environment (no working SQLAlchemy install to introspect).
-        Since these objects are only ever constructed by
-        _infer_sa_type_from_values()/_sa_type_for_column() immediately
-        above, exact-type matching is sufficient and removes any
-        dependency on an inheritance assumption that couldn't be
-        checked directly.
-        """
-        sa_type = self._sa_type_for_column(series)
-        exact_type = type(sa_type)
-        if exact_type is BigInteger:
-            return "bigint"
-        if exact_type is Integer:
-            return "integer"
-        if exact_type is Float:
-            return "double precision"
-        if exact_type is Boolean:
-            return "boolean"
-        if exact_type is Numeric:
-            return "numeric"
-        if exact_type is TIMESTAMP:
-            return "timestamp with time zone" if sa_type.timezone else "timestamp without time zone"
-        if exact_type is Date:
-            return "date"
-        if exact_type is SA_UUID:
-            return "uuid"
-        if exact_type is SA_JSONB:
-            return "jsonb"
-        if exact_type is Text:
-            return "text"
-        return str(sa_type).lower()
-
     # ---- Publication ----
 
     def publish(
         self,
+        conn,
         logical_target: str,
         dataframe: pd.DataFrame,
         execution_id,
         expected_row_count: int,
+        gold_schema,
     ) -> dict:
         """
         Creates a new immutable physical version table and repoints the
         stable view to it, all in one transaction. Returns
         {"physical_table", "previous_physical_table", "final_row_count"}.
-        REQUIRES the caller to already be holding this logical target's
-        session-level lock (via hold_target_lock()).
+
+        REQUIRES conn to be the SAME connection currently yielded by
+        this logical target's hold_target_lock() -- not a separate one
+        opened here. Publication and the session-level lock must share
+        one Postgres backend: reconciliation acquiring the lock later
+        only proves something about whichever connection held it, so if
+        that were a different connection than the one running this
+        transaction, a dead lock-holding connection wouldn't prove
+        anything about whether THIS transaction had resolved.
+
+        gold_schema is the ticket's own ObservedSchema for the Gold
+        target -- app.py's execute_live already calls
+        verify_complete_schema_match() before this, which guarantees
+        every column's post-repair logical dtype exactly matches what
+        Gold declares, so this is the authoritative, explicit
+        publication-type contract, not an inference from row values.
         """
         validate_identifier(logical_target, "logical target")
         for col in dataframe.columns:
@@ -443,7 +397,7 @@ class PostgresPublicationWriter:
 
         physical_table = physical_version_table_name(logical_target, execution_id)
 
-        with self.engine.begin() as conn:
+        with conn.begin():
             self._ensure_publish_schemas_and_log(conn)
 
             latest_marker = conn.execute(
@@ -457,22 +411,35 @@ class PostgresPublicationWriter:
 
             if previous_physical_table:
                 self._check_structural_compatibility(
-                    conn, previous_physical_table, dataframe
+                    conn, previous_physical_table, list(dataframe.columns), gold_schema
                 )
 
-            # 1. Create the new immutable physical version table.
+            # 1. Create the new immutable physical version table,
+            # typed from the Gold schema's own declared dtype for each
+            # column -- not inferred from row values, so an all-null
+            # NUMERIC/UUID/JSONB column keeps its declared type
+            # instead of falling back to TEXT.
             metadata = MetaData(schema=AEGIS_PUBLISH_DATA_SCHEMA)
-            columns = [
-                Column(col, self._sa_type_for_column(dataframe[col]))
+            sa_columns = [
+                Column(col, self._sa_type_for_gold_dtype(gold_schema.columns[col].dtype))
                 for col in dataframe.columns
             ]
-            Table(physical_table, metadata, *columns).create(bind=conn)
+            physical_table_obj = Table(physical_table, metadata, *sa_columns)
+            physical_table_obj.create(bind=conn)
 
-            # 2. Write the corrected dataset into it.
-            dataframe.to_sql(
-                physical_table, con=conn, schema=AEGIS_PUBLISH_DATA_SCHEMA,
-                if_exists="append", index=False,
-            )
+            # 2. Write the corrected dataset into it -- through the
+            # explicitly-typed table object's own insert(), not
+            # DataFrame.to_sql(). to_sql() builds its OWN SQLAlchemy
+            # metadata from the DataFrame directly, and its normal
+            # fallback for an object-dtype column is Text, regardless
+            # of what type the physical table actually declared --
+            # meaning the JSONB/UUID/Numeric/Date/TIMESTAMP bind
+            # processors selected above would never actually be used.
+            # Inserting through the real table object guarantees they
+            # are.
+            records = dataframe.to_dict(orient="records")
+            if records:
+                conn.execute(physical_table_obj.insert(), records)
 
             # 3. Validate (gate 15): row count actually written matches
             # what sandbox execution already found.
@@ -509,19 +476,24 @@ class PostgresPublicationWriter:
             "final_row_count": expected_row_count,
         }
 
-    def rollback_to_previous(self, logical_target: str, execution_id, previous_physical_table) -> None:
+    def rollback_to_previous(self, conn, logical_target: str, execution_id, previous_physical_table) -> None:
         """
         Repoints the stable view back to the execution's own recorded
         previous_physical_table -- or removes the view entirely if
         this was the first-ever publish for this logical target (no
         previous version to repoint to). Never drops or recreates any
         physical version table; they remain immutable for audit and
-        for any later rollback. REQUIRES the caller to already be
-        holding this logical target's session-level lock.
+        for any later rollback.
+
+        REQUIRES conn to be the SAME connection currently yielded by
+        this logical target's hold_target_lock() -- same reasoning as
+        publish(): the rollback transaction and the session-level lock
+        must share one Postgres backend for the lock's later
+        availability to mean anything about this transaction's fate.
         """
         validate_identifier(logical_target, "logical target")
 
-        with self.engine.begin() as conn:
+        with conn.begin():
             self._ensure_publish_schemas_and_log(conn)
 
             latest_marker = conn.execute(

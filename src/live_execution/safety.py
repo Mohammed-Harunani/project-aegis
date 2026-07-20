@@ -25,6 +25,8 @@ import os
 from typing import Optional
 
 from src.live_execution.identifiers import validate_identifier, InvalidIdentifierError
+from src.inspector import AegisInspector
+from src.live_execution.logical_dtype import build_corrected_observed_schema
 
 
 class LiveExecutionNotAllowedError(Exception):
@@ -72,6 +74,46 @@ def verify_output_fingerprint_match(sandbox_fingerprint: Optional[str], live_fin
             "The live recomputation does not match the sandbox output that was "
             "actually approved -- something has changed since approval (code, "
             "component versions, or repair behavior). Refusing to publish."
+        )
+
+
+def verify_complete_schema_match(corrected_dataframe, gold_schema) -> None:
+    """
+    Surgeon's own validation only checks
+    `list(working_df.columns) == list(gold_schema.column_order)` --
+    column names and order, nothing else. That can pass even when a
+    SECOND column still has the wrong type, because Consultant may
+    have proposed repairs for multiple problems but RepairSelector
+    only ever chooses one. A rename could succeed, leave a type
+    mismatch elsewhere untouched, and still show matching column
+    order -- Surgeon would report success, and nothing before this
+    point would catch the remaining problem. Live publication requires
+    the corrected schema to have a COMPLETELY empty delta against
+    Gold: no missing columns, no new columns, no type mismatches, no
+    reorder. Multi-repair tickets are not resolved automatically by
+    this system -- they are refused for live execution, not silently
+    published half-fixed.
+
+    Uses build_corrected_observed_schema(), not plain
+    AegisInspector.generate_observed_schema() -- the latter reads the
+    raw pandas dtype label, which is always "object" for anything
+    Decimal/date/UUID/JSON-holding. Gold schemas for a trusted-source
+    ticket may declare logical dtypes like "decimal" or "datetime_tz"
+    that never appear as real pandas dtype strings; comparing against
+    the raw label would wrongly flag every such column as unresolved
+    even when nothing is actually wrong.
+    """
+    observed = build_corrected_observed_schema(corrected_dataframe)
+    delta = AegisInspector().detect_delta(observed, gold_schema)
+    if delta.missing_columns or delta.new_columns or delta.type_mismatches or delta.reorder_event:
+        raise LiveExecutionNotAllowedError(
+            f"The corrected dataset does not fully match the Gold schema after "
+            f"repair -- missing_columns={delta.missing_columns}, "
+            f"new_columns={delta.new_columns}, "
+            f"type_mismatches={delta.type_mismatches}, "
+            f"reorder_event={delta.reorder_event}. Live publication requires a "
+            f"completely resolved schema; a single applied repair leaving another "
+            f"needed repair unresolved must not be published."
         )
 
 

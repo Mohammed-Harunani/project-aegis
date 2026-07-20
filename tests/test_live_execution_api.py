@@ -537,12 +537,18 @@ def test_primary_key_lookup_does_not_mix_columns_from_a_same_named_constraint_on
     with source_engine.begin() as conn:
         conn.execute(text('DROP TABLE IF EXISTS table_a'))
         conn.execute(text('DROP TABLE IF EXISTS table_b'))
+        # Both tables deliberately use the EXACT SAME constraint name --
+        # PostgreSQL scopes constraint name uniqueness per-table, not
+        # per-schema, so this is legal and is exactly the scenario that
+        # exposed the original bug (joining on constraint_name/
+        # constraint_schema alone, with no table_name in the join,
+        # could cross-match rows from either table).
         conn.execute(text(
             'CREATE TABLE table_a (a_id BIGINT, CONSTRAINT shared_pk_name PRIMARY KEY (a_id))'
         ))
         conn.execute(text(
             'CREATE TABLE table_b (b_id_one BIGINT, b_id_two BIGINT, '
-            'CONSTRAINT shared_pk_name_b PRIMARY KEY (b_id_one, b_id_two))'
+            'CONSTRAINT shared_pk_name PRIMARY KEY (b_id_one, b_id_two))'
         ))
 
     pk_a = get_primary_key_columns(source_engine, "public", "table_a")
@@ -559,10 +565,26 @@ def test_high_precision_numeric_and_temporal_types_survive_publication():
     """
     Issue 4: precise PostgreSQL NUMERIC values must not be silently
     coerced to float before fingerprinting or publication, and
-    DATE/TIMESTAMPTZ must be preserved as their real types, not
-    collapsed to TEXT.
+    DATE/TIMESTAMPTZ/UUID/JSONB must be preserved as their real types,
+    not collapsed to TEXT. Issue 5: insertion must go through the
+    writer's explicitly-typed table object, not DataFrame.to_sql()
+    (which would silently fall back to TEXT for these columns
+    regardless of what the physical table actually declared). This
+    test previously only read the source and checked Python values --
+    it never called PostgresPublicationWriter or queried a physical
+    publication table or the stable view; fixed to do all three,
+    including an all-null NUMERIC column specifically (which
+    value-based type inference had no way to type correctly, since
+    there's no value to inspect -- the Gold-schema-declared type is
+    what makes this work now).
     """
+    import decimal
+    import datetime
+    import uuid as uuid_module
+
     from src.live_execution.source_connector import read_complete_source_table
+    from src.live_execution.writer import PostgresPublicationWriter, AEGIS_PUBLISH_DATA_SCHEMA
+    from src.inspector import ObservedSchema, ColumnStats
 
     with source_engine.begin() as conn:
         conn.execute(text('DROP TABLE IF EXISTS financial_precision_test'))
@@ -570,19 +592,21 @@ def test_high_precision_numeric_and_temporal_types_survive_publication():
             'CREATE TABLE financial_precision_test ('
             'id BIGINT PRIMARY KEY, '
             'amount NUMERIC(20, 9), '
+            'nullable_amount NUMERIC(20, 9), '
             'effective_date DATE, '
-            'recorded_at TIMESTAMPTZ)'
+            'recorded_at TIMESTAMPTZ, '
+            'record_id UUID, '
+            'metadata JSONB)'
         ))
         conn.execute(text(
             "INSERT INTO financial_precision_test VALUES "
-            "(1, 12345678901.123456789, '2026-01-15', '2026-01-15 10:30:00+00')"
+            "(1, 12345678901.123456789, NULL, '2026-01-15', '2026-01-15 10:30:00+00', "
+            "'12345678-1234-5678-1234-567812345678', '{\"key\": \"value\"}')"
         ))
 
     result = read_complete_source_table(source_engine, "public", "financial_precision_test")
     df = result["dataframe"]
 
-    import decimal
-    import datetime
     amount = df["amount"].iloc[0]
     assert isinstance(amount, decimal.Decimal), f"amount should be Decimal, got {type(amount)}"
     assert str(amount) == "12345678901.123456789", f"NUMERIC precision was not preserved: {amount}"
@@ -593,6 +617,71 @@ def test_high_precision_numeric_and_temporal_types_survive_publication():
     recorded_at = df["recorded_at"].iloc[0]
     assert isinstance(recorded_at, datetime.datetime)
     assert recorded_at.tzinfo is not None, "TIMESTAMPTZ must preserve timezone awareness"
+
+    record_id = df["record_id"].iloc[0]
+    assert isinstance(record_id, uuid_module.UUID)
+
+    metadata = df["metadata"].iloc[0]
+    assert isinstance(metadata, dict) and metadata == {"key": "value"}
+
+    # Now actually publish it -- this is the part the original test
+    # never did.
+    gold_schema = ObservedSchema(
+        columns={
+            "id": ColumnStats(0, 0, "int64"),
+            "amount": ColumnStats(0, 0, "decimal"),
+            "nullable_amount": ColumnStats(1, 0, "decimal"),
+            "effective_date": ColumnStats(0, 0, "date"),
+            "recorded_at": ColumnStats(0, 0, "datetime_tz"),
+            "record_id": ColumnStats(0, 0, "uuid"),
+            "metadata": ColumnStats(0, 0, "json"),
+        },
+        column_order=list(df.columns),
+    )
+
+    writer = PostgresPublicationWriter(live_target_engine)
+    with writer.hold_target_lock("financial_precision_target") as locked_conn:
+        publish_result = writer.publish(
+            locked_conn,
+            logical_target="financial_precision_target",
+            dataframe=df,
+            execution_id=__import__("uuid").uuid4(),
+            expected_row_count=1,
+            gold_schema=gold_schema,
+        )
+
+    # Verify the PHYSICAL TABLE's declared types -- confirms the
+    # all-null NUMERIC column kept its declared type rather than
+    # falling back to TEXT (which value-based inference could never
+    # have avoided, since there's no value in that column to infer
+    # from).
+    with live_target_engine.connect() as conn:
+        columns = conn.execute(text(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = :table ORDER BY ordinal_position"
+        ), {"schema": AEGIS_PUBLISH_DATA_SCHEMA, "table": publish_result["physical_table"]}).fetchall()
+        types_by_column = {row[0]: row[1] for row in columns}
+
+    assert types_by_column["amount"] == "numeric"
+    assert types_by_column["nullable_amount"] == "numeric", (
+        "an all-null NUMERIC column must keep its Gold-declared type, not fall back to text"
+    )
+    assert types_by_column["effective_date"] == "date"
+    assert types_by_column["recorded_at"] == "timestamp with time zone"
+    assert types_by_column["record_id"] == "uuid"
+    assert types_by_column["metadata"] == "jsonb"
+
+    # Verify the actual published VALUES survive through the real
+    # insert path (writer.publish()'s Table.insert(), not to_sql()).
+    with live_target_engine.connect() as conn:
+        published_row = conn.execute(text(
+            'SELECT amount, nullable_amount, effective_date, recorded_at, record_id, metadata '
+            f'FROM "aegis_publish"."financial_precision_target"'
+        )).fetchone()
+
+    assert str(published_row[0]) == "12345678901.123456789"
+    assert published_row[1] is None
+    assert published_row[4] is not None  # UUID round-tripped without erroring
 
     with source_engine.begin() as conn:
         conn.execute(text('DROP TABLE IF EXISTS financial_precision_test'))
@@ -708,12 +797,15 @@ def test_reconciliation_heals_a_stuck_running_record():
         )
 
         writer = PostgresPublicationWriter(live_target_engine)
-        writer.publish(
-            logical_target="customer_master_17",
-            dataframe=ticket.target_dataset,
-            execution_id=live_record.live_execution_id,
-            expected_row_count=3,
-        )
+        with writer.hold_target_lock("customer_master_17") as locked_conn:
+            writer.publish(
+                locked_conn,
+                logical_target="customer_master_17",
+                dataframe=ticket.target_dataset,
+                execution_id=live_record.live_execution_id,
+                expected_row_count=3,
+                gold_schema=ticket.gold_schema,
+            )
         stuck_id = str(live_record.live_execution_id)
 
     fetched = client.get(f"/live-executions/{stuck_id}")
@@ -733,11 +825,13 @@ def test_reconciliation_heals_a_stuck_rolling_back_record():
         record = live_repo.mark_rolling_back(executed["live_execution_id"], operator="mo")
 
         writer = PostgresPublicationWriter(live_target_engine)
-        writer.rollback_to_previous(
-            logical_target="customer_master_18",
-            execution_id=record.live_execution_id,
-            previous_physical_table=record.previous_physical_table,
-        )
+        with writer.hold_target_lock("customer_master_18") as locked_conn:
+            writer.rollback_to_previous(
+                locked_conn,
+                logical_target="customer_master_18",
+                execution_id=record.live_execution_id,
+                previous_physical_table=record.previous_physical_table,
+            )
         stuck_id = str(record.live_execution_id)
 
     fetched = client.get(f"/live-executions/{stuck_id}")

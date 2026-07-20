@@ -35,6 +35,7 @@ from src.live_execution.safety import (
     live_execution_globally_enabled,
     validate_and_normalize_operator,
     verify_output_fingerprint_match,
+    verify_complete_schema_match,
     evaluate_safety_gates,
 )
 from src.live_execution.repository import (
@@ -53,8 +54,11 @@ from src.live_execution.output_fingerprint import compute_dataframe_fingerprint
 from src.live_execution.source_connector import (
     read_complete_source_table,
     verify_source_unchanged,
+    build_source_observed_schema,
+    postgres_type_to_aegis_dtype,
     SourceValidationError,
     SourceChangedError,
+    UnsupportedSourceTypeError,
 )
 
 
@@ -390,7 +394,21 @@ def simulate_migration_from_source(
 
     df_observed = source_read["dataframe"]
 
-    observed_schema_obj = inspector.generate_observed_schema(df_observed)
+    # Built from the CAPTURED PostgreSQL column metadata, not
+    # DataFrame.dtypes -- every column from read_complete_source_table()
+    # is forced to dtype=object to protect Decimal/date/UUID precision,
+    # which makes the pandas dtype label meaningless for schema
+    # comparison. Consultant.propose_repairs()'s rename detection
+    # requires an exact dtype match; without this, a genuinely BIGINT
+    # source column would never match a Gold column declared "int64",
+    # and no rename would ever be detected. Also rejects any column
+    # whose Postgres type has no explicit, safe logical mapping BEFORE
+    # a ticket is ever created.
+    try:
+        observed_schema_obj = build_source_observed_schema(df_observed, source_read["column_types"])
+    except UnsupportedSourceTypeError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
     gold_schema_obj = _build_gold_schema(gold_schema_dict)
 
     delta = inspector.detect_delta(observed_schema_obj, gold_schema_obj)
@@ -818,7 +836,7 @@ def execute_live(
     # verification, AND the target transaction.
     writer = PostgresPublicationWriter(live_engine)
     try:
-        with writer.hold_target_lock(request.logical_target):
+        with writer.hold_target_lock(request.logical_target) as locked_conn:
             # Created already RUNNING, in one committed insert. The
             # database-enforced backstop against the same race the
             # ticket lock above already guards against.
@@ -858,6 +876,9 @@ def execute_live(
                 # things that merely happen to share a fingerprint.
                 fresh_source = verify_source_unchanged(
                     source_engine, ticket.source_schema, ticket.source_table,
+                    expected_primary_key=ticket.source_primary_key,
+                    expected_row_count=ticket.source_row_count,
+                    expected_schema_fingerprint=ticket.source_schema_fingerprint,
                     expected_dataset_fingerprint=ticket.source_dataset_fingerprint,
                 )
 
@@ -873,6 +894,14 @@ def execute_live(
                     allowed_modes=["sandbox", "live"],
                 )
 
+                # Surgeon's own validation only checks column name/
+                # order against Gold -- it can pass even when a SECOND
+                # column still has the wrong type, because
+                # RepairSelector only ever picks one of the repairs
+                # Consultant proposed. Require a completely empty
+                # delta before anything gets published.
+                verify_complete_schema_match(working_copy, ticket.gold_schema)
+
                 live_recomputed_fingerprint = compute_dataframe_fingerprint(working_copy)
                 verify_output_fingerprint_match(
                     sandbox_fingerprint=manifest_record.corrected_output_fingerprint,
@@ -880,10 +909,12 @@ def execute_live(
                 )
 
                 result = writer.publish(
+                    locked_conn,
                     logical_target=request.logical_target,
                     dataframe=working_copy,
                     execution_id=live_record.live_execution_id,
                     expected_row_count=manifest_record.final_row_count,
+                    gold_schema=ticket.gold_schema,
                 )
             except SourceChangedError as e:
                 # The world changed out from under the approval --
@@ -899,6 +930,14 @@ def execute_live(
             except IncompatibleViewSchemaError as e:
                 # Provably nothing happened -- raised before any DDL,
                 # still inside the same transaction.
+                live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
+                raise HTTPException(status_code=422, detail=str(e))
+            except UnsupportedSourceTypeError as e:
+                # Should be unreachable in practice -- an unsupported
+                # logical dtype is already rejected at simulation time
+                # (build_source_observed_schema). Kept as a defensive
+                # backstop; raised before any DDL, so provably nothing
+                # happened yet.
                 live_repo.mark_failed(live_record.live_execution_id, failure_reason=str(e))
                 raise HTTPException(status_code=422, detail=str(e))
             except LiveWriteValidationError as e:
@@ -1098,7 +1137,7 @@ def rollback_live_execution(
 
     writer = PostgresPublicationWriter(live_engine)
     try:
-        with writer.hold_target_lock(record.logical_target):
+        with writer.hold_target_lock(record.logical_target) as locked_conn:
             try:
                 record = live_repo.mark_rolling_back(live_execution_id, operator=request.operator)
             except LiveExecutionInvalidStateError as e:
@@ -1106,6 +1145,7 @@ def rollback_live_execution(
 
             try:
                 writer.rollback_to_previous(
+                    locked_conn,
                     logical_target=record.logical_target,
                     execution_id=record.live_execution_id,
                     previous_physical_table=record.previous_physical_table,

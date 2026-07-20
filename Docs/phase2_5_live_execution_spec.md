@@ -665,3 +665,85 @@ storage strategy (separate from the governance database) before this
 system takes real production traffic against large source tables.
 Flagging this rather than guessing at a boundary number or design
 without your input on what "large" means for actual expected usage.
+
+## Sixth correction pass
+
+A further review found a genuine showstopper plus five more real
+implementation gaps. Fixed:
+
+1. **SHOWSTOPPER: trusted-source simulation could never detect a
+   repair.** Confirmed directly against the actual Consultant/Inspector
+   code: forcing dtype=object on every source column (the prior pass's
+   fix for Decimal/date/UUID precision) made Consultant.propose_repairs()'s
+   rename detection -- which requires observed_type == gold_type exactly
+   -- fail for every genuinely-typed source column, since "object" can
+   never equal "int64". Verified this returned zero repair plans for
+   the exact rename scenario this whole system exists to detect, before
+   fixing it. Fixed with a separate logical-dtype vocabulary
+   (logical_dtype.py) that recovers the correct dtype from captured
+   PostgreSQL column metadata instead of the (now precision-protected
+   but schema-meaningless) pandas dtype label. Caught and fixed two
+   self-inflicted regressions while implementing this fix itself: the
+   first version made safety.py transitively require sqlalchemy,
+   breaking the entire pure-Python test suite (fixed by extracting the
+   vocabulary into its own dependency-free module, confirmed importable
+   without a database again); a subsequent edit accidentally deleted
+   the UnsupportedSourceTypeError class definition entirely (caught by
+   re-reading the file rather than assuming, restored, reconfirmed).
+2. **Provenance revalidation was incomplete** -- verify_source_unchanged()
+   now compares all four persisted values (primary key, row count,
+   schema fingerprint, dataset fingerprint), not just the dataset
+   fingerprint. The schema fingerprint itself now includes ordinal
+   position, numeric precision/scale, datetime precision, and
+   nullability, not just column name + data_type.
+3. **Surgeon's own validation only checks column order, not type** --
+   added verify_complete_schema_match(), requiring a completely empty
+   schema delta (no missing/new columns, no type mismatches, no
+   reorder) before live publication. Catches the case where Consultant
+   proposed repairs for two problems but RepairSelector only chose
+   one, leaving a second column's type wrong while column order still
+   matched. Uses the SAME logical-dtype vocabulary as the source read
+   (build_corrected_observed_schema), not raw pandas dtype -- otherwise
+   every exotic-typed column (decimal/date/uuid/json) would wrongly
+   read as still-mismatched, since their pandas dtype is always
+   "object" regardless of correctness.
+4/5. **Publication typing was inferred from one row value, and
+   inserted through to_sql() rather than the explicitly-typed table**
+   -- confirmed both: an all-null NUMERIC/UUID/JSONB column had no
+   value to infer from and fell back to TEXT, and to_sql() builds its
+   own SQLAlchemy metadata from the DataFrame directly (ignoring the
+   physical table's actual declared types), so the JSONB/UUID/Numeric
+   bind processors were never actually exercised. Publication typing
+   now comes directly from the Gold schema's declared logical dtype
+   (guaranteed fully resolved by #3's check, not inferred from values
+   at all), and the corrected dataset is inserted through the real,
+   explicitly-typed Table object's own insert(), not DataFrame.to_sql().
+6. **Advisory-lock liveness was tied to the wrong connection** --
+   hold_target_lock() now yields its connection, and publish()/
+   rollback_to_previous() require that SAME connection rather than
+   opening their own. Reasoned through carefully before implementing:
+   the original nested-scope structure (lock acquired before publish
+   starts, released after it returns) already prevented the lock from
+   releasing while a normal publish was still running, but a narrower
+   real gap remained -- the two connections are independently drawn
+   from the same pool, so something like an intermediate proxy's idle
+   timeout could in principle affect one without affecting the other
+   at the same moment, letting the lock release while the publish
+   transaction was still genuinely active elsewhere. Sharing one
+   connection removes that gap by construction.
+7. **No database-level guarantee tied live_eligible to actual
+   provenance** -- added a CHECK constraint on approval_tickets
+   (NOT live_eligible OR all four provenance fields non-null), and
+   made live_executions' own source_schema/source_table/
+   source_dataset_fingerprint NOT NULL (every row is guaranteed to
+   come from a live_eligible ticket by construction).
+
+Also fixed a broken test: the primary-key constraint-collision test
+used two DIFFERENT constraint names (shared_pk_name vs
+shared_pk_name_b), never actually exercising the collision it claimed
+to test. Confirmed PostgreSQL scopes constraint-name uniqueness
+per-table, not per-schema, so two tables can legally share an
+identical constraint name -- fixed the test to actually do that.
+
+58/58 pure-Python tests pass throughout every step of this pass,
+re-verified after each individual fix, not just at the end.
