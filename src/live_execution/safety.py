@@ -78,7 +78,7 @@ def verify_output_fingerprint_match(sandbox_fingerprint: Optional[str], live_fin
 
 
 def verify_complete_schema_match(
-    corrected_dataframe, original_observed_schema, proposed_action, gold_schema
+    corrected_dataframe, original_observed_schema, proposed_action, gold_schema, repair_applied: bool = True
 ) -> None:
     """
     Surgeon's own validation only checks
@@ -96,6 +96,13 @@ def verify_complete_schema_match(
     this system -- they are refused for live execution, not silently
     published half-fixed.
 
+    repair_applied must reflect Surgeon's own execution_result.applied
+    -- confirmed directly that a CAST_COLUMN whose per-value safety
+    check fails leaves the column completely untouched, yet this
+    function's own dtype reconstruction was treating the repair's
+    declared target as authoritative regardless, letting a ticket
+    whose sandbox repair genuinely failed still pass this gate.
+
     Uses build_corrected_observed_schema(), not plain
     AegisInspector.generate_observed_schema() -- the latter reads the
     raw pandas dtype label, which is always "object" for anything
@@ -106,7 +113,9 @@ def verify_complete_schema_match(
     column's already-known logical type instead of guessing from
     values that may not exist.
     """
-    observed = build_corrected_observed_schema(corrected_dataframe, original_observed_schema, proposed_action)
+    observed = build_corrected_observed_schema(
+        corrected_dataframe, original_observed_schema, proposed_action, repair_applied
+    )
     delta = AegisInspector().detect_delta(observed, gold_schema)
     if delta.missing_columns or delta.new_columns or delta.type_mismatches or delta.reorder_event:
         raise LiveExecutionNotAllowedError(

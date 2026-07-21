@@ -227,7 +227,8 @@ def build_source_observed_schema(dataframe: pd.DataFrame, column_types: dict) ->
 
 
 def build_corrected_observed_schema(
-    dataframe: pd.DataFrame, original_observed_schema: ObservedSchema, proposed_action: str
+    dataframe: pd.DataFrame, original_observed_schema: ObservedSchema, proposed_action: str,
+    repair_applied: bool = True,
 ) -> ObservedSchema:
     """
     Builds an ObservedSchema for a POST-REPAIR working copy, using a
@@ -238,20 +239,34 @@ def build_corrected_observed_schema(
     falls back to "object", which then never matches whatever Gold
     actually declared for that column.
 
+    repair_applied must reflect Surgeon's own execution_result.applied
+    -- confirmed directly that a CAST_COLUMN whose per-value safety
+    check fails (e.g. casting "abc" to int64) leaves the column
+    completely untouched (still its original dtype and values), yet
+    this function was treating the repair's DECLARED target as
+    authoritative regardless of whether Surgeon actually applied it.
+    That let a ticket whose sandbox repair genuinely failed still pass
+    the completeness gate, since the check believed the (never
+    actually made) type change had happened. When repair_applied is
+    False, the CAST_COLUMN's declared target is ignored entirely and
+    every column is treated as untouched.
+
     For a column with a genuine native numpy dtype (Surgeon's
     CAST_COLUMN produces these directly via .astype()), that dtype is
     authoritative -- Surgeon actually changed it, so there's nothing
     to look up. For an object-dtype column, three cases: (1) a
-    CAST_COLUMN repair targeted THIS column and its own declared
-    target is "object" -- confirmed directly that treating this the
-    same as "untouched" wrongly reconstructed a successful cast-to-
-    object as still being its PRE-cast type, since object-dtype alone
-    can't distinguish "cast to object on purpose" from "never touched
-    at all"; the cast's own declared target is authoritative here. (2)
-    untouched, or renamed but not cast -- looked up from
+    CAST_COLUMN repair targeted THIS column, it actually succeeded,
+    and its own declared target is "object" -- confirmed directly that
+    treating this the same as "untouched" wrongly reconstructed a
+    successful cast-to-object as still being its PRE-cast type, since
+    object-dtype alone can't distinguish "cast to object on purpose"
+    from "never touched at all"; the cast's own declared target is
+    authoritative here. (2) untouched, renamed but not cast, or a cast
+    that did NOT actually succeed -- looked up from
     original_observed_schema instead of inferred, since a RENAME_COLUMN
-    repair changes a column's name but not its data or type. (3)
-    neither of the above -- value-based inference as a last resort.
+    repair changes a column's name but not its data or type, and a
+    failed cast leaves the column exactly as it was. (3) neither of
+    the above -- value-based inference as a last resort.
     """
     rename_map = {}  # new_name -> old_name
     cast_map = {}  # column -> its own repair's declared target logical dtype
@@ -262,9 +277,10 @@ def build_corrected_observed_schema(
             rename_map[new_name] = old_name
         except ValueError:
             pass  # unexpected format -- fall through to value-based inference
-    elif proposed_action.startswith("CAST_COLUMN"):
+    elif proposed_action.startswith("CAST_COLUMN") and repair_applied:
         # "CAST_COLUMN <col> TO <target>" (a trailing WITH_DROP_INVALID,
-        # if present, doesn't affect the resulting dtype itself).
+        # if present, doesn't affect the resulting dtype itself). Only
+        # trusted when the repair actually succeeded -- see docstring.
         parts = proposed_action.split()
         if len(parts) >= 4 and parts[2] == "TO":
             cast_map[parts[1]] = parts[3]

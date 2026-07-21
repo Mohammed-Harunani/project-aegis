@@ -28,6 +28,7 @@ serialized.
 """
 
 from contextlib import contextmanager
+import logging
 
 import pandas as pd
 from sqlalchemy import MetaData, Table, Column, text
@@ -38,6 +39,7 @@ from sqlalchemy.engine import Engine
 from src.live_execution.identifiers import validate_identifier, physical_version_table_name
 from src.live_execution.logical_dtype import aegis_dtype_to_postgres_type_name, UnsupportedSourceTypeError
 
+_logger = logging.getLogger(__name__)
 
 AEGIS_PUBLISH_SCHEMA = "aegis_publish"
 AEGIS_PUBLISH_DATA_SCHEMA = "aegis_publish_data"
@@ -126,13 +128,44 @@ class PostgresPublicationWriter:
             try:
                 yield conn
             finally:
-                conn.execute(
-                    text("SELECT pg_advisory_unlock(hashtext(:target))"),
-                    {"target": logical_target},
-                )
-                conn.commit()
+                # Best-effort cleanup -- must NEVER mask whatever the
+                # caller's code already decided (a return value, or a
+                # deliberately-raised HTTPException) by raising a NEW,
+                # unrelated exception here. Confirmed this was a real
+                # risk: if the connection is already dead or in a
+                # failed-transaction state (e.g. the publish
+                # transaction itself hit a connection error), a bare
+                # unlock attempt on it would itself raise, and that
+                # new exception would silently REPLACE whatever the
+                # inner code had already carefully determined (a clean
+                # 503, or a confirmed COMPLETED result). Any failure
+                # here is logged, not propagated -- PostgreSQL
+                # releases a backend's session-level advisory locks
+                # automatically when its connection terminates, so a
+                # failed unlock doesn't leave the lock stuck forever.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                try:
+                    conn.execute(
+                        text("SELECT pg_advisory_unlock(hashtext(:target))"),
+                        {"target": logical_target},
+                    )
+                    conn.commit()
+                except Exception as unlock_error:
+                    _logger.warning(
+                        "Failed to release advisory lock for logical_target=%r "
+                        "(connection likely already invalid) -- relying on "
+                        "PostgreSQL's automatic session-level lock release on "
+                        "connection termination instead. Reason: %s",
+                        logical_target, unlock_error,
+                    )
         finally:
-            conn.close()
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def check_operation_outcome(self, execution_id, operation: str) -> str:
         """

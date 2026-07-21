@@ -63,7 +63,6 @@ from src.live_execution.source_connector import (
 from src.live_execution.logical_dtype import (
     is_publishable_dtype,
     get_publishable_dtypes,
-    AEGIS_UNCASTABLE_TARGET_DTYPES,
 )
 
 
@@ -464,31 +463,47 @@ def simulate_migration_from_source(
             "message": "No repair plan survived governance review; all candidates quarantined.",
         }
 
-    # Confirmed directly: Surgeon's CAST_COLUMN applies
-    # working_df[column].astype(target_type) verbatim, and pandas does
-    # not understand Aegis's own extended logical dtype strings
-    # ("decimal", "date", "datetime", "datetime_tz", "uuid", "json") --
-    # every such cast fails for every row, reporting applied=False and
-    # HIGH_RISK, which can never become live-eligible anyway. Rejected
-    # here, before a ticket is ever created, rather than letting it
-    # fail much later and less clearly during approval. A source
-    # column that already needs to BE one of these types should be
-    # correctly typed at the source already -- no cast is needed in
-    # that case, only (at most) a rename, which works fine.
+    # Confirmed directly, twice: first that Surgeon's CAST_COLUMN
+    # cannot even attempt a cast to Aegis's own extended logical
+    # dtypes (pandas has no native equivalent, so every value fails);
+    # then, more seriously, that Surgeon's cast mechanism only checks
+    # whether astype() RAISES, never whether the result actually
+    # preserves the original value -- so even fully-supported,
+    # pandas-native casts can silently corrupt data while still
+    # reporting applied=True, LOW_RISK, and passing the completeness
+    # gate. Verified directly: float64->int64 truncates (1.9 -> 1),
+    # object->bool has surprising string-truthiness semantics ("false"
+    # and "0" both become True, since they're non-empty strings, not
+    # parsed for meaning), and int64->float64 silently loses precision
+    # for integers beyond 2^53. None of this is specific to Aegis's
+    # own extended dtypes -- it's a fundamental property of blind
+    # astype() calls, so restricting only the extended-dtype targets
+    # (an earlier, narrower version of this check) was not enough.
+    #
+    # For the live-capable path, Phase 2.5 supports RENAME_COLUMN
+    # only -- a rename never touches values at all, only metadata, so
+    # it carries none of this risk. CAST_COLUMN remains available for
+    # sandbox-only analysis via /simulate-migration; verified,
+    # pair-specific lossless cast converters (checking that a value
+    # round-trips exactly, not just that astype() didn't raise) belong
+    # in a later, dedicated phase, not bolted on here under time
+    # pressure with no way to verify them against a real database.
     if selected_plan.proposed_action.startswith("CAST_COLUMN"):
-        parts = selected_plan.proposed_action.split()
-        if len(parts) >= 4 and parts[2] == "TO" and parts[3] in AEGIS_UNCASTABLE_TARGET_DTYPES:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    f"The proposed repair ({selected_plan.proposed_action!r}) casts to "
-                    f"{parts[3]!r}, which Surgeon cannot currently perform (pandas has no "
-                    f"native equivalent for this Aegis-specific logical dtype). If the "
-                    f"source column already needs to be {parts[3]!r}, it should already "
-                    f"be correctly typed at the source -- only a rename would be needed "
-                    f"in that case, which is supported."
-                ),
-            )
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"The proposed repair ({selected_plan.proposed_action!r}) is a "
+                f"CAST_COLUMN, which is not supported on the live-capable source "
+                f"path -- confirmed that Surgeon's cast mechanism only checks "
+                f"whether astype() raises, not whether the result actually "
+                f"preserves the original value, so even a fully-supported cast "
+                f"(e.g. float64 to int64, or object to bool) can silently corrupt "
+                f"data while still reporting success. Only RENAME_COLUMN is "
+                f"supported for live execution; a column that needs an actual "
+                f"type correction should be corrected at the source, or analyzed "
+                f"via the sandbox-only /simulate-migration endpoint."
+            ),
+        )
 
     # Live-capable simulation always goes through human approval,
     # regardless of confidence -- not just as an extra safety margin
@@ -642,6 +657,7 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
             verify_complete_schema_match(
                 manifest.corrected_dataset, ticket.observed_schema,
                 ticket.repair_plan.proposed_action, ticket.gold_schema,
+                repair_applied=execution_result.applied,
             )
     except LiveExecutionNotAllowedError as e:
         db.rollback()
@@ -972,7 +988,7 @@ def execute_live(
 
                 surgeon = AegisSurgeon()
                 working_copy = fresh_source["dataframe"].copy()
-                surgeon.execute(
+                live_execution_result, _live_manifest = surgeon.execute(
                     repair_plan=ticket.repair_plan,
                     observed_schema=ticket.observed_schema,
                     gold_schema=ticket.gold_schema,
@@ -987,9 +1003,15 @@ def execute_live(
                 # column still has the wrong type, because
                 # RepairSelector only ever picks one of the repairs
                 # Consultant proposed. Require a completely empty
-                # delta before anything gets published.
+                # delta before anything gets published. repair_applied
+                # is now defensive rather than an active concern here
+                # specifically -- live-eligible tickets can only ever
+                # carry a RENAME_COLUMN repair (CAST_COLUMN is rejected
+                # at simulation time), but passing it through keeps
+                # this consistent with the same check at approval time.
                 verify_complete_schema_match(
-                    working_copy, ticket.observed_schema, ticket.repair_plan.proposed_action, ticket.gold_schema
+                    working_copy, ticket.observed_schema, ticket.repair_plan.proposed_action,
+                    ticket.gold_schema, repair_applied=live_execution_result.applied,
                 )
 
                 live_recomputed_fingerprint = compute_dataframe_fingerprint(working_copy)
