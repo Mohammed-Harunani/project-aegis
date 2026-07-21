@@ -14,6 +14,8 @@ from typing import Dict, List
 
 import pandas as pd
 
+from src.aegis_dtypes import is_valid_aegis_dtype
+
 
 SUPPORTED_FORMAT_VERSIONS = {1}
 
@@ -60,7 +62,10 @@ def validate_schema_definition(format_version: int, columns: List[dict]) -> None
     """
     Raises InvalidSchemaDefinitionError on the first problem found:
     unsupported format_version, no columns, an empty/duplicate column
-    name, or a dtype pandas.api.types.pandas_dtype() doesn't accept.
+    name, or a dtype that isn't a valid Aegis dtype (see
+    aegis_dtypes.is_valid_aegis_dtype -- a standard pandas dtype, or
+    one of Aegis's own extended logical dtypes like "decimal" or
+    "uuid", which pandas has no native equivalent for).
     """
     if format_version not in SUPPORTED_FORMAT_VERSIONS:
         raise InvalidSchemaDefinitionError(f"Unsupported format_version: {format_version!r}")
@@ -78,9 +83,7 @@ def validate_schema_definition(format_version: int, columns: List[dict]) -> None
         seen_names.add(name)
 
         dtype = col.get("dtype", "")
-        try:
-            pd.api.types.pandas_dtype(dtype)
-        except TypeError:
+        if not is_valid_aegis_dtype(dtype):
             raise InvalidSchemaDefinitionError(f"Unsupported dtype for column {name!r}: {dtype!r}")
 
 

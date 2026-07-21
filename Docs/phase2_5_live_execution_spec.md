@@ -747,3 +747,88 @@ identical constraint name -- fixed the test to actually do that.
 
 58/58 pure-Python tests pass throughout every step of this pass,
 re-verified after each individual fix, not just at the end.
+
+## Seventh correction pass
+
+A further review found three more severe, crash-level bugs in the
+trusted-source path, plus four more real gaps and one invalid test
+this project had already gotten wrong once. Every claim was verified
+directly (including the test-defect claim, confirmed via a real
+PostgreSQL core-developer explanation of index-name namespacing)
+before any code changed. Fixed:
+
+1. **SEVERE: the Schema Registry rejected every one of Phase 2.5's own
+   logical dtypes.** Confirmed directly: pandas.api.types.pandas_dtype()
+   rejects "decimal", "date", "datetime", "datetime_tz", "uuid", and
+   "json" outright -- meaning no Gold schema could ever be registered
+   declaring a NUMERIC, DATE, TIMESTAMPTZ, UUID, or JSONB column,
+   making several prior correction passes' datatype-fidelity work
+   unusable in practice for exactly the types a financial system cares
+   about most. Fixed with a new, phase-neutral aegis_dtypes.py module
+   (deliberately NOT under live_execution/, so Phase 2.4's registry
+   doesn't have to depend on a later phase's package) shared by the
+   registry and the logical-dtype vocabulary.
+2. **SEVERE: JSONB source columns crashed schema observation
+   entirely.** Confirmed directly: pandas' own Series.nunique() raises
+   TypeError: unhashable type: 'dict' on any dict/list value. Fixed
+   with a JSON-safe unique-count helper that canonicalizes dict/list
+   values to sorted JSON strings before counting.
+3. **SEVERE: UUID source columns crashed ticket submission, and a
+   reserved-key collision could silently corrupt legitimate JSONB
+   data.** Confirmed both directly: _sanitize_scalar had no UUID
+   handling at all (TypeError: Object of type UUID is not JSON
+   serializable), and a legitimate JSONB value that happened to
+   contain a key literally named "__aegis_type__" was indistinguishable
+   from an internal type tag on restore, silently corrupting it into a
+   Decimal. Fixed by adding UUID tagging AND wrapping every dict/list
+   value in an explicit envelope unconditionally, not just ones that
+   happen to collide -- this removes the ambiguity entirely rather
+   than trying to detect collisions. This touched previously-verified
+   Phase 2.3 serialization code; full regression re-run immediately
+   after to confirm nothing else broke.
+4. **All-null typed columns were wrongly rejected after repair.**
+   Confirmed directly: an all-null column has no value for the
+   value-based inference to work from, so it always fell back to
+   "object", which then never matched whatever Gold actually declared.
+   Fixed by making the post-repair check metadata-backed: an untouched
+   or renamed-but-not-cast column's logical dtype is looked up from
+   the ticket's own already-correctly-typed original schema instead of
+   re-inferred from values that may not exist.
+5. **Sandbox manifests could overstate success.** The schema-
+   completeness gate was only checked at execute-live time, not at
+   approval -- a live-eligible ticket with one of two needed repairs
+   applied could still be approved with a manifest claiming full
+   success and LOW_RISK. Added the same check to approve_ticket,
+   scoped specifically to live-eligible tickets (sample_data tickets
+   never carried this expectation, and changing their behavior wasn't
+   what was being asked).
+6. **Publication normalizes precision/scale rather than preserving
+   exact source DDL.** Confirmed and made an explicit, stated policy
+   rather than an implicit gap: Phase 2.5 uses canonical Aegis
+   normalization (unconstrained NUMERIC, BIGINT for all integers,
+   DOUBLE PRECISION for all floats, TEXT for all strings), which fully
+   preserves exact VALUE fidelity (nothing is ever rounded or
+   truncated) but does not preserve or enforce the source's
+   schema-level precision/scale/length constraints on the published
+   table. Documented directly in logical_dtype.py as a deliberate
+   choice; exact schema-level fidelity would be a separate, larger
+   piece of work.
+7. **The CHECK constraint didn't cover all six provenance fields.**
+   Extended to require source_row_count and source_schema_fingerprint
+   too (both part of the four-value revalidation), plus a non-empty
+   primary-key array, in both models.py and migration 0003.
+
+Also fixed a test that was invalid for a reason this project had
+already gotten wrong once before: the primary-key constraint-collision
+test tried to create two PRIMARY KEY constraints sharing one name in
+one schema. Confirmed via a real PostgreSQL core-developer explanation
+that this is not legally constructible at all -- PRIMARY KEY/UNIQUE
+constraints require a backing index, and index names are unique per
+SCHEMA, not per table, so the second CREATE TABLE would fail outright
+before the lookup logic under test was ever exercised. Redesigned
+around a genuinely legal scenario instead: a FOREIGN KEY constraint
+(which needs no backing index, and so isn't subject to that
+restriction) sharing a name with a PRIMARY KEY on a different table --
+this actually reproduces the class of collision the fix addresses.
+
+58/58 pure-Python tests pass, reconfirmed after every individual fix.

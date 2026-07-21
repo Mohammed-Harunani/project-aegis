@@ -30,7 +30,9 @@ class ApprovalTicketRecord(Base):
         CheckConstraint(
             "NOT live_eligible OR ("
             "source_schema IS NOT NULL AND source_table IS NOT NULL AND "
-            "source_primary_key IS NOT NULL AND source_dataset_fingerprint IS NOT NULL"
+            "source_primary_key IS NOT NULL AND jsonb_array_length(source_primary_key) > 0 AND "
+            "source_row_count IS NOT NULL AND source_schema_fingerprint IS NOT NULL AND "
+            "source_dataset_fingerprint IS NOT NULL"
             ")",
             name="ck_approval_tickets_live_eligible_requires_provenance",
         ),

@@ -75,6 +75,16 @@ def _sanitize_scalar(value):
     corruption a "Financial Data Integrity Guardian" shouldn't
     introduce itself). None already covers NaN/NaT/pd.NA by the time
     this runs -- see _dataset_to_json.
+
+    Every dict/list value is wrapped in an explicit "raw_json"
+    envelope, not just ones that happen to collide with the
+    "__aegis_type__" key -- confirmed directly that a legitimate JSONB
+    value containing that key as its own data (e.g.
+    {"__aegis_type__": "decimal", "value": "10.50"} as genuine user
+    content, not an Aegis tag) would otherwise be silently
+    misinterpreted as an internal type tag on restore and corrupted
+    into a Decimal. Wrapping every dict/list unconditionally removes
+    the ambiguity entirely rather than trying to detect collisions.
     """
     if value is None:
         return None
@@ -97,6 +107,10 @@ def _sanitize_scalar(value):
         return {"__aegis_type__": "python_datetime", "value": value.isoformat()}
     if isinstance(value, datetime_module.date):
         return {"__aegis_type__": "date", "value": value.isoformat()}
+    if isinstance(value, uuid.UUID):
+        return {"__aegis_type__": "uuid", "value": str(value)}
+    if isinstance(value, (dict, list)):
+        return {"__aegis_type__": "raw_json", "value": value}
     return value
 
 
@@ -116,6 +130,10 @@ def _restore_scalar(value):
             return datetime_module.datetime.fromisoformat(raw)
         if kind == "date":
             return datetime_module.date.fromisoformat(raw)
+        if kind == "uuid":
+            return uuid.UUID(raw)
+        if kind == "raw_json":
+            return raw
     return value
 
 

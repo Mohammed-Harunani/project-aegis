@@ -528,33 +528,53 @@ def test_primary_key_lookup_does_not_mix_columns_from_a_same_named_constraint_on
     """
     Issue 2: the primary-key lookup originally joined
     information_schema.key_column_usage to table_constraints on
-    constraint_name/constraint_schema alone -- two DIFFERENT tables in
-    the same schema sharing an identically-named PRIMARY KEY
-    constraint could have their key_column_usage rows cross-matched.
+    constraint_name/constraint_schema alone -- any DIFFERENT
+    constraint (of any type) in the same schema sharing that exact
+    name could have its key_column_usage rows cross-matched in.
+
+    A prior version of this test tried to construct two PRIMARY KEY
+    constraints sharing one name in the same schema -- confirmed via
+    PostgreSQL's own documented behavior (each PRIMARY KEY/UNIQUE
+    constraint requires a backing index, and index names are unique
+    per SCHEMA, not per table) that this specific scenario is not
+    legally constructible at all: the second CREATE TABLE would fail
+    with "relation already exists" before ever reaching the lookup
+    logic being tested. FOREIGN KEY constraints have no such
+    restriction (they need no backing index), so this uses one of
+    those instead to legally reproduce the actual class of collision
+    the fix addresses.
     """
     from src.live_execution.source_connector import get_primary_key_columns
 
     with source_engine.begin() as conn:
-        conn.execute(text('DROP TABLE IF EXISTS table_a'))
         conn.execute(text('DROP TABLE IF EXISTS table_b'))
-        # Both tables deliberately use the EXACT SAME constraint name --
-        # PostgreSQL scopes constraint name uniqueness per-table, not
-        # per-schema, so this is legal and is exactly the scenario that
-        # exposed the original bug (joining on constraint_name/
-        # constraint_schema alone, with no table_name in the join,
-        # could cross-match rows from either table).
+        conn.execute(text('DROP TABLE IF EXISTS table_a'))
+        conn.execute(text('DROP TABLE IF EXISTS table_c'))
         conn.execute(text(
-            'CREATE TABLE table_a (a_id BIGINT, CONSTRAINT shared_pk_name PRIMARY KEY (a_id))'
+            'CREATE TABLE table_a (a_id BIGINT, CONSTRAINT shared_name PRIMARY KEY (a_id))'
         ))
         conn.execute(text(
-            'CREATE TABLE table_b (b_id_one BIGINT, b_id_two BIGINT, '
-            'CONSTRAINT shared_pk_name PRIMARY KEY (b_id_one, b_id_two))'
+            'CREATE TABLE table_c (c_id BIGINT PRIMARY KEY)'
+        ))
+        # table_b's FOREIGN KEY deliberately shares table_a's PRIMARY
+        # KEY constraint name -- legal, since a foreign key needs no
+        # backing index and so isn't subject to the schema-wide unique
+        # index-name restriction PRIMARY KEY/UNIQUE constraints have.
+        conn.execute(text(
+            'CREATE TABLE table_b (b_id BIGINT, ref_id BIGINT, '
+            'CONSTRAINT shared_name FOREIGN KEY (ref_id) REFERENCES table_c(c_id))'
         ))
 
     pk_a = get_primary_key_columns(source_engine, "public", "table_a")
-    pk_b = get_primary_key_columns(source_engine, "public", "table_b")
-    assert pk_a == ["a_id"], f"table_a's PK lookup must not pick up table_b's columns, got {pk_a}"
-    assert pk_b == ["b_id_one", "b_id_two"], f"table_b's PK lookup returned {pk_b}"
+    assert pk_a == ["a_id"], (
+        f"table_a's PK lookup must not pick up table_b's foreign-key column "
+        f"just because the constraint names collide, got {pk_a}"
+    )
+
+    with source_engine.begin() as conn:
+        conn.execute(text('DROP TABLE IF EXISTS table_b'))
+        conn.execute(text('DROP TABLE IF EXISTS table_a'))
+        conn.execute(text('DROP TABLE IF EXISTS table_c'))
 
     with source_engine.begin() as conn:
         conn.execute(text('DROP TABLE IF EXISTS table_a'))

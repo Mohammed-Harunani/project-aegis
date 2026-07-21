@@ -27,11 +27,32 @@ source read or renamed-but-not-cast by Surgeon).
 
 import decimal
 import datetime
+import json
 import uuid as uuid_module
 
 import pandas as pd
 
 from src.inspector import ObservedSchema, ColumnStats
+
+
+def _json_safe_unique_count(series: pd.Series) -> int:
+    """
+    pandas' own Series.nunique() raises TypeError: unhashable type
+    'dict' the moment it encounters a JSONB column's dict/list values
+    -- confirmed directly. Canonicalizes any dict/list value to a
+    stable, sorted JSON string before counting (two dicts with the
+    same keys/values in a different order count as the same unique
+    value, matching what "unique" should mean for JSON content), so a
+    JSONB column no longer crashes schema observation entirely.
+    """
+    seen = set()
+    for v in series:
+        if v is None or (isinstance(v, float) and pd.isna(v)):
+            continue
+        if isinstance(v, (dict, list)):
+            v = json.dumps(v, sort_keys=True, default=str)
+        seen.add(v)
+    return len(seen)
 
 
 _POSTGRES_TO_AEGIS_LOGICAL_DTYPE = {
@@ -61,6 +82,25 @@ class UnsupportedSourceTypeError(Exception):
     before publication, not discovered later."""
 
 
+# Phase 2.5 POLICY DECISION, stated explicitly rather than left
+# implicit: publication uses CANONICAL AEGIS NORMALIZATION, not exact
+# source database fidelity. A source NUMERIC(20, 9) publishes as
+# unconstrained NUMERIC (no declared precision/scale); SMALLINT and
+# INTEGER both publish as BIGINT; REAL publishes as DOUBLE PRECISION;
+# VARCHAR(n) publishes as TEXT. This is a deliberate choice, not an
+# oversight: the property this project actually cares about -- exact
+# VALUE fidelity, never silently losing precision on the data itself
+# -- is fully preserved by this scheme (unconstrained NUMERIC still
+# holds a Decimal with its original exact digits; nothing here ever
+# rounds or truncates a value). What is NOT preserved is the source's
+# declared SCHEMA-LEVEL constraint (that a column may only hold up to
+# 9 digits after the decimal point, or at most 255 characters) --
+# publication does not re-derive or enforce those constraints in the
+# published table. Exact schema-level fidelity (persisting precision,
+# scale, and length, and recreating them on the published table) is a
+# larger, separate piece of work than this phase attempts; if it's
+# ever needed, it belongs in a dedicated follow-up, not bolted on here
+# implicitly.
 _AEGIS_LOGICAL_DTYPE_TO_POSTGRES_TYPE_NAME = {
     "int64": "bigint",
     "float64": "double precision",
@@ -142,28 +182,60 @@ def build_source_observed_schema(dataframe: pd.DataFrame, column_types: dict) ->
         series = dataframe[col]
         columns[col] = ColumnStats(
             null_count=int(series.isna().sum()),
-            unique_count=int(series.nunique(dropna=True)),
+            unique_count=_json_safe_unique_count(series),
             dtype=postgres_type_to_aegis_dtype(column_types[col]),
         )
     return ObservedSchema(columns=columns, column_order=list(dataframe.columns))
 
 
-def build_corrected_observed_schema(dataframe: pd.DataFrame) -> ObservedSchema:
+def build_corrected_observed_schema(
+    dataframe: pd.DataFrame, original_observed_schema: ObservedSchema, proposed_action: str
+) -> ObservedSchema:
     """
-    Builds an ObservedSchema for a POST-REPAIR working copy, using the
-    SAME logical dtype vocabulary as build_source_observed_schema().
-    Native numpy dtypes (Surgeon's CAST_COLUMN produces these
-    directly) use that dtype string as-is; "object" columns have their
-    logical dtype inferred from actual values instead.
+    Builds an ObservedSchema for a POST-REPAIR working copy, using a
+    METADATA-BACKED type contract rather than inferring from row
+    values. Confirmed directly that value-based inference wrongly
+    rejects every all-null typed column (NUMERIC, UUID, JSONB, date,
+    etc.) -- there's no non-null value to infer a type from, so it
+    falls back to "object", which then never matches whatever Gold
+    actually declared for that column.
+
+    For a column with a genuine native numpy dtype (Surgeon's
+    CAST_COLUMN produces these directly via .astype()), that dtype is
+    authoritative -- Surgeon actually changed it, so there's nothing
+    to look up. For an object-dtype column (untouched by this repair,
+    or renamed but not cast), its logical dtype is looked up from
+    original_observed_schema instead of inferred: a RENAME_COLUMN
+    repair changes a column's name but not its data or type, so the
+    ORIGINAL column's already-known logical dtype (found under its OLD
+    name, via proposed_action) is still correct. Value-based inference
+    remains only as a last-resort fallback for a column this can't
+    otherwise account for.
     """
+    rename_map = {}  # new_name -> old_name
+    if proposed_action.startswith("RENAME_COLUMN"):
+        try:
+            _, rest = proposed_action.split(" ", 1)
+            old_name, new_name = (s.strip() for s in rest.split("->"))
+            rename_map[new_name] = old_name
+        except ValueError:
+            pass  # unexpected format -- fall through to value-based inference
+
     columns = {}
     for col in dataframe.columns:
         series = dataframe[col]
         dtype_str = str(series.dtype)
-        logical_dtype = dtype_str if dtype_str != "object" else infer_aegis_logical_dtype_from_values(series)
+        if dtype_str != "object":
+            logical_dtype = dtype_str
+        else:
+            original_name = rename_map.get(col, col)
+            if original_name in original_observed_schema.columns:
+                logical_dtype = original_observed_schema.columns[original_name].dtype
+            else:
+                logical_dtype = infer_aegis_logical_dtype_from_values(series)
         columns[col] = ColumnStats(
             null_count=int(series.isna().sum()),
-            unique_count=int(series.nunique(dropna=True)),
+            unique_count=_json_safe_unique_count(series),
             dtype=logical_dtype,
         )
     return ObservedSchema(columns=columns, column_order=list(dataframe.columns))

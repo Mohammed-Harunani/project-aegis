@@ -569,6 +569,35 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
             source_dataset_fingerprint=ticket.source_dataset_fingerprint,
             commit=False,
         )
+
+        # Surgeon's own validation only checks column name/order --
+        # it can report applied=True, validation.success=True, and
+        # LOW_RISK even when a second column Consultant also flagged
+        # still has the wrong type, because RepairSelector only ever
+        # chose one repair. execute-live already refuses to publish
+        # such a ticket, but without this, the PERSISTED sandbox
+        # manifest itself would misleadingly claim full success.
+        # Scoped to live-eligible tickets specifically -- a sample_data
+        # ticket never carried an expectation of fully resolving the
+        # schema, and this is specifically about not letting a
+        # live-eligible ticket's manifest overstate what it actually
+        # achieved.
+        if ticket.live_eligible:
+            verify_complete_schema_match(
+                manifest.corrected_dataset, ticket.observed_schema,
+                ticket.repair_plan.proposed_action, ticket.gold_schema,
+            )
+    except LiveExecutionNotAllowedError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"This ticket's repair plan does not fully resolve the schema "
+                f"against Gold, so a live-eligible ticket cannot be approved as "
+                f"a misleadingly 'successful' manifest -- the approval was "
+                f"rolled back and the ticket remains PENDING. {e}"
+            ),
+        )
     except Exception:
         db.rollback()
         raise HTTPException(
@@ -900,7 +929,9 @@ def execute_live(
                 # RepairSelector only ever picks one of the repairs
                 # Consultant proposed. Require a completely empty
                 # delta before anything gets published.
-                verify_complete_schema_match(working_copy, ticket.gold_schema)
+                verify_complete_schema_match(
+                    working_copy, ticket.observed_schema, ticket.repair_plan.proposed_action, ticket.gold_schema
+                )
 
                 live_recomputed_fingerprint = compute_dataframe_fingerprint(working_copy)
                 verify_output_fingerprint_match(

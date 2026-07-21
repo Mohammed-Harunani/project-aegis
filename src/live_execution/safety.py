@@ -77,7 +77,9 @@ def verify_output_fingerprint_match(sandbox_fingerprint: Optional[str], live_fin
         )
 
 
-def verify_complete_schema_match(corrected_dataframe, gold_schema) -> None:
+def verify_complete_schema_match(
+    corrected_dataframe, original_observed_schema, proposed_action, gold_schema
+) -> None:
     """
     Surgeon's own validation only checks
     `list(working_df.columns) == list(gold_schema.column_order)` --
@@ -97,13 +99,14 @@ def verify_complete_schema_match(corrected_dataframe, gold_schema) -> None:
     Uses build_corrected_observed_schema(), not plain
     AegisInspector.generate_observed_schema() -- the latter reads the
     raw pandas dtype label, which is always "object" for anything
-    Decimal/date/UUID/JSON-holding. Gold schemas for a trusted-source
-    ticket may declare logical dtypes like "decimal" or "datetime_tz"
-    that never appear as real pandas dtype strings; comparing against
-    the raw label would wrongly flag every such column as unresolved
-    even when nothing is actually wrong.
+    Decimal/date/UUID/JSON-holding, AND (confirmed directly) would
+    wrongly reject every all-null typed column, since there's no value
+    left to infer a type from. original_observed_schema and
+    proposed_action let it look up an untouched or renamed-but-not-cast
+    column's already-known logical type instead of guessing from
+    values that may not exist.
     """
-    observed = build_corrected_observed_schema(corrected_dataframe)
+    observed = build_corrected_observed_schema(corrected_dataframe, original_observed_schema, proposed_action)
     delta = AegisInspector().detect_delta(observed, gold_schema)
     if delta.missing_columns or delta.new_columns or delta.type_mismatches or delta.reorder_event:
         raise LiveExecutionNotAllowedError(
