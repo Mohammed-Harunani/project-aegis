@@ -832,3 +832,56 @@ restriction) sharing a name with a PRIMARY KEY on a different table --
 this actually reproduces the class of collision the fix addresses.
 
 58/58 pure-Python tests pass, reconfirmed after every individual fix.
+
+## Eighth correction pass
+
+A further review found four more real gaps in the dtype/repair
+contract, all confirmed directly against actual Surgeon/pandas
+behavior before any code changed. Fixed:
+
+1. **Consultant could propose casts Surgeon cannot perform.**
+   Confirmed directly: Surgeon's CAST_COLUMN applies
+   working_df[column].astype(target_type) verbatim, and pandas has no
+   understanding of Aegis's own extended logical dtypes ("decimal",
+   "date", "datetime", "datetime_tz", "uuid", "json") -- every such
+   cast fails for every row, reporting applied=False/HIGH_RISK, which
+   can never become live-eligible regardless. Rather than implement
+   unverified conversion logic for five exotic types with no way to
+   test it against a real database, this is fixed conservatively:
+   /simulate-migration-from-source now rejects a CAST_COLUMN targeting
+   one of these dtypes before a ticket is ever created, with a clear
+   explanation. This is a deliberate scope decision, not a permanent
+   one -- renames to these types already work fine; only casting a
+   mismatched source into them does not yet.
+2. **A successful cast to "object" was wrongly rejected post-repair.**
+   build_corrected_observed_schema() only ever accounted for
+   RENAME_COLUMN; for CAST_COLUMN it fell through to "look up the
+   original name's dtype," which is correct for untouched columns but
+   wrong for one a cast had just deliberately retyped. Confirmed
+   directly: a genuine int64-to-object cast was reconstructed as still
+   being int64 and flagged as an unresolved mismatch. Fixed by parsing
+   CAST_COLUMN the same way RENAME_COLUMN already was, and using the
+   cast's own declared target as authoritative for that column.
+3. **The registry accepted dtypes publication can't handle.** Since
+   the Schema Registry now accepts anything
+   pandas.api.types.pandas_dtype() recognizes, confirmed directly that
+   "int32", "Int64", "float32", "string", "datetime64[ns]", and
+   "category" all pass registry validation with no publication mapping
+   at all -- such a schema could register, simulate, and get approved,
+   only to fail at execute-live. Fixed by validating every Gold
+   column's dtype is publishable at simulation time for the
+   live-capable path specifically, rejecting before a ticket exists.
+4. **live_executions didn't retain complete source provenance.** The
+   ticket and manifest persist all six provenance fields
+   (source_schema, source_table, source_primary_key, source_row_count,
+   source_schema_fingerprint, source_dataset_fingerprint), but
+   live_executions only copied three -- the other three were only
+   recoverable via a join back to the ticket, when the design intent
+   was for this record to stand alone as a complete, independent audit
+   trail. Added the missing three (NOT NULL, same reasoning as the
+   other three) to models.py, migration 0003, create_running(), and
+   exposed them in the GET response.
+
+58/58 pure-Python tests pass, reconfirmed after every individual fix.
+Two new PostgreSQL-dependent tests added for the new rejection paths
+(uncastable-target casts, unpublishable Gold dtypes).

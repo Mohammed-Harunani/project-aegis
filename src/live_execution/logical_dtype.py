@@ -115,6 +115,44 @@ _AEGIS_LOGICAL_DTYPE_TO_POSTGRES_TYPE_NAME = {
 }
 
 
+def get_publishable_dtypes() -> list:
+    """Public accessor for error messages -- the underlying mapping is
+    a module-private implementation detail."""
+    return sorted(_AEGIS_LOGICAL_DTYPE_TO_POSTGRES_TYPE_NAME)
+
+
+def is_publishable_dtype(logical_dtype: str) -> bool:
+    """
+    True if this logical dtype has an explicit Postgres publication
+    type mapping. Confirmed directly that the Schema Registry accepts
+    a much wider set (anything pandas.api.types.pandas_dtype()
+    recognizes, e.g. "int32", "Int64", "float32", "string", "category")
+    than publication actually supports -- a Gold schema could
+    otherwise register successfully, pass simulation and approval, and
+    only fail at live-execution time with an UnsupportedSourceTypeError.
+    Used to reject that mismatch at simulation time instead.
+    """
+    try:
+        aegis_dtype_to_postgres_type_name(logical_dtype)
+        return True
+    except UnsupportedSourceTypeError:
+        return False
+
+
+# Confirmed directly: Surgeon's CAST_COLUMN applies
+# working_df[column].astype(target_type) verbatim -- pandas has no
+# native understanding of Aegis's own extended logical dtype strings
+# ("decimal", "date", "datetime", "datetime_tz", "uuid", "json"), so
+# every such cast fails for every row and the whole repair reports
+# applied=False. Casting works fine when the source is ALREADY that
+# type and the repair only renames it (no cast needed) -- this set is
+# specifically about CAST_COLUMN targeting one of these strings, which
+# is the specific case that cannot currently succeed.
+AEGIS_UNCASTABLE_TARGET_DTYPES = frozenset({
+    "decimal", "date", "datetime", "datetime_tz", "uuid", "json",
+})
+
+
 def aegis_dtype_to_postgres_type_name(logical_dtype: str) -> str:
     try:
         return _AEGIS_LOGICAL_DTYPE_TO_POSTGRES_TYPE_NAME[logical_dtype]
@@ -203,16 +241,20 @@ def build_corrected_observed_schema(
     For a column with a genuine native numpy dtype (Surgeon's
     CAST_COLUMN produces these directly via .astype()), that dtype is
     authoritative -- Surgeon actually changed it, so there's nothing
-    to look up. For an object-dtype column (untouched by this repair,
-    or renamed but not cast), its logical dtype is looked up from
-    original_observed_schema instead of inferred: a RENAME_COLUMN
-    repair changes a column's name but not its data or type, so the
-    ORIGINAL column's already-known logical dtype (found under its OLD
-    name, via proposed_action) is still correct. Value-based inference
-    remains only as a last-resort fallback for a column this can't
-    otherwise account for.
+    to look up. For an object-dtype column, three cases: (1) a
+    CAST_COLUMN repair targeted THIS column and its own declared
+    target is "object" -- confirmed directly that treating this the
+    same as "untouched" wrongly reconstructed a successful cast-to-
+    object as still being its PRE-cast type, since object-dtype alone
+    can't distinguish "cast to object on purpose" from "never touched
+    at all"; the cast's own declared target is authoritative here. (2)
+    untouched, or renamed but not cast -- looked up from
+    original_observed_schema instead of inferred, since a RENAME_COLUMN
+    repair changes a column's name but not its data or type. (3)
+    neither of the above -- value-based inference as a last resort.
     """
     rename_map = {}  # new_name -> old_name
+    cast_map = {}  # column -> its own repair's declared target logical dtype
     if proposed_action.startswith("RENAME_COLUMN"):
         try:
             _, rest = proposed_action.split(" ", 1)
@@ -220,6 +262,12 @@ def build_corrected_observed_schema(
             rename_map[new_name] = old_name
         except ValueError:
             pass  # unexpected format -- fall through to value-based inference
+    elif proposed_action.startswith("CAST_COLUMN"):
+        # "CAST_COLUMN <col> TO <target>" (a trailing WITH_DROP_INVALID,
+        # if present, doesn't affect the resulting dtype itself).
+        parts = proposed_action.split()
+        if len(parts) >= 4 and parts[2] == "TO":
+            cast_map[parts[1]] = parts[3]
 
     columns = {}
     for col in dataframe.columns:
@@ -227,6 +275,8 @@ def build_corrected_observed_schema(
         dtype_str = str(series.dtype)
         if dtype_str != "object":
             logical_dtype = dtype_str
+        elif col in cast_map:
+            logical_dtype = cast_map[col]
         else:
             original_name = rename_map.get(col, col)
             if original_name in original_observed_schema.columns:

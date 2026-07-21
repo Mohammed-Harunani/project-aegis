@@ -240,6 +240,17 @@ class LiveExecutionRecord(Base):
     # live_eligible ticket (evaluate_safety_gates checks this before
     # create_running() is ever called), so a null here could only mean
     # a bug, never a legitimate case.
+    #
+    # Originally only source_schema/source_table/source_dataset_fingerprint
+    # were copied here -- source_primary_key/source_row_count/
+    # source_schema_fingerprint were recoverable via the ticket_id
+    # foreign key, but the design intent was for this record to stand
+    # on its own as a complete, independent audit trail, not one that
+    # requires following a join to fully account for what was
+    # revalidated immediately before publication.
     source_schema = Column(Text, nullable=False)
     source_table = Column(Text, nullable=False)
+    source_primary_key = Column(JSONB, nullable=False)
+    source_row_count = Column(Integer, nullable=False)
+    source_schema_fingerprint = Column(Text, nullable=False)
     source_dataset_fingerprint = Column(Text, nullable=False)

@@ -136,9 +136,14 @@ def upgrade() -> None:
         sa.Column("integrity_status", sa.Text, nullable=False),
         # Copied from the ticket at execution time for an independent
         # audit trail, and re-verified (source re-read, fingerprint
-        # compared) immediately before publishing.
+        # compared) immediately before publishing. All six fields, so
+        # this record stands on its own as a complete audit trail
+        # rather than requiring a join back to the ticket.
         sa.Column("source_schema", sa.Text, nullable=False),
         sa.Column("source_table", sa.Text, nullable=False),
+        sa.Column("source_primary_key", postgresql.JSONB, nullable=False),
+        sa.Column("source_row_count", sa.Integer, nullable=False),
+        sa.Column("source_schema_fingerprint", sa.Text, nullable=False),
         sa.Column("source_dataset_fingerprint", sa.Text, nullable=False),
         sa.CheckConstraint(
             "status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'ROLLING_BACK', 'ROLLED_BACK')",

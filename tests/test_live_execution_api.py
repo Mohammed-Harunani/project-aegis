@@ -179,6 +179,67 @@ def test_source_table_without_primary_key_rejected():
     assert response.status_code == 422
 
 
+def test_cast_to_uncastable_extended_dtype_rejected_before_ticket_creation():
+    """
+    Issue 1 (eighth correction pass): Surgeon's CAST_COLUMN applies
+    working_df[column].astype(target_type) verbatim, and pandas has no
+    understanding of Aegis's own extended logical dtypes ("decimal",
+    "date", "datetime_tz", "uuid", "json") -- confirmed directly that
+    every such cast fails for every row. A Gold schema whose dtype
+    mismatch would require Consultant to propose exactly this kind of
+    cast must be rejected before a ticket is ever created, not
+    discovered later as an unexplained HIGH_RISK/applied=False result.
+    """
+    client.post("/schemas/orders_uncastable_test/versions", json={
+        "format_version": 1, "created_by": "mo",
+        "columns": [{"name": "amount", "dtype": "decimal"}],
+    })
+    with source_engine.begin() as conn:
+        conn.execute(text('DROP TABLE IF EXISTS orders_uncastable'))
+        # Same column NAME as Gold ("amount"), but wrong TYPE (TEXT
+        # instead of NUMERIC) -- this forces Consultant to propose a
+        # CAST_COLUMN (not a rename), targeting "decimal".
+        conn.execute(text(
+            'CREATE TABLE orders_uncastable (id BIGINT PRIMARY KEY, amount TEXT)'
+        ))
+        conn.execute(text("INSERT INTO orders_uncastable VALUES (1, 'not-a-number')"))
+    response = client.post("/simulate-migration-from-source", json={
+        "schema_name": "orders_uncastable_test",
+        "source_schema": "public", "source_table": "orders_uncastable",
+    })
+    assert response.status_code == 422
+    assert "cast" in response.json()["detail"].lower()
+
+
+def test_unpublishable_gold_dtype_rejected_before_ticket_creation():
+    """
+    Issue 3 (eighth correction pass): the Schema Registry accepts any
+    dtype pandas.api.types.pandas_dtype() recognizes, which is a much
+    wider set than publication actually supports -- confirmed directly
+    that "int32"/"Int64"/"category" etc. all pass registry validation
+    but have no PostgreSQL publication mapping. A Gold schema declaring
+    one of these must be rejected at simulation time for the
+    live-capable path, not allowed to pass approval and only fail at
+    execute-live.
+    """
+    client.post("/schemas/orders_unpublishable_test/versions", json={
+        "format_version": 1, "created_by": "mo",
+        "columns": [{"name": "small_amount", "dtype": "int32"}],
+    })
+    with source_engine.begin() as conn:
+        conn.execute(text('DROP TABLE IF EXISTS orders_unpublishable'))
+        conn.execute(text(
+            'CREATE TABLE orders_unpublishable (id BIGINT PRIMARY KEY, small_amount BIGINT)'
+        ))
+        conn.execute(text("INSERT INTO orders_unpublishable VALUES (1, 100)"))
+    response = client.post("/simulate-migration-from-source", json={
+        "schema_name": "orders_unpublishable_test",
+        "source_schema": "public", "source_table": "orders_unpublishable",
+    })
+    assert response.status_code == 422
+    assert "publication mapping" in response.json()["detail"].lower() or "publishable" in response.json()["detail"].lower()
+
+
 def test_sample_data_ticket_is_not_live_eligible():
     """The core safety property of this whole redesign: a ticket from
     /simulate-migration (sample_data) must never be able to execute
@@ -813,6 +874,9 @@ def test_reconciliation_heals_a_stuck_running_record():
             integrity_status=manifest.integrity_status,
             source_schema=ticket.source_schema,
             source_table=ticket.source_table,
+            source_primary_key=ticket.source_primary_key,
+            source_row_count=ticket.source_row_count,
+            source_schema_fingerprint=ticket.source_schema_fingerprint,
             source_dataset_fingerprint=ticket.source_dataset_fingerprint,
         )
 
@@ -881,6 +945,9 @@ def test_staleness_gate_prevents_premature_reconciliation():
             integrity_status=manifest.integrity_status,
             source_schema=ticket.source_schema,
             source_table=ticket.source_table,
+            source_primary_key=ticket.source_primary_key,
+            source_row_count=ticket.source_row_count,
+            source_schema_fingerprint=ticket.source_schema_fingerprint,
             source_dataset_fingerprint=ticket.source_dataset_fingerprint,
         )
         stuck_id = str(live_record.live_execution_id)
@@ -926,6 +993,9 @@ def test_reconciliation_respects_lock_held_before_publish_even_starts():
             integrity_status=manifest.integrity_status,
             source_schema=ticket.source_schema,
             source_table=ticket.source_table,
+            source_primary_key=ticket.source_primary_key,
+            source_row_count=ticket.source_row_count,
+            source_schema_fingerprint=ticket.source_schema_fingerprint,
             source_dataset_fingerprint=ticket.source_dataset_fingerprint,
         )
         stuck_id = str(live_record.live_execution_id)
@@ -1007,7 +1077,8 @@ def test_migration_0003_creates_expected_tables_and_columns():
         "status", "requested_by", "started_at", "completed_at",
         "rollback_started_at", "rolled_back_by", "rolled_back_at",
         "failure_reason", "original_row_count", "final_row_count", "risk_level",
-        "integrity_status", "source_schema", "source_table", "source_dataset_fingerprint",
+        "integrity_status", "source_schema", "source_table", "source_primary_key",
+        "source_row_count", "source_schema_fingerprint", "source_dataset_fingerprint",
     }
     assert expected.issubset(columns)
 

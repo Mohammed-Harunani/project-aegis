@@ -60,6 +60,11 @@ from src.live_execution.source_connector import (
     SourceChangedError,
     UnsupportedSourceTypeError,
 )
+from src.live_execution.logical_dtype import (
+    is_publishable_dtype,
+    get_publishable_dtypes,
+    AEGIS_UNCASTABLE_TARGET_DTYPES,
+)
 
 
 app = FastAPI(
@@ -411,6 +416,31 @@ def simulate_migration_from_source(
 
     gold_schema_obj = _build_gold_schema(gold_schema_dict)
 
+    # Confirmed directly: the Schema Registry accepts a much wider set
+    # of dtypes (anything pandas.api.types.pandas_dtype() recognizes,
+    # e.g. "int32", "Int64", "category") than publication actually
+    # supports. Without this check, such a Gold schema could pass
+    # simulation and approval and only fail at live-execution time.
+    # Checked here, for the live-capable path specifically, rather than
+    # at registration time -- a Gold schema is reusable across both
+    # /simulate-migration (sandbox-only, no publication concern at all)
+    # and this endpoint, so publishability is a live-path requirement,
+    # not a blanket registry-wide one.
+    unpublishable = [
+        (name, stats.dtype) for name, stats in gold_schema_obj.columns.items()
+        if not is_publishable_dtype(stats.dtype)
+    ]
+    if unpublishable:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Gold schema {request.schema_name!r} declares dtypes that have no "
+                f"PostgreSQL publication mapping, so this schema cannot be used for "
+                f"live-capable simulation: {unpublishable}. Supported dtypes: "
+                f"{get_publishable_dtypes()}."
+            ),
+        )
+
     delta = inspector.detect_delta(observed_schema_obj, gold_schema_obj)
 
     repair_plans = consultant.propose_repairs(delta, observed_schema_obj, gold_schema_obj)
@@ -433,6 +463,32 @@ def simulate_migration_from_source(
             "source_row_count": source_read["row_count"],
             "message": "No repair plan survived governance review; all candidates quarantined.",
         }
+
+    # Confirmed directly: Surgeon's CAST_COLUMN applies
+    # working_df[column].astype(target_type) verbatim, and pandas does
+    # not understand Aegis's own extended logical dtype strings
+    # ("decimal", "date", "datetime", "datetime_tz", "uuid", "json") --
+    # every such cast fails for every row, reporting applied=False and
+    # HIGH_RISK, which can never become live-eligible anyway. Rejected
+    # here, before a ticket is ever created, rather than letting it
+    # fail much later and less clearly during approval. A source
+    # column that already needs to BE one of these types should be
+    # correctly typed at the source already -- no cast is needed in
+    # that case, only (at most) a rename, which works fine.
+    if selected_plan.proposed_action.startswith("CAST_COLUMN"):
+        parts = selected_plan.proposed_action.split()
+        if len(parts) >= 4 and parts[2] == "TO" and parts[3] in AEGIS_UNCASTABLE_TARGET_DTYPES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"The proposed repair ({selected_plan.proposed_action!r}) casts to "
+                    f"{parts[3]!r}, which Surgeon cannot currently perform (pandas has no "
+                    f"native equivalent for this Aegis-specific logical dtype). If the "
+                    f"source column already needs to be {parts[3]!r}, it should already "
+                    f"be correctly typed at the source -- only a rename would be needed "
+                    f"in that case, which is supported."
+                ),
+            )
 
     # Live-capable simulation always goes through human approval,
     # regardless of confidence -- not just as an extra safety margin
@@ -882,6 +938,9 @@ def execute_live(
                     integrity_status=manifest_record.integrity_status,
                     source_schema=ticket.source_schema,
                     source_table=ticket.source_table,
+                    source_primary_key=ticket.source_primary_key,
+                    source_row_count=ticket.source_row_count,
+                    source_schema_fingerprint=ticket.source_schema_fingerprint,
                     source_dataset_fingerprint=ticket.source_dataset_fingerprint,
                 )
             except LiveExecutionConflictError as e:
@@ -1124,6 +1183,9 @@ def get_live_execution(
         "integrity_status": record.integrity_status,
         "source_schema": record.source_schema,
         "source_table": record.source_table,
+        "source_primary_key": record.source_primary_key,
+        "source_row_count": record.source_row_count,
+        "source_schema_fingerprint": record.source_schema_fingerprint,
         "source_dataset_fingerprint": record.source_dataset_fingerprint,
     }
 

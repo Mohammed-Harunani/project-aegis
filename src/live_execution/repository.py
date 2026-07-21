@@ -133,15 +133,21 @@ class LiveExecutionRepository:
         final_row_count: int,
         risk_level: str,
         integrity_status: str,
-        source_schema: Optional[str] = None,
-        source_table: Optional[str] = None,
-        source_dataset_fingerprint: Optional[str] = None,
+        source_schema: str,
+        source_table: str,
+        source_primary_key: list,
+        source_row_count: int,
+        source_schema_fingerprint: str,
+        source_dataset_fingerprint: str,
     ) -> LiveExecutionRecord:
         """
         Creates the record already RUNNING, in one committed insert.
         source_* fields are copied from the ticket's own persisted
         provenance for an independent audit trail on this specific
-        execution.
+        execution -- all six fields, so this record stands on its own
+        rather than requiring a join back to the ticket to fully
+        account for what was revalidated immediately before
+        publication.
         """
         record = LiveExecutionRecord(
             live_execution_id=uuid.uuid4(),
@@ -160,6 +166,9 @@ class LiveExecutionRepository:
             integrity_status=integrity_status,
             source_schema=source_schema,
             source_table=source_table,
+            source_primary_key=source_primary_key,
+            source_row_count=source_row_count,
+            source_schema_fingerprint=source_schema_fingerprint,
             source_dataset_fingerprint=source_dataset_fingerprint,
         )
         self.db.add(record)
