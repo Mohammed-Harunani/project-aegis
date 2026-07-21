@@ -63,7 +63,7 @@ def _schema_from_json(data: dict) -> ObservedSchema:
 # identically, so a plain datetime.datetime silently came back as a
 # Timestamp. All four confirmed directly and fixed here.
 
-DATASET_FORMAT_VERSION = 1
+DATASET_FORMAT_VERSION = 2
 
 
 def _sanitize_scalar(value):
@@ -75,6 +75,10 @@ def _sanitize_scalar(value):
     corruption a "Financial Data Integrity Guardian" shouldn't
     introduce itself). None already covers NaN/NaT/pd.NA by the time
     this runs -- see _dataset_to_json.
+
+    Always writes in the CURRENT (v2) format -- there is no v1
+    encoder, only a v1 DECODER (see _restore_scalar_v1), since nothing
+    is ever newly written in the old format.
 
     Every dict/list value is wrapped in an explicit "raw_json"
     envelope, not just ones that happen to collide with the
@@ -98,7 +102,7 @@ def _sanitize_scalar(value):
         return {"__aegis_type__": "decimal", "value": str(value)}
     # Order matters: pd.Timestamp is a subclass of datetime.datetime,
     # which is a subclass of datetime.date -- most specific first.
-    # Getting this wrong is exactly how the previous version tagged
+    # Getting this wrong is exactly how an earlier version tagged
     # both pd.Timestamp and plain datetime.datetime as "timestamp",
     # silently collapsing the distinction between them.
     if isinstance(value, pd.Timestamp):
@@ -114,7 +118,13 @@ def _sanitize_scalar(value):
     return value
 
 
-def _restore_scalar(value):
+def _restore_scalar_v2(value):
+    """
+    Current (format_version 2) decoder. Handles UUID and wraps every
+    dict/list in an explicit "raw_json" envelope -- see
+    _sanitize_scalar's docstring for why the wrapping is
+    unconditional, not collision-detected.
+    """
     if isinstance(value, dict) and "__aegis_type__" in value:
         kind = value["__aegis_type__"]
         if kind == "positive_infinity":
@@ -134,6 +144,46 @@ def _restore_scalar(value):
             return uuid.UUID(raw)
         if kind == "raw_json":
             return raw
+    return value
+
+
+def _restore_scalar_v1(value):
+    """
+    LEGACY decoder for format_version 1 payloads only -- reproduces
+    the ORIGINAL behavior exactly (no UUID tag, no raw_json wrapper),
+    since that is genuinely what was written under that version and a
+    v2-aware decoder would silently misinterpret it. Any dict/list
+    written under v1 was NEVER wrapped, so it passes through here
+    unchanged UNLESS it happens to be a dict containing a
+    "__aegis_type__" key matching one of the tags v1 actually used
+    (positive_infinity, negative_infinity, decimal, pandas_timestamp,
+    python_datetime, date). That specific collision is a genuine,
+    UNRESOLVABLE ambiguity inherent to the v1 format itself: a v1
+    payload cannot distinguish "this is really an Aegis-tagged
+    Decimal" from "this is a legitimate user JSONB object that happens
+    to have those same keys" -- v1 never recorded which one it was.
+    This decoder resolves that ambiguity the same way v1's own code
+    always did (treat it as the tag), which is the closest available
+    approximation, not a guarantee of correctness. There is no way to
+    retroactively recover certainty for data written before this
+    distinction existed; this is a known, documented limitation of
+    reading v1 data, not something v2 can silently paper over.
+    """
+    if isinstance(value, dict) and "__aegis_type__" in value:
+        kind = value["__aegis_type__"]
+        if kind == "positive_infinity":
+            return float("inf")
+        if kind == "negative_infinity":
+            return float("-inf")
+        raw = value.get("value")
+        if kind == "decimal":
+            return decimal.Decimal(raw)
+        if kind == "pandas_timestamp":
+            return pd.Timestamp(raw)
+        if kind == "python_datetime":
+            return datetime_module.datetime.fromisoformat(raw)
+        if kind == "date":
+            return datetime_module.date.fromisoformat(raw)
     return value
 
 
@@ -159,8 +209,13 @@ def _dataset_to_json(df: pd.DataFrame) -> dict:
 
 
 def _dataset_from_json(payload: dict) -> pd.DataFrame:
-    if payload.get("format_version") != DATASET_FORMAT_VERSION:
-        raise ValueError(f"Unsupported dataset format_version: {payload.get('format_version')!r}")
+    format_version = payload.get("format_version")
+    if format_version == 1:
+        restore_scalar = _restore_scalar_v1
+    elif format_version == 2:
+        restore_scalar = _restore_scalar_v2
+    else:
+        raise ValueError(f"Unsupported dataset format_version: {format_version!r}")
 
     column_order = payload["column_order"]
     dtypes = payload["dtypes"]
@@ -171,14 +226,14 @@ def _dataset_from_json(payload: dict) -> pd.DataFrame:
     # default 0..n-1 index for every one of them, so no alignment
     # mismatch when combined below), and ONLY THEN cast to its recorded
     # dtype. Doing this in one shot via pd.DataFrame(dict_of_lists)
-    # instead -- as the previous version did -- lets pandas re-infer
+    # instead -- as an earlier version did -- lets pandas re-infer
     # types across the whole frame at once, which silently promotes a
     # plain datetime.datetime column back to Timestamp before the
     # dtype ever gets reapplied. Verified directly: that was exactly
     # how "python_datetime" and "pandas_timestamp" collapsed together.
     columns = {}
     for col in column_order:
-        restored_values = [_restore_scalar(v) for v in data[col]]
+        restored_values = [restore_scalar(v) for v in data[col]]
         series = pd.Series(restored_values, dtype=object)
         target_dtype = dtypes.get(col)
         if target_dtype and target_dtype != "object":
@@ -195,7 +250,7 @@ def _dataset_from_json(payload: dict) -> pd.DataFrame:
 
     df = pd.DataFrame(columns, columns=column_order)
 
-    index_values = [_restore_scalar(v) for v in index_info["values"]]
+    index_values = [restore_scalar(v) for v in index_info["values"]]
     idx = pd.Index(index_values, name=index_info["name"], dtype=object)
     index_dtype = index_info.get("dtype")
     if index_dtype and index_dtype != "object":

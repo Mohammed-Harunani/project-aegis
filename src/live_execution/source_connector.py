@@ -124,15 +124,20 @@ def _get_column_metadata(conn, source_schema: str, source_table: str) -> list:
     Full column metadata in ordinal order, from the SAME connection/
     transaction as everything else in the snapshot. Returns dicts with
     name, data_type, numeric_precision, numeric_scale,
-    datetime_precision, and is_nullable -- richer than just (name,
-    data_type), since a source change that alters precision/scale or
-    nullability without changing any current row's values would
-    otherwise be invisible to the schema fingerprint.
+    datetime_precision, is_nullable, character_maximum_length,
+    udt_schema, udt_name, domain_schema, domain_name, collation_name --
+    a source change that alters precision/scale/length, nullability,
+    domain, UDT identity, or collation, without changing any current
+    row's values, would otherwise be invisible to the schema
+    fingerprint. Confirmed directly this was a real gap: a column
+    widened from VARCHAR(20) to VARCHAR(200) produced no fingerprint
+    change at all under the narrower metadata set.
     """
     rows = conn.execute(
         text(
             "SELECT column_name, data_type, numeric_precision, numeric_scale, "
-            "datetime_precision, is_nullable "
+            "datetime_precision, is_nullable, character_maximum_length, "
+            "udt_schema, udt_name, domain_schema, domain_name, collation_name "
             "FROM information_schema.columns "
             "WHERE table_schema = :schema AND table_name = :table "
             "ORDER BY ordinal_position"
@@ -148,6 +153,8 @@ def _schema_fingerprint_from_metadata(column_metadata: list) -> str:
             [
                 m["column_name"], m["data_type"], m["numeric_precision"],
                 m["numeric_scale"], m["datetime_precision"], m["is_nullable"],
+                m["character_maximum_length"], m["udt_schema"], m["udt_name"],
+                m["domain_schema"], m["domain_name"], m["collation_name"],
             ]
             for m in column_metadata
         ],
