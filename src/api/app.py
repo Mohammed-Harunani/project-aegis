@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator, field_validator
 from typing import Dict, List, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import DBAPIError
 import uuid
 import pandas as pd
 
@@ -965,9 +966,11 @@ def execute_live(
             # Everything from here to mark_completed() is protected in
             # one failure-handling block: source re-verification,
             # Surgeon recomputation, fingerprint verification, and
-            # publication. A failure at ANY point marks the
-            # (already-durable) record FAILED rather than leaving it
-            # stuck RUNNING or never having existed at all.
+            # publication. A failure at ANY point must leave an honest
+            # governance state: FAILED when publication was never
+            # attempted or is proven not committed, RUNNING only when
+            # the target outcome genuinely cannot yet be proven.
+            publication_attempted = False
             try:
                 # Re-read the source and require the SAME dataset
                 # fingerprint as what was approved -- a source change
@@ -1020,6 +1023,7 @@ def execute_live(
                     live_fingerprint=live_recomputed_fingerprint,
                 )
 
+                publication_attempted = True
                 result = writer.publish(
                     locked_conn,
                     logical_target=request.logical_target,
@@ -1066,12 +1070,29 @@ def execute_live(
                     ),
                 )
             except Exception as e:
-                # Genuinely ambiguous: this exception alone doesn't
-                # prove whether the target transaction committed.
-                # Check the target-side marker before concluding
-                # anything -- a plain marker check, NOT a lock-testing
-                # one, since we already hold this target's lock
-                # ourselves right now.
+                # Unexpected failures before writer.publish() begins
+                # cannot have changed the target database. Record them
+                # as FAILED immediately rather than misclassifying a
+                # Surgeon/source/application error as an ambiguous
+                # publication outcome.
+                if not publication_attempted:
+                    live_repo.mark_failed(
+                        live_record.live_execution_id,
+                        failure_reason=str(e),
+                    )
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "Live execution failed before target publication began. "
+                            "No target transaction was attempted and the execution "
+                            f"has been recorded as FAILED. Reason: {e}"
+                        ),
+                    )
+
+                # Publication was attempted. A durable target-side
+                # marker proves the transaction committed, including
+                # the case where the response/acknowledgement was lost
+                # after commit.
                 outcome = writer.check_operation_outcome(
                     live_record.live_execution_id, "PUBLISH"
                 )
@@ -1093,50 +1114,59 @@ def execute_live(
                         "previous_physical_table": previous_physical_table,
                         "final_row_count": manifest_record.final_row_count,
                         "note": (
-                            "The original response to this request was lost to a "
-                            "connection error, but the target-side marker confirms "
-                            "the publication actually committed -- this reflects "
-                            "that, not a new attempt."
+                            "The original response to this request was lost, but "
+                            "the target-side marker confirms the publication "
+                            "committed. This response reflects that completed "
+                            "operation and does not start a new attempt."
                         ),
                     }
-                else:
-                    # "not_committed" and "unknown" are treated the
-                    # SAME way here, deliberately: a marker being
-                    # absent at this exact instant does not prove the
-                    # target transaction has finished failing -- the
-                    # commit acknowledgment could simply be delayed,
-                    # independent of whether the underlying commit
-                    # itself succeeds moments later. Concluding FAILED
-                    # here would make the ticket retryable while the
-                    # original publication might still land, risking a
-                    # duplicate. Only the staleness+lock-gated
-                    # reconciliation path (reconcile_running, via a
-                    # later GET) is allowed to conclude FAILED, because
-                    # it additionally proves the session lock is free
-                    # -- not just that a marker happens to be absent
-                    # right now.
+
+                # A database/connection exception may represent a lost
+                # commit acknowledgement. Likewise, outcome ==
+                # "unknown" means the target-side marker could not be
+                # checked at all. In either case it would be unsafe to
+                # mark FAILED and permit a retry, because the original
+                # publication may still have committed.
+                if isinstance(e, DBAPIError) or outcome == "unknown":
                     live_repo.mark_outcome_unknown(
                         live_record.live_execution_id,
                         reason=(
-                            f"Connection error during publication -- outcome not yet "
-                            f"provable ({outcome}). Left RUNNING; GET "
-                            f"/live-executions/{{id}} will reconcile it once the "
-                            f"staleness threshold passes and the target lock can be "
-                            f"proven free. Reason: {e}"
+                            f"Publication raised {type(e).__name__} and its target "
+                            f"outcome is not yet provable ({outcome}). Left RUNNING; "
+                            f"GET /live-executions/{{id}} will reconcile it after "
+                            f"the staleness threshold and target-lock check. "
+                            f"Reason: {e}"
                         ),
                     )
                     raise HTTPException(
                         status_code=503,
                         detail=(
-                            f"Live execution outcome is not yet provable -- a connection "
-                            f"error occurred and the target-side marker was absent or "
-                            f"unreachable, but that alone doesn't prove the publication "
-                            f"failed. This execution remains RUNNING; poll GET "
-                            f"/live-executions/{{live_execution_id}} for the reconciled "
-                            f"outcome once the staleness threshold passes. Retrying "
+                            "Live execution outcome is not yet provable. The "
+                            "execution remains RUNNING and must be reconciled via "
+                            "GET /live-executions/{live_execution_id}; retrying "
                             f"blindly risks a duplicate publication. Reason: {e}"
                         ),
                     )
+
+                # The marker table was reachable and contains no
+                # PUBLISH marker, while the raised error was an
+                # ordinary application exception rather than a DBAPI
+                # connection/transaction exception. Publication is
+                # therefore not committed and this attempt is safely
+                # recorded as FAILED.
+                live_repo.mark_failed(
+                    live_record.live_execution_id,
+                    failure_reason=str(e),
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Live execution failed and no committed target publication "
+                        "was found. The previously published version is unchanged "
+                        f"and this attempt has been recorded as FAILED. Reason: {e}"
+                    ),
+                )
+
 
             live_repo.mark_completed(
                 live_record.live_execution_id,

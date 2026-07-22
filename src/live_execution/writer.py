@@ -29,6 +29,7 @@ serialized.
 
 from contextlib import contextmanager
 import logging
+import uuid as uuid_module
 
 import pandas as pd
 from sqlalchemy import MetaData, Table, Column, text

@@ -23,8 +23,9 @@ won't create aegis_source_test automatically -- create it manually:
     docker compose exec postgres psql -U aegis_user -d postgres \
         -c "CREATE DATABASE aegis_source_test;"
 
-Written and syntax-checked but NOT executed -- same constraint as
-every Postgres-dependent piece of this project.
+This suite is executed only against the three explicitly verified,
+disposable PostgreSQL test databases listed above. Its guards refuse
+to run against any differently named database.
 """
 
 import sys
@@ -51,6 +52,7 @@ from sqlalchemy import create_engine, text, inspect as sa_inspect
 from sqlalchemy.orm import sessionmaker
 
 from src.api.app import app
+from src.surgeon import AegisSurgeon
 from src.db.session import get_db
 from src.db.live_session import get_live_engine
 from src.db.source_session import get_source_engine
@@ -120,6 +122,11 @@ def _create_source_table(rows=((1, "alice"), (2, "bob"), (3, "carol"))):
     used throughout the rest of this project's tests.
     """
     with source_engine.begin() as conn:
+        # Some publication/rollback tests intentionally create a
+        # second source snapshot inside the same test. Replace the
+        # first table deterministically rather than relying only on
+        # setup_function(), which runs once per test function.
+        conn.execute(text("DROP TABLE IF EXISTS customers"))
         conn.execute(text(
             'CREATE TABLE customers ('
             '"Customer_ID" BIGINT PRIMARY KEY, name TEXT)'
@@ -880,12 +887,31 @@ def test_reconciliation_heals_a_stuck_running_record():
             source_dataset_fingerprint=ticket.source_dataset_fingerprint,
         )
 
+        # The persisted ticket dataset is the trusted source snapshot
+        # before repair (Customer_ID). Reproduce the live Surgeon step
+        # so the simulated committed publication contains the same
+        # corrected dataset (customer_id) that execute_live() would
+        # have written before the governance process supposedly
+        # crashed.
+        corrected_dataset = ticket.target_dataset.copy()
+        execution_result, _ = AegisSurgeon().execute(
+            repair_plan=ticket.repair_plan,
+            observed_schema=ticket.observed_schema,
+            gold_schema=ticket.gold_schema,
+            target_dataset=corrected_dataset,
+            operator="mo",
+            execution_mode="live",
+            allowed_modes=["sandbox", "live"],
+        )
+        assert execution_result.applied
+        assert execution_result.validation.success
+
         writer = PostgresPublicationWriter(live_target_engine)
         with writer.hold_target_lock("customer_master_17") as locked_conn:
             writer.publish(
                 locked_conn,
                 logical_target="customer_master_17",
-                dataframe=ticket.target_dataset,
+                dataframe=corrected_dataset,
                 execution_id=live_record.live_execution_id,
                 expected_row_count=3,
                 gold_schema=ticket.gold_schema,
@@ -1064,40 +1090,56 @@ def test_migration_0003_creates_expected_tables_and_columns():
     cfg.set_main_option("script_location", str(project_root / "alembic"))
     cfg.set_main_option("sqlalchemy.url", TEST_DATABASE_URL)
 
+    # Base.metadata.drop_all() does not own Alembic's version table.
+    # Leaving an old 0002/0003 row behind while dropping the actual
+    # application tables makes Alembic skip migrations whose tables no
+    # longer exist. Reset both schema objects and revision state so the
+    # test genuinely exercises 0001 -> 0002 -> 0003 from an empty,
+    # disposable database.
     Base.metadata.drop_all(bind=engine)
-    command.upgrade(cfg, "head")
+    with engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
 
-    inspector = sa_inspect(engine)
-    assert "live_executions" in inspector.get_table_names()
+    try:
+        command.upgrade(cfg, "head")
 
-    columns = {c["name"] for c in inspector.get_columns("live_executions")}
-    expected = {
-        "live_execution_id", "ticket_id", "sandbox_manifest_id", "schema_version_id",
-        "logical_target", "physical_table", "previous_physical_table",
-        "status", "requested_by", "started_at", "completed_at",
-        "rollback_started_at", "rolled_back_by", "rolled_back_at",
-        "failure_reason", "original_row_count", "final_row_count", "risk_level",
-        "integrity_status", "source_schema", "source_table", "source_primary_key",
-        "source_row_count", "source_schema_fingerprint", "source_dataset_fingerprint",
-    }
-    assert expected.issubset(columns)
+        inspector = sa_inspect(engine)
+        assert "live_executions" in inspector.get_table_names()
 
-    ticket_columns = {c["name"] for c in inspector.get_columns("approval_tickets")}
-    assert {
-        "source_schema", "source_table", "source_primary_key", "source_row_count",
-        "source_schema_fingerprint", "source_dataset_fingerprint", "live_eligible",
-    }.issubset(ticket_columns)
+        columns = {c["name"] for c in inspector.get_columns("live_executions")}
+        expected = {
+            "live_execution_id", "ticket_id", "sandbox_manifest_id", "schema_version_id",
+            "logical_target", "physical_table", "previous_physical_table",
+            "status", "requested_by", "started_at", "completed_at",
+            "rollback_started_at", "rolled_back_by", "rolled_back_at",
+            "failure_reason", "original_row_count", "final_row_count", "risk_level",
+            "integrity_status", "source_schema", "source_table", "source_primary_key",
+            "source_row_count", "source_schema_fingerprint", "source_dataset_fingerprint",
+        }
+        assert expected.issubset(columns)
 
-    manifest_columns = {c["name"] for c in inspector.get_columns("healing_manifests")}
-    assert "corrected_output_fingerprint" in manifest_columns
-    assert "source_dataset_fingerprint" in manifest_columns
+        ticket_columns = {c["name"] for c in inspector.get_columns("approval_tickets")}
+        assert {
+            "source_schema", "source_table", "source_primary_key", "source_row_count",
+            "source_schema_fingerprint", "source_dataset_fingerprint", "live_eligible",
+        }.issubset(ticket_columns)
 
-    index_names = {idx["name"] for idx in inspector.get_indexes("live_executions")}
-    assert "uq_live_executions_ticket_active_or_done" in index_names
-    assert "uq_live_executions_target_in_flight" in index_names
+        manifest_columns = {c["name"] for c in inspector.get_columns("healing_manifests")}
+        assert "corrected_output_fingerprint" in manifest_columns
+        assert "source_dataset_fingerprint" in manifest_columns
 
-    command.downgrade(cfg, "0002")
-    tables_after = sa_inspect(engine).get_table_names()
-    assert "live_executions" not in tables_after
+        index_names = {idx["name"] for idx in inspector.get_indexes("live_executions")}
+        assert "uq_live_executions_ticket_active_or_done" in index_names
+        assert "uq_live_executions_target_in_flight" in index_names
 
-    Base.metadata.create_all(bind=engine)
+        command.downgrade(cfg, "0002")
+        tables_after = sa_inspect(engine).get_table_names()
+        assert "live_executions" not in tables_after
+    finally:
+        # Restore the module's normal Base.metadata-managed test schema
+        # and remove Alembic bookkeeping so this migration test neither
+        # depends on nor contaminates other integration-test modules.
+        Base.metadata.drop_all(bind=engine)
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE IF EXISTS alembic_version"))
+        Base.metadata.create_all(bind=engine)

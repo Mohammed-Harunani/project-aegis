@@ -898,3 +898,53 @@ behavior before any code changed. Fixed:
 58/58 pure-Python tests pass, reconfirmed after every individual fix.
 Two new PostgreSQL-dependent tests added for the new rejection paths
 (uncastable-target casts, unpublishable Gold dtypes).
+
+## Ninth correction and PostgreSQL verification pass
+
+The first complete execution against real PostgreSQL exposed issues
+that pure-Python and syntax-only review could not reveal. The pass was
+kept inside Phase 2.5 and completed before any Phase 3 work began.
+
+1. **The publication writer crashed on UUID physical-table names.**
+   `writer.py` referenced `uuid_module` without importing it. Added
+   `import uuid as uuid_module`. The initial full run reported 17
+   failures, with most later failures cascading from this root cause.
+2. **Publication exceptions were classified too broadly as ambiguous.**
+   The API now records whether `writer.publish()` was actually entered.
+   Failures before publication are marked `FAILED` immediately. After
+   publication begins, a committed target marker heals the result to
+   `COMPLETED`; `DBAPIError` or an unreachable marker check remains
+   `RUNNING`; an ordinary application exception with a reachable,
+   absent marker is marked `FAILED`.
+3. **The trusted-source test helper was not deterministic within one
+   test.** Some tests created a second source snapshot without a fresh
+   `setup_function()` call. `_create_source_table()` now drops and
+   recreates the disposable table itself.
+4. **The crash-reconciliation test published the uncorrected ticket
+   snapshot.** It now reproduces the live Surgeon step and publishes
+   the corrected dataset before simulating the governance crash.
+5. **The migration test retained stale Alembic revision state.**
+   `Base.metadata.drop_all()` does not remove `alembic_version`; the test
+   now resets both application tables and revision bookkeeping, runs
+   `0001 -> 0002 -> 0003`, verifies the schema and indexes, downgrades,
+   and restores the normal test schema in `finally`.
+6. **A stale local backup directory entered an earlier Docker image and
+   caused duplicate test-module collection.** The backup was moved
+   outside the repository, the API image was rebuilt without cache, and
+   the rebuilt image was explicitly checked to contain no
+   `_phase2_5_backup_*` directory.
+
+Verification results:
+
+- Targeted live-execution suite:
+  **32 passed, 3 deprecation warnings, 0 failures**.
+- Complete suite:
+  **145 passed, 5 deprecation warnings, 0 failures, exit code 0** in
+  26.45 seconds.
+- Repository review:
+  accidental untracked files removed; full-file line-ending noise
+  removed; CRLF-aware `git diff --check` returned exit code 0.
+
+This pass closes the real-PostgreSQL verification gap recorded in the
+earlier specification. Phase 2.5 is technically verified and ready for
+its final version-control commit and formal closure.

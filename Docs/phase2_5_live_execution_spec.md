@@ -1,6 +1,6 @@
 # Aegis Phase 2.5 -- Live Execution Mode Specification
 
-**Status: active, authoritative.** This document describes what the
+**Status: verified, authoritative.** This document describes what the
 system actually does today. The full history of how it got here --
 every correction pass, every bug found and fixed, in order -- lives in
 `Docs/phase2_5_live_execution_history_appendix.md`. Nothing in this
@@ -31,12 +31,13 @@ correction logic actually consequential outside of Aegis itself.
 - It does not preserve exact source-database type fidelity on
   publication (precision/scale/length are not recreated on the
   published table) -- see Section 3's canonicalization policy.
-- It has never been run against a real PostgreSQL instance in this
-  project's development environment. Every pure-Python test (69, at
-  last count) has been run repeatedly. The ~76+ PostgreSQL-dependent
-  tests have been written and reasoned through carefully, but not
-  executed. This is the single most important caveat in this
-  document, and closing it is Phase 2.5's actual remaining work.
+**Verification status:** Phase 2.5 has now been executed against real,
+disposable PostgreSQL instances for all three database roles. On
+2026-07-22, the targeted live-execution suite passed 32/32 tests and
+the complete project suite passed 145/145 tests. The five full-suite
+warnings were deprecation notices only; there were no failures or
+collection errors. This closes the former real-database verification
+gap.
 
 ---
 
@@ -290,15 +291,21 @@ would misleadingly claim full success.
     refused, since Postgres won't allow a rollback to repoint a view
     to a narrower physical table later. Repoints (or creates) the
     stable view via `CREATE OR REPLACE VIEW`.
-12. Any exception after step 6 is handled by category: exceptions
-    provably raised before any DDL (`SourceChangedError`,
-    `IncompatibleViewSchemaError`, etc.) mark the execution `FAILED`
-    directly. A truly ambiguous exception checks the target-side
-    marker: found -> `COMPLETED`; genuinely absent -> the execution is
-    **left `RUNNING`**, never concluded `FAILED` synchronously (a bare
-    marker-absent check doesn't prove the transaction won't still
-    commit), and the caller is told to poll `GET /live-executions/{id}`
-    for the reconciled outcome once the staleness threshold passes.
+12. Any exception after step 6 is classified by both execution stage
+    and target-side evidence:
+    - Before `writer.publish()` begins, the target database cannot have
+      changed. Unexpected source, Surgeon, fingerprint, or application
+      failures therefore mark the execution `FAILED` and return 500.
+    - After publication is attempted, a durable `PUBLISH` marker proves
+      the target transaction committed; the governance record is healed
+      to `COMPLETED`, including when the original response was lost.
+    - A `DBAPIError`, or an `unknown` marker-check result, may represent
+      a lost commit acknowledgement. The record remains `RUNNING` and
+      returns 503 for later lock-gated reconciliation.
+    - For an ordinary application exception, when the marker table is
+      reachable and contains no matching `PUBLISH` marker, publication
+      is treated as not committed; the record is marked `FAILED` and
+      returns 500.
 
 ---
 
@@ -334,8 +341,7 @@ sufficient proof that a transaction has finished failing.
 
 ## 8. Persistence model
 
-### Governance tables (migration `0003`, unapplied so far -- amend
-directly, don't add a new migration)
+### Governance tables (migration `0003`, applied and verified)
 
 - `approval_tickets`: adds `source_schema`, `source_table`,
   `source_primary_key` (JSONB), `source_row_count`,
@@ -435,18 +441,21 @@ In roughly the order they're checked:
 
 - `tests/test_inspector.py`, `test_consultant.py`, `test_surgeon.py`,
   `test_selector.py`, `test_approval.py`, `test_schema_registry_logic.py`,
-  `test_live_execution_logic.py`, `test_dataset_codec.py` -- pure
-  Python, no database required. **69 tests, run repeatedly throughout
-  development, currently all passing.**
+  `test_live_execution_logic.py`, `test_dataset_codec.py` -- 69
+  pure-Python tests, all passing.
 - `tests/test_api.py`, `test_schema_registry_api.py`,
-  `test_live_execution_api.py` -- require three disposable PostgreSQL
-  databases (governance, live target, trusted source; see
-  `docker/init-test-db.sql`, which creates all three automatically).
-  Roughly 76 tests covering: trusted-source simulation (including
-  rejection of unpublishable dtypes and `CAST_COLUMN` repairs),
-  approval/sandbox validation, publication (including high-precision
-  NUMERIC/DATE/TIMESTAMPTZ/UUID/JSONB), rollback, crash reconciliation,
-  concurrent-access handling, and the migration itself.
-  **These have never been executed against a real PostgreSQL instance
-  in this project's development environment.** This is the single
-  concrete gap standing between "carefully reasoned" and "verified."
+  `test_live_execution_api.py` -- 76 PostgreSQL-dependent tests using
+  three disposable databases: governance, live target, and trusted
+  source. Coverage includes trusted-source simulation, rejection of
+  unpublishable dtypes and every live `CAST_COLUMN`, approval/sandbox
+  validation, typed publication, rollback, crash reconciliation,
+  concurrent-access handling, and Alembic migration `0003`.
+- Targeted verification on 2026-07-22:
+  `tests/test_live_execution_api.py` -- **32 passed, 3 deprecation
+  warnings, 0 failures**.
+- Complete verification on 2026-07-22:
+  **145 passed, 5 deprecation warnings, 0 failures, exit code 0** in
+  26.45 seconds against PostgreSQL 16.
+- The warnings were limited to the Starlette/httpx TestClient
+  deprecation and Alembic's legacy `prepend_sys_path` separator
+  behavior. They do not affect Phase 2.5 correctness.
