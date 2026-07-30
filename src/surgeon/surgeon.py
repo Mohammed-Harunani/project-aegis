@@ -4,10 +4,13 @@ from typing import Optional, Tuple
 
 import pandas as pd
 
-from src.governance.manifest import (
-    ConversionOutcomeMetadata,
-    HealingManifest,
+from src.governance.conversion_safety import (
+    InvalidCastActionError,
+    ParsedCastAction,
+    build_conversion_metadata,
+    parse_cast_action,
 )
+from src.governance.manifest import ConversionOutcomeMetadata, HealingManifest
 from src.type_repair import (
     ColumnConversionResult,
     ConversionStatus,
@@ -27,25 +30,18 @@ class ExecutionResult:
     validation: ValidationResult
 
 
-@dataclass(frozen=True)
-class _ParsedCastAction:
-    column: str
-    target_dtype: str
-    drop_invalid_requested: bool
-
-
 class AegisSurgeon:
     """
     Applies an explicitly approved repair plan to a controlled working
     dataset.
 
-    Phase 3.1.3 changes CAST_COLUMN only: sandbox casts now delegate to the
+    Phase 3.1.4 retains the verified CAST_COLUMN path: sandbox casts now delegate to the
     verified type-repair engine, destructive WITH_DROP_INVALID plans are
     refused, and live casts remain blocked. RENAME_COLUMN behavior is kept
     unchanged.
     """
 
-    _SURGEON_VERSION = "1.8"
+    _SURGEON_VERSION = "1.9"
     _LIVE_CAST_BLOCK_MESSAGE = (
         "Verified CAST_COLUMN execution is sandbox-only; live casting "
         "remains blocked until Phase 3.1.6."
@@ -56,53 +52,19 @@ class AegisSurgeon:
     )
 
     @staticmethod
-    def _parse_cast_action(action: str) -> Optional[_ParsedCastAction]:
-        """Parse the V1 free-text CAST_COLUMN action deterministically."""
-        if type(action) is not str:
+    def _parse_cast_action(action: str) -> Optional[ParsedCastAction]:
+        """Compatibility wrapper around the shared governance parser."""
+        try:
+            return parse_cast_action(action)
+        except InvalidCastActionError:
             return None
-
-        parts = action.split()
-        if len(parts) not in (4, 5):
-            return None
-        if parts[0] != "CAST_COLUMN" or parts[2] != "TO":
-            return None
-        if len(parts) == 5 and parts[4] != "WITH_DROP_INVALID":
-            return None
-
-        column = parts[1]
-        target_dtype = parts[3]
-        if not column or not target_dtype:
-            return None
-
-        return _ParsedCastAction(
-            column=column,
-            target_dtype=target_dtype,
-            drop_invalid_requested=len(parts) == 5,
-        )
 
     @staticmethod
     def _conversion_metadata(
         column: str,
         result: ColumnConversionResult,
     ) -> ConversionOutcomeMetadata:
-        return ConversionOutcomeMetadata(
-            column_name=column,
-            status=result.status.value,
-            source_dtype=result.source_dtype,
-            target_dtype=result.target_dtype,
-            policy_version=result.policy_version,
-            total_count=result.total_count,
-            null_count=result.null_count,
-            converted_count=result.converted_count,
-            failed_count=result.failed_count,
-            diagnostic_count=len(result.diagnostics),
-            reason_codes=tuple(
-                dict.fromkeys(
-                    diagnostic.reason_code.value
-                    for diagnostic in result.diagnostics
-                )
-            ),
-        )
+        return build_conversion_metadata(column, result)
 
     @staticmethod
     def _conversion_summary(

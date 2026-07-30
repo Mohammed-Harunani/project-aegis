@@ -90,7 +90,7 @@ from src.db.session import get_db
 from src.db.models import Base, ApprovalTicketRecord, HealingManifestRecord
 from src.consultant.consultant import RepairPlan
 from src.governance.approval import TicketNotPendingError
-from src.governance.approval_repository import PostgresApprovalRepository
+from src.governance.approval_repository import PostgresApprovalRepository, _dataset_to_json
 from src.inspector import AegisInspector
 
 
@@ -130,6 +130,28 @@ def _submit_rename_scenario():
         json={
             "gold_schema": {"customer_id": "int64"},
             "sample_data": {"Customer_ID": [1, 2, 3]},
+        },
+    )
+
+
+
+
+def _submit_safe_cast_scenario():
+    return client.post(
+        "/simulate-migration",
+        json={
+            "gold_schema": {"amount": "int64"},
+            "sample_data": {"amount": ["1", "2", "-3"]},
+        },
+    )
+
+
+def _submit_unsafe_cast_scenario():
+    return client.post(
+        "/simulate-migration",
+        json={
+            "gold_schema": {"amount": "int64"},
+            "sample_data": {"amount": [1.5, 2.0]},
         },
     )
 
@@ -179,6 +201,121 @@ def test_approve_executes_persists_manifest_and_clears_from_pending():
             .count()
         )
         assert count == 1
+
+
+def test_safe_cast_requires_human_approval_and_exposes_redacted_decision():
+    response = _submit_safe_cast_scenario()
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["status"] == "PENDING_APPROVAL"
+    assert body["governance_decision"] == "REQUIRES_HUMAN_APPROVAL"
+    assert body["conversion_decision"]["status"] == "SAFE"
+    assert body["conversion_decision"]["reason_codes"] == []
+    assert "raw_value" not in body["conversion_decision"]
+    assert "row_index" not in body["conversion_decision"]
+    assert "message" not in body["conversion_decision"]
+
+
+def test_safe_cast_decision_persists_and_is_exposed_by_approval_reads():
+    ticket_id = _submit_safe_cast_scenario().json()["ticket_id"]
+
+    fetched = client.get(f"/approvals/{ticket_id}")
+    listed = client.get("/approvals")
+
+    assert fetched.status_code == 200
+    assert fetched.json()["conversion_decision"]["status"] == "SAFE"
+    match = next(
+        item for item in listed.json()["tickets"]
+        if item["ticket_id"] == ticket_id
+    )
+    assert match["conversion_decision"] == fetched.json()["conversion_decision"]
+
+    with TestSessionLocal() as db:
+        record = db.query(ApprovalTicketRecord).filter_by(ticket_id=ticket_id).one()
+        assert record.conversion_decision == fetched.json()["conversion_decision"]
+
+
+def test_safe_cast_approval_persists_matching_manifest_outcome():
+    ticket_id = _submit_safe_cast_scenario().json()["ticket_id"]
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo", "note": "verified safe"},
+    )
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["status"] == "APPROVED"
+    assert body["conversion_decision"]["status"] == "SAFE"
+    assert body["conversion_outcome"] == body["conversion_decision"]
+
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(ticket_id=ticket_id).one()
+        manifest = db.query(HealingManifestRecord).filter_by(ticket_id=ticket_id).one()
+        assert ticket.conversion_decision == body["conversion_decision"]
+        assert manifest.conversion_outcome == body["conversion_outcome"]
+
+
+def test_unsafe_cast_is_blocked_without_creating_approval_ticket():
+    response = _submit_unsafe_cast_scenario()
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body["status"] == "BLOCKED_BY_CONVERSION_SAFETY"
+    assert body["governance_decision"] == "QUARANTINE"
+    assert body["conversion_decision"]["status"] == "UNSAFE"
+    assert "FRACTIONAL_VALUE" in body["conversion_decision"]["reason_codes"]
+
+    with TestSessionLocal() as db:
+        assert db.query(ApprovalTicketRecord).count() == 0
+        assert db.query(HealingManifestRecord).count() == 0
+
+
+def test_changed_persisted_dataset_blocks_cast_approval_and_rolls_back_status():
+    ticket_id = _submit_safe_cast_scenario().json()["ticket_id"]
+
+    with TestSessionLocal() as db:
+        record = db.query(ApprovalTicketRecord).filter_by(ticket_id=ticket_id).one()
+        record.target_dataset = _dataset_to_json(
+            pd.DataFrame({"amount": ["1", "not-an-int", "-3"]})
+        )
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo", "note": "attempt"},
+    )
+
+    assert response.status_code == 422
+    assert "conversion governance" in response.json()["detail"]
+
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(ticket_id=ticket_id).one()
+        assert ticket.status == "PENDING"
+        assert db.query(HealingManifestRecord).count() == 0
+
+
+def test_tampered_persisted_decision_blocks_cast_approval():
+    ticket_id = _submit_safe_cast_scenario().json()["ticket_id"]
+
+    with TestSessionLocal() as db:
+        record = db.query(ApprovalTicketRecord).filter_by(ticket_id=ticket_id).one()
+        tampered = dict(record.conversion_decision)
+        tampered["target_dtype"] = "float64"
+        record.conversion_decision = tampered
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo"},
+    )
+
+    assert response.status_code == 422
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(ticket_id=ticket_id).one()
+        assert ticket.status == "PENDING"
+        assert db.query(HealingManifestRecord).count() == 0
 
 
 def test_reject_discards_without_executing_or_persisting_manifest():
@@ -498,6 +635,8 @@ def test_alembic_upgrade_and_downgrade():
     manifest_columns = {c["name"] for c in inspector.get_columns("healing_manifests")}
     assert "schema_version_id" in ticket_columns
     assert "schema_version_id" in manifest_columns
+    assert "conversion_decision" in ticket_columns
+    assert "conversion_outcome" in manifest_columns
 
     command.downgrade(cfg, "base")
     tables_after = sa_inspect(engine).get_table_names()

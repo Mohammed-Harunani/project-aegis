@@ -15,6 +15,14 @@ from src.governance.selector import RepairSelector
 from src.governance.approval import TicketNotFoundError, TicketNotPendingError
 from src.governance.approval_repository import PostgresApprovalRepository
 from src.governance.manifest_repository import save_manifest
+from src.governance.conversion_safety import (
+    ConversionApprovalBlockedError,
+    ConversionGovernanceError,
+    StaleConversionDecisionError,
+    analyze_cast_plan,
+    is_cast_action,
+    require_safe_conversion_decision,
+)
 from src.db.session import get_db
 from src.db.models import HealingManifestRecord
 from src.db.live_session import get_live_engine
@@ -214,6 +222,11 @@ def _build_gold_schema(gold_schema: Dict[str, str]) -> ObservedSchema:
     return ObservedSchema(columns=columns, column_order=list(gold_schema.keys()))
 
 
+def _public_conversion_metadata(metadata):
+    """Expose only the reviewed redacted conversion metadata shape."""
+    return metadata.to_dict() if metadata is not None else None
+
+
 @app.get("/")
 def root():
     return {"status": "Aegis API running"}
@@ -283,7 +296,36 @@ def simulate_migration(request: MigrationRequest, db: Session = Depends(get_db))
             "message": "No repair plan survived governance review; all candidates quarantined.",
         }
 
-    decision = governance.evaluate(selected_plan.confidence)
+    conversion_decision = None
+    if is_cast_action(selected_plan.proposed_action):
+        try:
+            conversion_decision = analyze_cast_plan(selected_plan, df_observed)
+        except ConversionGovernanceError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+        # CAST_COLUMN is never auto-approved. A non-SAFE result is exposed as
+        # redacted governance evidence but no approval ticket is created, so a
+        # human decision cannot override conversion safety.
+        if not conversion_decision.is_safe:
+            return {
+                "schema_delta": str(delta),
+                "proposed_repair": str(selected_plan),
+                "confidence": selected_plan.confidence,
+                "governance_decision": "QUARANTINE",
+                "schema_version_id": schema_version_id,
+                "status": "BLOCKED_BY_CONVERSION_SAFETY",
+                "conversion_decision": _public_conversion_metadata(
+                    conversion_decision
+                ),
+                "message": (
+                    "CAST_COLUMN was not submitted for approval because the "
+                    f"verified conversion decision is {conversion_decision.status}."
+                ),
+            }
+
+        decision = "REQUIRES_HUMAN_APPROVAL"
+    else:
+        decision = governance.evaluate(selected_plan.confidence)
 
     if decision == "AUTO_APPROVE":
         execution_result, manifest = surgeon.execute(
@@ -328,6 +370,7 @@ def simulate_migration(request: MigrationRequest, db: Session = Depends(get_db))
             target_dataset=df_observed,
             schema_version_id=schema_version_id,
             live_eligible=False,
+            conversion_decision=conversion_decision,
         )
         return {
             "schema_delta": str(delta),
@@ -337,6 +380,9 @@ def simulate_migration(request: MigrationRequest, db: Session = Depends(get_db))
             "schema_version_id": schema_version_id,
             "status": "PENDING_APPROVAL",
             "ticket_id": ticket.ticket_id,
+            "conversion_decision": _public_conversion_metadata(
+                ticket.conversion_decision
+            ),
             "message": (
                 f"Repair requires human approval before execution. "
                 f"POST /approvals/{ticket.ticket_id}/approve to proceed, "
@@ -563,6 +609,9 @@ def list_pending_approvals(db: Session = Depends(get_db)):
                 "status": t.status,
                 "created_at": t.created_at,
                 "schema_version_id": t.schema_version_id,
+                "conversion_decision": _public_conversion_metadata(
+                    t.conversion_decision
+                ),
             }
             for t in tickets
         ],
@@ -587,6 +636,9 @@ def get_approval(ticket_id: str, db: Session = Depends(get_db)):
         "decided_at": t.decided_at,
         "decision_note": t.decision_note,
         "schema_version_id": t.schema_version_id,
+        "conversion_decision": _public_conversion_metadata(
+            t.conversion_decision
+        ),
     }
 
 
@@ -601,6 +653,31 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
     except TicketNotPendingError as e:
         db.rollback()
         raise HTTPException(status_code=409, detail=str(e))
+    except ConversionGovernanceError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Approval was blocked by verified conversion governance; "
+                f"the ticket remains PENDING. {e}"
+            ),
+        )
+
+    try:
+        require_safe_conversion_decision(
+            ticket.repair_plan,
+            ticket.target_dataset,
+            ticket.conversion_decision,
+        )
+    except ConversionGovernanceError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Approval was blocked by verified conversion governance; "
+                f"the ticket remains PENDING. {e}"
+            ),
+        )
 
     # ticket.status is "APPROVED" here, but NOT YET COMMITTED --
     # approve() only flushed. If execution or manifest persistence
@@ -618,6 +695,17 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
             operator=request.operator,
             execution_mode="sandbox",
         )
+
+        if ticket.conversion_decision is not None:
+            if not execution_result.applied or not execution_result.validation.success:
+                raise ConversionApprovalBlockedError(
+                    "SAFE CAST_COLUMN approval did not produce a successful sandbox execution."
+                )
+            if manifest.conversion_outcome != ticket.conversion_decision:
+                raise StaleConversionDecisionError(
+                    "Sandbox conversion outcome does not match the approved decision."
+                )
+
         # Phase 2.5 correction: fingerprint the ACTUAL corrected output
         # this exact sandbox execution produced, not a separate
         # recomputation -- see the AUTO_APPROVE branch above for why
@@ -660,6 +748,15 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
                 ticket.repair_plan.proposed_action, ticket.gold_schema,
                 repair_applied=execution_result.applied,
             )
+    except ConversionGovernanceError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Approval execution was blocked by verified conversion governance; "
+                f"the ticket remains PENDING. {e}"
+            ),
+        )
     except LiveExecutionNotAllowedError as e:
         db.rollback()
         raise HTTPException(
@@ -691,6 +788,12 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
         "decided_at": ticket.decided_at,
         "execution_result": str(execution_result),
         "manifest": str(manifest),
+        "conversion_decision": _public_conversion_metadata(
+            ticket.conversion_decision
+        ),
+        "conversion_outcome": _public_conversion_metadata(
+            manifest.conversion_outcome
+        ),
     }
 
 
@@ -866,6 +969,15 @@ def execute_live(
             detail="Ticket has no recorded approval identity or timestamp -- refusing to execute live.",
         )
 
+    if is_cast_action(ticket.repair_plan.proposed_action) or ticket.conversion_decision is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Verified CAST_COLUMN remains blocked from live execution until "
+                "Phase 3.1.6 controlled allowlist enablement."
+            ),
+        )
+
     manifest_record = (
         db.query(HealingManifestRecord)
         .filter(HealingManifestRecord.ticket_id == uuid.UUID(ticket_id))
@@ -884,6 +996,14 @@ def execute_live(
         raise HTTPException(
             status_code=422,
             detail=f"Sandbox manifest has unexpected execution_mode {manifest_record.execution_mode!r}.",
+        )
+    if manifest_record.conversion_outcome is not None:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Sandbox manifest contains a CAST_COLUMN conversion outcome, "
+                "which is not live-enabled in Phase 3.1.4."
+            ),
         )
     if str(manifest_record.schema_version_id) != str(ticket.schema_version_id):
         raise HTTPException(
