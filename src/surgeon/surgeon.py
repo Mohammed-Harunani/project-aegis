@@ -1,9 +1,18 @@
 from dataclasses import dataclass
-from datetime import datetime, UTC
-from typing import Tuple
+from datetime import UTC, datetime
+from typing import Optional, Tuple
+
 import pandas as pd
 
-from src.governance.manifest import HealingManifest
+from src.governance.manifest import (
+    ConversionOutcomeMetadata,
+    HealingManifest,
+)
+from src.type_repair import (
+    ColumnConversionResult,
+    ConversionStatus,
+    analyze_and_convert,
+)
 
 
 @dataclass(frozen=True)
@@ -18,20 +27,139 @@ class ExecutionResult:
     validation: ValidationResult
 
 
+@dataclass(frozen=True)
+class _ParsedCastAction:
+    column: str
+    target_dtype: str
+    drop_invalid_requested: bool
+
+
 class AegisSurgeon:
+    """
+    Applies an explicitly approved repair plan to a controlled working
+    dataset.
 
-    def _safe_cast_diagnostics(self, series: pd.Series, target_type: str):
-        failed_rows = []
-        failed_values = []
+    Phase 3.1.3 changes CAST_COLUMN only: sandbox casts now delegate to the
+    verified type-repair engine, destructive WITH_DROP_INVALID plans are
+    refused, and live casts remain blocked. RENAME_COLUMN behavior is kept
+    unchanged.
+    """
 
-        for idx, value in series.items():
-            try:
-                pd.Series([value]).astype(target_type)
-            except Exception:
-                failed_rows.append(idx)
-                failed_values.append(value)
+    _SURGEON_VERSION = "1.8"
+    _LIVE_CAST_BLOCK_MESSAGE = (
+        "Verified CAST_COLUMN execution is sandbox-only; live casting "
+        "remains blocked until Phase 3.1.6."
+    )
+    _DROP_INVALID_BLOCK_MESSAGE = (
+        "WITH_DROP_INVALID is forbidden by the verified type-repair "
+        "contract; row-dropping is not a type conversion."
+    )
 
-        return failed_rows, failed_values
+    @staticmethod
+    def _parse_cast_action(action: str) -> Optional[_ParsedCastAction]:
+        """Parse the V1 free-text CAST_COLUMN action deterministically."""
+        if type(action) is not str:
+            return None
+
+        parts = action.split()
+        if len(parts) not in (4, 5):
+            return None
+        if parts[0] != "CAST_COLUMN" or parts[2] != "TO":
+            return None
+        if len(parts) == 5 and parts[4] != "WITH_DROP_INVALID":
+            return None
+
+        column = parts[1]
+        target_dtype = parts[3]
+        if not column or not target_dtype:
+            return None
+
+        return _ParsedCastAction(
+            column=column,
+            target_dtype=target_dtype,
+            drop_invalid_requested=len(parts) == 5,
+        )
+
+    @staticmethod
+    def _conversion_metadata(
+        column: str,
+        result: ColumnConversionResult,
+    ) -> ConversionOutcomeMetadata:
+        return ConversionOutcomeMetadata(
+            column_name=column,
+            status=result.status.value,
+            source_dtype=result.source_dtype,
+            target_dtype=result.target_dtype,
+            policy_version=result.policy_version,
+            total_count=result.total_count,
+            null_count=result.null_count,
+            converted_count=result.converted_count,
+            failed_count=result.failed_count,
+            diagnostic_count=len(result.diagnostics),
+            reason_codes=tuple(
+                dict.fromkeys(
+                    diagnostic.reason_code.value
+                    for diagnostic in result.diagnostics
+                )
+            ),
+        )
+
+    @staticmethod
+    def _conversion_summary(
+        column: str,
+        result: ColumnConversionResult,
+    ) -> str:
+        # Keep the summary deterministic and redacted. No row indexes or raw
+        # source values are included. Preserve first-seen reason-code order
+        # while removing duplicates, so repeated row failures do not create
+        # noisy or input-size-dependent messages.
+        reason_codes = tuple(
+            dict.fromkeys(
+                diagnostic.reason_code.value
+                for diagnostic in result.diagnostics
+            )
+        )
+        reason_text = ",".join(reason_codes) if reason_codes else "NONE"
+        return (
+            f"Verified cast {result.status.value}: "
+            f"column={column}; target={result.target_dtype}; "
+            f"converted={result.converted_count}; "
+            f"failed={result.failed_count}; nulls={result.null_count}; "
+            f"reasons={reason_text}; policy={result.policy_version}."
+        )
+
+    @staticmethod
+    def _safe_conversion_is_applicable(
+        source_series: pd.Series,
+        result: ColumnConversionResult,
+    ) -> bool:
+        """Defence-in-depth check before Surgeon assigns a SAFE result."""
+        if type(result) is not ColumnConversionResult:
+            return False
+        if result.status is not ConversionStatus.SAFE:
+            return False
+        if result.failed_count != 0 or result.diagnostics:
+            return False
+
+        converted = result.converted_series
+        expected_dtypes = {
+            "int64": "int64",
+            "float64": "float64",
+            "bool": "bool",
+            "object": "object",
+        }
+        expected_dtype = expected_dtypes.get(result.target_dtype)
+        if expected_dtype is None:
+            return False
+
+        return (
+            type(converted) is pd.Series
+            and result.total_count == len(source_series)
+            and len(converted) == len(source_series)
+            and converted.index.equals(source_series.index)
+            and converted.name == source_series.name
+            and str(converted.dtype) == expected_dtype
+        )
 
     def _compute_risk(
         self,
@@ -50,12 +178,11 @@ class AegisSurgeon:
 
             if ratio < 0.01:
                 return "LOW_RISK"
-            elif ratio < 0.10:
+            if ratio < 0.10:
                 return "MEDIUM_RISK"
-            elif ratio < 0.50:
+            if ratio < 0.50:
                 return "HIGH_RISK"
-            else:
-                return "CRITICAL_RISK"
+            return "CRITICAL_RISK"
 
         if integrity_status == "DATA_GAIN_EVENT":
             return "MEDIUM_RISK"
@@ -80,69 +207,144 @@ class AegisSurgeon:
             raise ValueError("Execution mode not allowed.")
 
         original_row_count = len(target_dataset)
-        working_df = target_dataset.copy() if execution_mode == "sandbox" else target_dataset
+        working_df = (
+            target_dataset.copy(deep=True)
+            if execution_mode == "sandbox"
+            else target_dataset
+        )
 
         applied = False
         validation_success = False
         validation_message = "No operation performed."
+        conversion_outcome = None
+        rollback_df = working_df.copy(deep=True)
 
         try:
             action = repair_plan.proposed_action
 
-            if action.startswith("RENAME_COLUMN"):
+            if type(action) is str and action.startswith("RENAME_COLUMN"):
                 parts = action.split()
-                old_col = parts[1]
-                new_col = parts[3]
+                if len(parts) == 4 and parts[2] == "->":
+                    old_col = parts[1]
+                    new_col = parts[3]
 
-                if old_col in working_df.columns:
-                    working_df.rename(columns={old_col: new_col}, inplace=True)
-                    applied = True
+                    if old_col in working_df.columns:
+                        working_df.rename(
+                            columns={old_col: new_col},
+                            inplace=True,
+                        )
+                        applied = True
+                    else:
+                        validation_message = (
+                            f"Rename source column not found: {old_col}."
+                        )
+                else:
+                    validation_message = "Invalid RENAME_COLUMN action."
 
-            elif action.startswith("CAST_COLUMN"):
-                parts = action.split()
-                column = parts[1]
-                target_type = parts[3]
-                drop_invalid = "WITH_DROP_INVALID" in action
+            elif type(action) is str and action.startswith("CAST_COLUMN"):
+                cast_action = self._parse_cast_action(action)
 
-                if column in working_df.columns:
-                    failed_rows, failed_values = self._safe_cast_diagnostics(
-                        working_df[column], target_type
+                if cast_action is None:
+                    validation_message = "Invalid CAST_COLUMN action."
+                elif execution_mode != "sandbox":
+                    # Explicit defence in depth: the live API already blocks
+                    # CAST_COLUMN tickets, but Surgeon itself must enforce the
+                    # Phase 3.1.3 boundary too.
+                    validation_message = self._LIVE_CAST_BLOCK_MESSAGE
+                elif cast_action.drop_invalid_requested:
+                    validation_message = self._DROP_INVALID_BLOCK_MESSAGE
+                elif cast_action.column not in working_df.columns:
+                    validation_message = (
+                        f"Cast source column not found: {cast_action.column}."
+                    )
+                else:
+                    conversion_result = analyze_and_convert(
+                        working_df[cast_action.column],
+                        cast_action.target_dtype,
+                    )
+                    conversion_outcome = self._conversion_metadata(
+                        cast_action.column,
+                        conversion_result,
+                    )
+                    validation_message = self._conversion_summary(
+                        cast_action.column,
+                        conversion_result,
                     )
 
-                    if failed_rows and not drop_invalid:
-                        validation_message = (
-                            f"Unsafe cast detected. "
-                            f"{len(failed_rows)} invalid values found. "
-                            f"Rows: {failed_rows}. "
-                            f"Values: {failed_values}"
-                        )
-                        applied = False
-                    else:
-                        if failed_rows and drop_invalid:
-                            working_df = working_df.drop(index=failed_rows)
-
-                        working_df[column] = working_df[column].astype(target_type)
-                        applied = True
-
-                        if failed_rows and drop_invalid:
+                    if conversion_result.status == ConversionStatus.SAFE:
+                        source_series = working_df[cast_action.column]
+                        if not self._safe_conversion_is_applicable(
+                            source_series,
+                            conversion_result,
+                        ):
                             validation_message = (
-                                f"Dropped {len(failed_rows)} invalid rows before cast."
+                                "Execution error: invalid SAFE conversion result."
                             )
+                            applied = False
+                        else:
+                            # Apply only after the complete series has passed.
+                            # Use a second candidate copy so an unexpected pandas
+                            # assignment failure cannot partially alter the current
+                            # working dataset.
+                            candidate_df = working_df.copy(deep=True)
+                            candidate_df[cast_action.column] = (
+                                conversion_result.converted_series.copy(deep=True)
+                            )
+                            working_df = candidate_df
+                            applied = True
+                    else:
+                        # Atomic rejection: no converted series exists for a
+                        # non-SAFE result, and the working copy remains exactly
+                        # as it was before analysis.
+                        applied = False
+
+            else:
+                validation_message = "Unsupported repair action."
 
             if applied:
-                validation_success = list(working_df.columns) == list(gold_schema.column_order)
+                # Phase 3.1.3 deliberately retains the existing Surgeon
+                # post-operation schema check. It validates column names/order;
+                # broader complete-schema validation remains at the existing
+                # API/live gates.
+                validation_success = (
+                    list(working_df.columns)
+                    == list(gold_schema.column_order)
+                )
 
-                if validation_success and validation_message == "No operation performed.":
+                if conversion_outcome is not None:
+                    if validation_success:
+                        validation_message = (
+                            f"{validation_message} Schema matches gold."
+                        )
+                    else:
+                        validation_message = (
+                            f"{validation_message} "
+                            "Operation applied but schema mismatch."
+                        )
+                elif (
+                    validation_success
+                    and validation_message == "No operation performed."
+                ):
                     validation_message = "Schema matches gold."
                 elif not validation_success:
-                    validation_message = "Operation applied but schema mismatch."
-
+                    validation_message = (
+                        "Operation applied but schema mismatch."
+                    )
             else:
                 validation_success = False
 
-        except Exception as e:
+        except Exception as exc:
+            # Sandbox execution is all-or-nothing even when an unexpected
+            # exception occurs after a candidate transformation was built.
+            # Restore the pristine sandbox snapshot before producing the
+            # manifest. Live CAST_COLUMN never reaches mutation in this stage;
+            # legacy live RENAME_COLUMN behavior remains unchanged.
+            if execution_mode == "sandbox":
+                working_df = rollback_df
             validation_success = False
-            validation_message = f"Execution error: {str(e)}"
+            validation_message = (
+                f"Execution error: {type(exc).__name__}."
+            )
             applied = False
 
         final_row_count = len(working_df)
@@ -171,22 +373,29 @@ class AegisSurgeon:
             integrity_status,
         )
 
+        component_versions = {
+            "inspector": "1.0",
+            "consultant": "1.2",
+            "surgeon": self._SURGEON_VERSION,
+        }
+        if conversion_outcome is not None:
+            component_versions["type_repair"] = (
+                conversion_outcome.policy_version
+            )
+
         manifest = HealingManifest(
             timestamp=datetime.now(UTC).isoformat(),
             repair_plan=repair_plan,
             execution_result=execution_result,
             execution_mode=execution_mode,
             operator=operator,
-            component_versions={
-                "inspector": "1.0",
-                "consultant": "1.2",
-                "surgeon": "1.7",
-            },
+            component_versions=component_versions,
             original_row_count=original_row_count,
             final_row_count=final_row_count,
             integrity_status=integrity_status,
             risk_level=risk_level,
-            corrected_dataset=working_df.copy(),
+            corrected_dataset=working_df.copy(deep=True),
+            conversion_outcome=conversion_outcome,
         )
 
         return execution_result, manifest
