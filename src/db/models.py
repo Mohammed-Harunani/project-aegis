@@ -82,7 +82,7 @@ class ApprovalTicketRecord(Base):
 
     # Phase 3.1.4 -- redacted verified CAST_COLUMN preflight decision.
     # None for RENAME_COLUMN tickets and all pre-Phase-3.1.4 rows.
-    conversion_decision = Column(JSONB, nullable=True)
+    conversion_decision = Column(JSONB(none_as_null=True), nullable=True)
 
 
 class HealingManifestRecord(Base):
@@ -141,7 +141,7 @@ class HealingManifestRecord(Base):
 
     # Phase 3.1.4 -- persisted redacted CAST_COLUMN execution outcome.
     # The corrected DataFrame itself remains ephemeral and is never stored.
-    conversion_outcome = Column(JSONB, nullable=True)
+    conversion_outcome = Column(JSONB(none_as_null=True), nullable=True)
 
 
 class GoldSchemaRecord(Base):
