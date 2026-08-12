@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
 import pandas as pd
 
@@ -11,6 +11,11 @@ from src.governance.conversion_safety import (
     parse_cast_action,
 )
 from src.governance.manifest import ConversionOutcomeMetadata, HealingManifest
+from src.live_execution.cast_allowlist import (
+    LiveCastAllowlistError,
+    LiveCastPair,
+    require_live_cast_pair_allowed,
+)
 from src.type_repair import (
     ColumnConversionResult,
     ConversionStatus,
@@ -35,17 +40,13 @@ class AegisSurgeon:
     Applies an explicitly approved repair plan to a controlled working
     dataset.
 
-    Phase 3.1.4 retains the verified CAST_COLUMN path: sandbox casts now delegate to the
-    verified type-repair engine, destructive WITH_DROP_INVALID plans are
-    refused, and live casts remain blocked. RENAME_COLUMN behavior is kept
-    unchanged.
+    Phase 3.1.6 retains the verified sandbox CAST_COLUMN path and permits a
+    live cast only when its trusted logical source-target pair is explicitly
+    allowlisted by the caller. Destructive WITH_DROP_INVALID plans remain
+    refused. RENAME_COLUMN behavior is unchanged.
     """
 
-    _SURGEON_VERSION = "1.9"
-    _LIVE_CAST_BLOCK_MESSAGE = (
-        "Verified CAST_COLUMN execution is sandbox-only; live casting "
-        "remains blocked until Phase 3.1.6."
-    )
+    _SURGEON_VERSION = "2.0"
     _DROP_INVALID_BLOCK_MESSAGE = (
         "WITH_DROP_INVALID is forbidden by the verified type-repair "
         "contract; row-dropping is not a type conversion."
@@ -160,6 +161,7 @@ class AegisSurgeon:
         operator: str,
         execution_mode: str = "sandbox",
         allowed_modes=None,
+        allowed_live_cast_pairs: Optional[Iterable[LiveCastPair]] = None,
     ) -> Tuple[ExecutionResult, HealingManifest]:
 
         if allowed_modes is None:
@@ -208,11 +210,6 @@ class AegisSurgeon:
 
                 if cast_action is None:
                     validation_message = "Invalid CAST_COLUMN action."
-                elif execution_mode != "sandbox":
-                    # Explicit defence in depth: the live API already blocks
-                    # CAST_COLUMN tickets, but Surgeon itself must enforce the
-                    # Phase 3.1.3 boundary too.
-                    validation_message = self._LIVE_CAST_BLOCK_MESSAGE
                 elif cast_action.drop_invalid_requested:
                     validation_message = self._DROP_INVALID_BLOCK_MESSAGE
                 elif cast_action.column not in working_df.columns:
@@ -220,45 +217,62 @@ class AegisSurgeon:
                         f"Cast source column not found: {cast_action.column}."
                     )
                 else:
-                    conversion_result = analyze_and_convert(
-                        working_df[cast_action.column],
-                        cast_action.target_dtype,
-                    )
-                    conversion_outcome = self._conversion_metadata(
-                        cast_action.column,
-                        conversion_result,
-                    )
-                    validation_message = self._conversion_summary(
-                        cast_action.column,
-                        conversion_result,
-                    )
+                    conversion_result = None
+                    live_pair_allowed = True
+                    if execution_mode == "live":
+                        try:
+                            require_live_cast_pair_allowed(
+                                repair_plan,
+                                observed_schema,
+                                allowed_live_cast_pairs,
+                            )
+                        except LiveCastAllowlistError as exc:
+                            validation_message = str(exc)
+                            live_pair_allowed = False
+                    if live_pair_allowed:
+                        conversion_result = analyze_and_convert(
+                            working_df[cast_action.column],
+                            cast_action.target_dtype,
+                        )
 
-                    if conversion_result.status == ConversionStatus.SAFE:
-                        source_series = working_df[cast_action.column]
-                        if not self._safe_conversion_is_applicable(
-                            source_series,
-                            conversion_result,
-                        ):
-                            validation_message = (
-                                "Execution error: invalid SAFE conversion result."
-                            )
-                            applied = False
-                        else:
-                            # Apply only after the complete series has passed.
-                            # Use a second candidate copy so an unexpected pandas
-                            # assignment failure cannot partially alter the current
-                            # working dataset.
-                            candidate_df = working_df.copy(deep=True)
-                            candidate_df[cast_action.column] = (
-                                conversion_result.converted_series.copy(deep=True)
-                            )
-                            working_df = candidate_df
-                            applied = True
-                    else:
-                        # Atomic rejection: no converted series exists for a
-                        # non-SAFE result, and the working copy remains exactly
-                        # as it was before analysis.
+                    if conversion_result is None:
                         applied = False
+                    else:
+                        conversion_outcome = self._conversion_metadata(
+                            cast_action.column,
+                            conversion_result,
+                        )
+                        validation_message = self._conversion_summary(
+                            cast_action.column,
+                            conversion_result,
+                        )
+
+                        if conversion_result.status == ConversionStatus.SAFE:
+                            source_series = working_df[cast_action.column]
+                            if not self._safe_conversion_is_applicable(
+                                source_series,
+                                conversion_result,
+                            ):
+                                validation_message = (
+                                    "Execution error: invalid SAFE conversion result."
+                                )
+                                applied = False
+                            else:
+                                # Apply only after the complete series has passed.
+                                # Use a second candidate copy so an unexpected pandas
+                                # assignment failure cannot partially alter the current
+                                # working dataset.
+                                candidate_df = working_df.copy(deep=True)
+                                candidate_df[cast_action.column] = (
+                                    conversion_result.converted_series.copy(deep=True)
+                                )
+                                working_df = candidate_df
+                                applied = True
+                        else:
+                            # Atomic rejection: no converted series exists for a
+                            # non-SAFE result, and the working copy remains exactly
+                            # as it was before analysis.
+                            applied = False
 
             else:
                 validation_message = "Unsupported repair action."

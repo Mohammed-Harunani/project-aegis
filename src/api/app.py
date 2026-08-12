@@ -25,6 +25,7 @@ from src.governance.conversion_safety import (
 )
 from src.db.session import get_db
 from src.db.models import HealingManifestRecord
+from src.governance.manifest import ConversionOutcomeMetadata
 from src.db.live_session import get_live_engine
 from src.db.source_session import get_source_engine
 from src.registry.schema_definition import (
@@ -72,6 +73,11 @@ from src.live_execution.source_connector import (
 from src.live_execution.logical_dtype import (
     is_publishable_dtype,
     get_publishable_dtypes,
+)
+from src.live_execution.cast_allowlist import (
+    LiveCastAllowlistError,
+    configured_live_cast_allowlist,
+    require_live_cast_pair_allowed,
 )
 
 
@@ -510,47 +516,27 @@ def simulate_migration_from_source(
             "message": "No repair plan survived governance review; all candidates quarantined.",
         }
 
-    # Confirmed directly, twice: first that Surgeon's CAST_COLUMN
-    # cannot even attempt a cast to Aegis's own extended logical
-    # dtypes (pandas has no native equivalent, so every value fails);
-    # then, more seriously, that Surgeon's cast mechanism only checks
-    # whether astype() RAISES, never whether the result actually
-    # preserves the original value -- so even fully-supported,
-    # pandas-native casts can silently corrupt data while still
-    # reporting applied=True, LOW_RISK, and passing the completeness
-    # gate. Verified directly: float64->int64 truncates (1.9 -> 1),
-    # object->bool has surprising string-truthiness semantics ("false"
-    # and "0" both become True, since they're non-empty strings, not
-    # parsed for meaning), and int64->float64 silently loses precision
-    # for integers beyond 2^53. None of this is specific to Aegis's
-    # own extended dtypes -- it's a fundamental property of blind
-    # astype() calls, so restricting only the extended-dtype targets
-    # (an earlier, narrower version of this check) was not enough.
-    #
-    # For the live-capable path, Phase 2.5 supports RENAME_COLUMN
-    # only -- a rename never touches values at all, only metadata, so
-    # it carries none of this risk. CAST_COLUMN remains available for
-    # sandbox-only analysis via /simulate-migration; verified,
-    # pair-specific lossless cast converters (checking that a value
-    # round-trips exactly, not just that astype() didn't raise) belong
-    # in a later, dedicated phase, not bolted on here under time
-    # pressure with no way to verify them against a real database.
-    if selected_plan.proposed_action.startswith("CAST_COLUMN"):
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                f"The proposed repair ({selected_plan.proposed_action!r}) is a "
-                f"CAST_COLUMN, which is not supported on the live-capable source "
-                f"path -- confirmed that Surgeon's cast mechanism only checks "
-                f"whether astype() raises, not whether the result actually "
-                f"preserves the original value, so even a fully-supported cast "
-                f"(e.g. float64 to int64, or object to bool) can silently corrupt "
-                f"data while still reporting success. Only RENAME_COLUMN is "
-                f"supported for live execution; a column that needs an actual "
-                f"type correction should be corrected at the source, or analyzed "
-                f"via the sandbox-only /simulate-migration endpoint."
-            ),
-        )
+    conversion_decision = None
+    live_cast_pair = None
+    if is_cast_action(selected_plan.proposed_action):
+        try:
+            conversion_decision = analyze_cast_plan(selected_plan, df_observed)
+            if not conversion_decision.is_safe:
+                raise ConversionApprovalBlockedError(
+                    f"Verified conversion decision is {conversion_decision.status}, not SAFE."
+                )
+            live_cast_pair = require_live_cast_pair_allowed(
+                selected_plan,
+                observed_schema_obj,
+            )
+        except (ConversionGovernanceError, LiveCastAllowlistError) as e:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Source-backed CAST_COLUMN is not live-eligible. "
+                    f"{e}"
+                ),
+            )
 
     # Live-capable simulation always goes through human approval,
     # regardless of confidence -- not just as an extra safety margin
@@ -574,6 +560,7 @@ def simulate_migration_from_source(
         source_schema_fingerprint=source_read["schema_fingerprint"],
         source_dataset_fingerprint=source_read["dataset_fingerprint"],
         live_eligible=True,
+        conversion_decision=conversion_decision,
     )
     return {
         "schema_delta": str(delta),
@@ -587,6 +574,10 @@ def simulate_migration_from_source(
         "status": "PENDING_APPROVAL",
         "ticket_id": ticket.ticket_id,
         "live_eligible": True,
+        "conversion_decision": _public_conversion_metadata(
+            ticket.conversion_decision
+        ),
+        "live_cast_pair": live_cast_pair.token if live_cast_pair else None,
         "message": (
             f"Repair requires human approval before execution. "
             f"POST /approvals/{ticket.ticket_id}/approve to proceed, "
@@ -969,14 +960,28 @@ def execute_live(
             detail="Ticket has no recorded approval identity or timestamp -- refusing to execute live.",
         )
 
-    if is_cast_action(ticket.repair_plan.proposed_action) or ticket.conversion_decision is not None:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "Verified CAST_COLUMN remains blocked from live execution until "
-                "Phase 3.1.6 controlled allowlist enablement."
-            ),
-        )
+    is_live_cast = is_cast_action(ticket.repair_plan.proposed_action)
+    allowed_live_cast_pairs = frozenset()
+    live_cast_pair = None
+    try:
+        if is_live_cast:
+            allowed_live_cast_pairs = configured_live_cast_allowlist()
+            require_safe_conversion_decision(
+                ticket.repair_plan,
+                ticket.target_dataset,
+                ticket.conversion_decision,
+            )
+            live_cast_pair = require_live_cast_pair_allowed(
+                ticket.repair_plan,
+                ticket.observed_schema,
+                allowed_live_cast_pairs,
+            )
+        elif ticket.conversion_decision is not None:
+            raise ConversionApprovalBlockedError(
+                "Non-CAST live ticket unexpectedly carries conversion metadata."
+            )
+    except (ConversionGovernanceError, LiveCastAllowlistError) as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     manifest_record = (
         db.query(HealingManifestRecord)
@@ -997,13 +1002,34 @@ def execute_live(
             status_code=422,
             detail=f"Sandbox manifest has unexpected execution_mode {manifest_record.execution_mode!r}.",
         )
-    if manifest_record.conversion_outcome is not None:
+    sandbox_conversion_outcome = None
+    if is_live_cast:
+        if manifest_record.conversion_outcome is None:
+            raise HTTPException(
+                status_code=422,
+                detail="Sandbox manifest has no verified CAST_COLUMN outcome.",
+            )
+        try:
+            sandbox_conversion_outcome = ConversionOutcomeMetadata.from_dict(
+                manifest_record.conversion_outcome
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Sandbox CAST_COLUMN outcome is invalid: {e}",
+            )
+        if sandbox_conversion_outcome != ticket.conversion_decision:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Sandbox CAST_COLUMN outcome does not match the approved "
+                    "conversion decision."
+                ),
+            )
+    elif manifest_record.conversion_outcome is not None:
         raise HTTPException(
             status_code=422,
-            detail=(
-                "Sandbox manifest contains a CAST_COLUMN conversion outcome, "
-                "which is not live-enabled in Phase 3.1.4."
-            ),
+            detail="Non-CAST sandbox manifest unexpectedly carries conversion metadata.",
         )
     if str(manifest_record.schema_version_id) != str(ticket.schema_version_id):
         raise HTTPException(
@@ -1119,7 +1145,33 @@ def execute_live(
                     operator=request.operator,
                     execution_mode="live",
                     allowed_modes=["sandbox", "live"],
+                    allowed_live_cast_pairs=allowed_live_cast_pairs,
                 )
+
+                if not live_execution_result.applied or not live_execution_result.validation.success:
+                    raise LiveExecutionNotAllowedError(
+                        "Fresh live Surgeon execution did not produce a successful repair. "
+                        f"{live_execution_result.validation.message}"
+                    )
+
+                if is_live_cast:
+                    if _live_manifest.conversion_outcome is None:
+                        raise LiveExecutionNotAllowedError(
+                            "Fresh live CAST_COLUMN execution produced no conversion outcome."
+                        )
+                    if _live_manifest.conversion_outcome != ticket.conversion_decision:
+                        raise LiveExecutionNotAllowedError(
+                            "Fresh live CAST_COLUMN outcome does not match the approved decision."
+                        )
+                    if _live_manifest.conversion_outcome != sandbox_conversion_outcome:
+                        raise LiveExecutionNotAllowedError(
+                            "Fresh live CAST_COLUMN outcome does not match the sandbox manifest."
+                        )
+
+                # For CAST_COLUMN, Surgeon applies to a candidate copy and returns
+                # the verified corrected dataset in its manifest. For RENAME_COLUMN
+                # the same assignment is equivalent to the legacy in-place result.
+                working_copy = _live_manifest.corrected_dataset
 
                 # Surgeon's own validation only checks column name/
                 # order against Gold -- it can pass even when a SECOND
@@ -1127,11 +1179,8 @@ def execute_live(
                 # RepairSelector only ever picks one of the repairs
                 # Consultant proposed. Require a completely empty
                 # delta before anything gets published. repair_applied
-                # is now defensive rather than an active concern here
-                # specifically -- live-eligible tickets can only ever
-                # carry a RENAME_COLUMN repair (CAST_COLUMN is rejected
-                # at simulation time), but passing it through keeps
-                # this consistent with the same check at approval time.
+                # records the fresh Surgeon result for both legacy live
+                # RENAME_COLUMN and explicitly allowlisted live CAST_COLUMN.
                 verify_complete_schema_match(
                     working_copy, ticket.observed_schema, ticket.repair_plan.proposed_action,
                     ticket.gold_schema, repair_applied=live_execution_result.applied,
@@ -1233,6 +1282,7 @@ def execute_live(
                         "physical_table": physical_table,
                         "previous_physical_table": previous_physical_table,
                         "final_row_count": manifest_record.final_row_count,
+                        "live_cast_pair": live_cast_pair.token if live_cast_pair else None,
                         "note": (
                             "The original response to this request was lost, but "
                             "the target-side marker confirms the publication "
@@ -1302,6 +1352,7 @@ def execute_live(
                 "physical_table": result["physical_table"],
                 "previous_physical_table": result["previous_physical_table"],
                 "final_row_count": result["final_row_count"],
+                "live_cast_pair": live_cast_pair.token if live_cast_pair else None,
             }
     except TargetLockUnavailableError as e:
         # Raised entering hold_target_lock() itself, before

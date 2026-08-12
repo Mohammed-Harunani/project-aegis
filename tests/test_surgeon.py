@@ -8,6 +8,7 @@ import pytest
 from consultant.consultant import AegisConsultant, RepairPlan
 from inspector import AegisInspector
 from surgeon.surgeon import AegisSurgeon
+from src.live_execution.cast_allowlist import LiveCastPair
 from type_repair import (
     ColumnConversionResult,
     ConversionDiagnostic,
@@ -35,6 +36,7 @@ def _execute(
     *,
     execution_mode: str = "sandbox",
     allowed_modes=None,
+    allowed_live_cast_pairs=None,
 ):
     return AegisSurgeon().execute(
         repair_plan=_plan(action),
@@ -44,6 +46,7 @@ def _execute(
         operator="test_user",
         execution_mode=execution_mode,
         allowed_modes=allowed_modes,
+        allowed_live_cast_pairs=allowed_live_cast_pairs,
     )
 
 
@@ -81,7 +84,7 @@ def test_surgeon_emits_healing_manifest_for_rename_unchanged():
     assert manifest.operator == "test_user"
     assert manifest.component_versions["inspector"] == "1.0"
     assert manifest.component_versions["consultant"] == "1.2"
-    assert manifest.component_versions["surgeon"] == "1.9"
+    assert manifest.component_versions["surgeon"] == "2.0"
     assert "type_repair" not in manifest.component_versions
     assert manifest.conversion_outcome is None
     assert list(manifest.corrected_dataset.columns) == ["old_name"]
@@ -247,7 +250,7 @@ def test_with_drop_invalid_is_forbidden_and_never_calls_converter():
     pd.testing.assert_frame_equal(manifest.corrected_dataset, original)
 
 
-def test_live_cast_is_blocked_inside_surgeon_even_when_live_mode_is_allowed():
+def test_live_cast_is_blocked_inside_surgeon_when_allowlist_is_empty():
     source = pd.DataFrame({"amount": pd.Series(["1"], dtype=object)})
     original = source.copy(deep=True)
     gold = pd.DataFrame({"amount": pd.Series([1], dtype="int64")})
@@ -258,13 +261,62 @@ def test_live_cast_is_blocked_inside_surgeon_even_when_live_mode_is_allowed():
         "CAST_COLUMN amount TO int64",
         execution_mode="live",
         allowed_modes=["sandbox", "live"],
+        allowed_live_cast_pairs=frozenset(),
     )
 
     assert result.applied is False
     assert result.validation.success is False
-    assert "live casting remains blocked until Phase 3.1.6" in result.validation.message
+    assert "object->int64" in result.validation.message
+    assert "not explicitly allowlisted" in result.validation.message
     assert manifest.conversion_outcome is None
     pd.testing.assert_frame_equal(source, original)
+
+
+def test_allowlisted_safe_live_cast_returns_verified_corrected_manifest():
+    source = pd.DataFrame({"amount": pd.Series(["1", "2", "-3"], dtype=object)})
+    original = source.copy(deep=True)
+    gold = pd.DataFrame({"amount": pd.Series([1, 2, -3], dtype="int64")})
+
+    result, manifest = _execute(
+        source,
+        gold,
+        "CAST_COLUMN amount TO int64",
+        execution_mode="live",
+        allowed_modes=["sandbox", "live"],
+        allowed_live_cast_pairs={LiveCastPair("object", "int64")},
+    )
+
+    assert result.applied is True
+    assert result.validation.success is True
+    assert manifest.conversion_outcome.status == "SAFE"
+    assert manifest.conversion_outcome.failed_count == 0
+    assert manifest.corrected_dataset["amount"].tolist() == [1, 2, -3]
+    assert str(manifest.corrected_dataset["amount"].dtype) == "int64"
+    # Candidate-copy semantics prevent a partial mutation of the caller-owned
+    # source frame; the API publishes only manifest.corrected_dataset.
+    pd.testing.assert_frame_equal(source, original)
+
+
+def test_allowlisted_but_unsafe_live_cast_remains_atomic_and_unapplied():
+    source = pd.DataFrame({"amount": pd.Series(["1", "bad"], dtype=object)})
+    original = source.copy(deep=True)
+    gold = pd.DataFrame({"amount": pd.Series([1, 2], dtype="int64")})
+
+    result, manifest = _execute(
+        source,
+        gold,
+        "CAST_COLUMN amount TO int64",
+        execution_mode="live",
+        allowed_modes=["sandbox", "live"],
+        allowed_live_cast_pairs={LiveCastPair("object", "int64")},
+    )
+
+    assert result.applied is False
+    assert result.validation.success is False
+    assert manifest.conversion_outcome.status == "UNSAFE"
+    assert manifest.conversion_outcome.reason_codes == ("PARSE_ERROR",)
+    pd.testing.assert_frame_equal(source, original)
+    pd.testing.assert_frame_equal(manifest.corrected_dataset, original)
 
 
 def test_live_rename_behavior_remains_available_and_unchanged():

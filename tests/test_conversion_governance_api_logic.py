@@ -1,4 +1,4 @@
-"""Database-free API orchestration tests for Phase 3.1.4 governance."""
+"""Database-free API orchestration tests for Phase 3.1 governance."""
 
 import os
 from datetime import UTC, datetime
@@ -235,8 +235,14 @@ def test_approve_stale_safe_decision_is_blocked(monkeypatch):
     assert db.commit_calls == 0
 
 
-def test_live_cast_remains_blocked_before_manifest_or_database_work(monkeypatch):
-    df = pd.DataFrame({"amount": ["1", "2", "-3"]})
+def test_live_cast_with_empty_allowlist_stops_before_manifest_or_database_work(monkeypatch):
+    # This synthetic ticket models PostgreSQL TEXT, whose trusted Aegis logical
+    # dtype is ``object``.  Keep the fixture explicit because pandas 3.0 may
+    # infer its native ``str`` dtype for an untyped string Series; production
+    # source-backed simulation resolves the dtype from PostgreSQL metadata.
+    df = pd.DataFrame(
+        {"amount": pd.Series(["1", "2", "-3"], dtype=object)}
+    )
     plan = RepairPlan("CAST_COLUMN amount TO int64", 0.85, "cast")
     safe = analyze_cast_plan(plan, df)
     ticket = _approved_cast_ticket(df, safe)
@@ -250,10 +256,11 @@ def test_live_cast_remains_blocked_before_manifest_or_database_work(monkeypatch)
 
     monkeypatch.setattr(api_module, "PostgresApprovalRepository", Repo)
     monkeypatch.setattr(api_module, "live_execution_globally_enabled", lambda: True)
+    monkeypatch.setenv("AEGIS_LIVE_CAST_ALLOWLIST", "")
 
     class QueryMustNotRunDB(FakeDB):
         def query(self, *args, **kwargs):
-            raise AssertionError("live CAST_COLUMN must stop before manifest query")
+            raise AssertionError("non-allowlisted live CAST_COLUMN must stop before manifest query")
 
     with pytest.raises(HTTPException) as exc:
         api_module.execute_live(
@@ -269,4 +276,5 @@ def test_live_cast_remains_blocked_before_manifest_or_database_work(monkeypatch)
         )
 
     assert exc.value.status_code == 422
-    assert "Phase 3.1.6" in exc.value.detail
+    assert "object->int64" in exc.value.detail
+    assert "not explicitly allowlisted" in exc.value.detail
