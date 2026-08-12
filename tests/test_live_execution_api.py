@@ -99,6 +99,7 @@ def teardown_module(_module):
 
 def setup_function(_):
     os.environ["AEGIS_LIVE_EXECUTION_ENABLED"] = "true"
+    os.environ["AEGIS_LIVE_CAST_ALLOWLIST"] = ""
     with engine.begin() as conn:
         conn.execute(LiveExecutionRecord.__table__.delete())
         conn.execute(HealingManifestRecord.__table__.delete())
@@ -111,6 +112,7 @@ def setup_function(_):
     with source_engine.begin() as conn:
         conn.execute(text("DROP TABLE IF EXISTS customers"))
         conn.execute(text("DROP TABLE IF EXISTS customers_no_pk"))
+        conn.execute(text("DROP TABLE IF EXISTS orders_cast"))
 
 
 def _create_source_table(rows=((1, "alice"), (2, "bob"), (3, "carol"))):
@@ -172,6 +174,198 @@ def _view_rows(logical_target, order_col="customer_id"):
             f'SELECT * FROM "{AEGIS_PUBLISH_SCHEMA}"."{logical_target}" ORDER BY "{order_col}"'
         )).fetchall()
     return rows
+
+
+def _create_cast_source_table(rows=((1, "10"), (2, "20"), (3, "-30"))):
+    with source_engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS orders_cast"))
+        conn.execute(text(
+            "CREATE TABLE orders_cast (id BIGINT PRIMARY KEY, amount TEXT)"
+        ))
+        for pk, amount in rows:
+            conn.execute(
+                text("INSERT INTO orders_cast VALUES (:pk, :amount)"),
+                {"pk": pk, "amount": amount},
+            )
+
+
+def _register_cast_schema(schema_name="orders_cast_schema"):
+    response = client.post(f"/schemas/{schema_name}/versions", json={
+        "format_version": 1,
+        "created_by": "mo",
+        "columns": [
+            {"name": "id", "dtype": "int64"},
+            {"name": "amount", "dtype": "int64"},
+        ],
+    })
+    assert response.status_code == 200, response.text
+    return schema_name
+
+
+def _submit_cast_ticket(schema_name=None, rows=None):
+    os.environ["AEGIS_LIVE_CAST_ALLOWLIST"] = "object->int64"
+    schema_name = _register_cast_schema(schema_name or "orders_cast_schema")
+    _create_cast_source_table(rows=rows) if rows else _create_cast_source_table()
+    response = client.post("/simulate-migration-from-source", json={
+        "schema_name": schema_name,
+        "source_schema": "public",
+        "source_table": "orders_cast",
+    })
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["live_cast_pair"] == "object->int64"
+    assert body["conversion_decision"]["status"] == "SAFE"
+    return body
+
+
+def _submit_and_approve_cast_ticket(schema_name=None, rows=None):
+    submit = _submit_cast_ticket(schema_name=schema_name, rows=rows)
+    approval = client.post(
+        f"/approvals/{submit['ticket_id']}/approve",
+        json={"operator": "mo"},
+    )
+    assert approval.status_code == 200, approval.text
+    assert approval.json()["conversion_outcome"] == submit["conversion_decision"]
+    return submit["ticket_id"], submit["schema_version_id"]
+
+
+def _cast_view_rows(logical_target):
+    return _view_rows(logical_target, order_col="id")
+
+
+# ---- Phase 3.1.6 controlled live CAST_COLUMN ----
+
+def test_safe_source_cast_is_rejected_when_live_allowlist_is_empty():
+    _register_cast_schema("orders_cast_empty_allowlist")
+    _create_cast_source_table()
+
+    response = client.post("/simulate-migration-from-source", json={
+        "schema_name": "orders_cast_empty_allowlist",
+        "source_schema": "public",
+        "source_table": "orders_cast",
+    })
+
+    assert response.status_code == 422
+    assert "object->int64" in response.json()["detail"]
+    assert "not explicitly allowlisted" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        assert db.query(ApprovalTicketRecord).count() == 0
+
+
+def test_allowlisted_source_cast_persists_safe_decision_and_matching_manifest():
+    submit = _submit_cast_ticket("orders_cast_approval")
+    ticket_id = submit["ticket_id"]
+
+    approval = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo"},
+    )
+    assert approval.status_code == 200, approval.text
+    body = approval.json()
+    assert body["conversion_decision"] == submit["conversion_decision"]
+    assert body["conversion_outcome"] == submit["conversion_decision"]
+
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(ticket_id)
+        ).one()
+        manifest = db.query(HealingManifestRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(ticket_id)
+        ).one()
+        assert ticket.conversion_decision["status"] == "SAFE"
+        assert manifest.conversion_outcome == ticket.conversion_decision
+        assert manifest.final_row_count == manifest.original_row_count == 3
+
+
+def test_allowlisted_live_cast_publishes_verified_converted_values():
+    ticket_id, _ = _submit_and_approve_cast_ticket("orders_cast_publish")
+
+    response = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("orders_cast_target"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "COMPLETED"
+    assert _cast_view_rows("orders_cast_target") == [
+        (1, 10),
+        (2, 20),
+        (3, -30),
+    ]
+
+    with live_target_engine.connect() as conn:
+        dtype = conn.execute(text(
+            "SELECT data_type FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = :table "
+            "AND column_name = 'amount'"
+        ), {
+            "schema": AEGIS_PUBLISH_DATA_SCHEMA,
+            "table": body["physical_table"],
+        }).scalar_one()
+        assert dtype == "bigint"
+
+
+def test_removing_cast_pair_after_approval_revokes_live_execution():
+    ticket_id, _ = _submit_and_approve_cast_ticket("orders_cast_revoke")
+    os.environ["AEGIS_LIVE_CAST_ALLOWLIST"] = ""
+
+    response = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("orders_cast_revoked_target"),
+    )
+    assert response.status_code == 422
+    assert "not explicitly allowlisted" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        assert db.query(LiveExecutionRecord).count() == 0
+
+
+def test_live_cast_republish_and_rollback_preserve_immutable_versions():
+    first_ticket, _ = _submit_and_approve_cast_ticket("orders_cast_versions")
+    first = client.post(
+        f"/approvals/{first_ticket}/execute-live",
+        json=_execute_live_body("orders_cast_versioned"),
+    )
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+
+    second_ticket, _ = _submit_and_approve_cast_ticket(
+        "orders_cast_versions_2",
+        rows=((1, "100"), (2, "200"), (3, "300")),
+    )
+    second = client.post(
+        f"/approvals/{second_ticket}/execute-live",
+        json=_execute_live_body("orders_cast_versioned"),
+    )
+    assert second.status_code == 200, second.text
+    second_body = second.json()
+    assert second_body["previous_physical_table"] == first_body["physical_table"]
+    assert _cast_view_rows("orders_cast_versioned") == [
+        (1, 100), (2, 200), (3, 300)
+    ]
+
+    rollback = client.post(
+        f"/live-executions/{second_body['live_execution_id']}/rollback",
+        json={"operator": "mo"},
+    )
+    assert rollback.status_code == 200, rollback.text
+    assert rollback.json()["status"] == "ROLLED_BACK"
+    assert _cast_view_rows("orders_cast_versioned") == [
+        (1, 10), (2, 20), (3, -30)
+    ]
+
+    with live_target_engine.connect() as conn:
+        existing = conn.execute(text(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = :schema AND table_name IN (:first, :second)"
+        ), {
+            "schema": AEGIS_PUBLISH_DATA_SCHEMA,
+            "first": first_body["physical_table"],
+            "second": second_body["physical_table"],
+        }).scalars().all()
+        assert set(existing) == {
+            first_body["physical_table"],
+            second_body["physical_table"],
+        }
 
 
 # ---- Trusted source ----

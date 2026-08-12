@@ -23,6 +23,7 @@ from typing import Dict, List, Literal, Optional
 import pandas as pd
 
 from src.consultant.consultant import RepairPlan
+from src.governance.manifest import ConversionOutcomeMetadata
 
 
 ApprovalStatus = Literal["PENDING", "APPROVED", "REJECTED"]
@@ -72,6 +73,11 @@ class ApprovalTicket:
     source_dataset_fingerprint: Optional[str] = None
     live_eligible: bool = False
 
+    # Phase 3.1.4 -- persisted, redacted CAST_COLUMN preflight decision.
+    # None for non-cast tickets. Human approval may proceed only when this
+    # decision exists, is SAFE, and matches a fresh deterministic analysis.
+    conversion_decision: Optional[ConversionOutcomeMetadata] = None
+
 
 class ApprovalQueue:
     """
@@ -89,6 +95,7 @@ class ApprovalQueue:
         observed_schema,
         gold_schema,
         target_dataset: pd.DataFrame,
+        conversion_decision: Optional[ConversionOutcomeMetadata] = None,
     ) -> ApprovalTicket:
         ticket = ApprovalTicket(
             ticket_id=str(uuid.uuid4()),
@@ -99,6 +106,7 @@ class ApprovalQueue:
             observed_schema=observed_schema,
             gold_schema=gold_schema,
             target_dataset=target_dataset,
+            conversion_decision=conversion_decision,
         )
         self._tickets[ticket.ticket_id] = ticket
         return ticket
@@ -116,6 +124,18 @@ class ApprovalQueue:
         ticket = self.get(ticket_id)
         if ticket.status != "PENDING":
             raise TicketNotPendingError(f"Ticket {ticket_id} is {ticket.status}, not PENDING.")
+
+        # Phase 3.1.4: approval itself enforces conversion safety, not only
+        # the API orchestrator. The local import avoids a module cycle while
+        # keeping the legacy in-memory queue governed by the same invariant.
+        from src.governance.conversion_safety import require_safe_conversion_decision
+
+        require_safe_conversion_decision(
+            ticket.repair_plan,
+            ticket.target_dataset,
+            ticket.conversion_decision,
+        )
+
         ticket.status = "APPROVED"
         ticket.decided_by = operator
         ticket.decided_at = datetime.now(UTC).isoformat()

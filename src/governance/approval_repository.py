@@ -15,7 +15,7 @@ import uuid
 import decimal
 import datetime as datetime_module
 from datetime import datetime, UTC
-from typing import List
+from typing import List, Optional
 
 import pandas as pd
 from sqlalchemy.orm import Session
@@ -23,6 +23,8 @@ from sqlalchemy.orm import Session
 from src.consultant.consultant import RepairPlan
 from src.inspector import ObservedSchema, ColumnStats
 from src.db.models import ApprovalTicketRecord
+from src.governance.manifest import ConversionOutcomeMetadata
+from src.governance.conversion_safety import require_safe_conversion_decision
 from src.governance.approval import (
     ApprovalTicket,
     TicketNotFoundError,
@@ -288,6 +290,11 @@ def _record_to_ticket(record: ApprovalTicketRecord) -> ApprovalTicket:
         source_schema_fingerprint=record.source_schema_fingerprint,
         source_dataset_fingerprint=record.source_dataset_fingerprint,
         live_eligible=bool(record.live_eligible),
+        conversion_decision=(
+            ConversionOutcomeMetadata.from_dict(record.conversion_decision)
+            if record.conversion_decision is not None
+            else None
+        ),
     )
 
 
@@ -315,6 +322,7 @@ class PostgresApprovalRepository:
         source_schema_fingerprint: str = None,
         source_dataset_fingerprint: str = None,
         live_eligible: bool = False,
+        conversion_decision: Optional[ConversionOutcomeMetadata] = None,
     ) -> ApprovalTicket:
         record = ApprovalTicketRecord(
             ticket_id=uuid.uuid4(),
@@ -334,6 +342,11 @@ class PostgresApprovalRepository:
             source_schema_fingerprint=source_schema_fingerprint,
             source_dataset_fingerprint=source_dataset_fingerprint,
             live_eligible=live_eligible,
+            conversion_decision=(
+                conversion_decision.to_dict()
+                if conversion_decision is not None
+                else None
+            ),
         )
         self.db.add(record)
         self.db.commit()
@@ -419,6 +432,14 @@ class PostgresApprovalRepository:
         record = self._get_record_for_update(ticket_id)
         if record.status != "PENDING":
             raise TicketNotPendingError(f"Ticket {ticket_id} is {record.status}, not PENDING.")
+
+        ticket = _record_to_ticket(record)
+        require_safe_conversion_decision(
+            ticket.repair_plan,
+            ticket.target_dataset,
+            ticket.conversion_decision,
+        )
+
         record.status = "APPROVED"
         record.decided_by = operator
         record.decided_at = datetime.now(UTC)

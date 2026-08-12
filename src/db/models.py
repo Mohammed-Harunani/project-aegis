@@ -36,6 +36,10 @@ class ApprovalTicketRecord(Base):
             ")",
             name="ck_approval_tickets_live_eligible_requires_provenance",
         ),
+        CheckConstraint(
+            "conversion_decision IS NULL OR jsonb_typeof(conversion_decision) = 'object'",
+            name="ck_approval_tickets_conversion_decision_object",
+        ),
     )
 
     ticket_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -76,6 +80,10 @@ class ApprovalTicketRecord(Base):
     source_dataset_fingerprint = Column(Text, nullable=True)
     live_eligible = Column(Boolean, nullable=False, default=False)
 
+    # Phase 3.1.4 -- redacted verified CAST_COLUMN preflight decision.
+    # None for RENAME_COLUMN tickets and all pre-Phase-3.1.4 rows.
+    conversion_decision = Column(JSONB(none_as_null=True), nullable=True)
+
 
 class HealingManifestRecord(Base):
     __tablename__ = "healing_manifests"
@@ -86,6 +94,10 @@ class HealingManifestRecord(Base):
         # ticket -- defense-in-depth alongside the row lock in
         # approval_repository.py's approve().
         UniqueConstraint("ticket_id", name="uq_healing_manifests_ticket_id"),
+        CheckConstraint(
+            "conversion_outcome IS NULL OR jsonb_typeof(conversion_outcome) = 'object'",
+            name="ck_healing_manifests_conversion_outcome_object",
+        ),
     )
 
     manifest_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -126,6 +138,10 @@ class HealingManifestRecord(Base):
     schema_version_id = Column(
         UUID(as_uuid=True), ForeignKey("schema_versions.schema_version_id"), nullable=True
     )
+
+    # Phase 3.1.4 -- persisted redacted CAST_COLUMN execution outcome.
+    # The corrected DataFrame itself remains ephemeral and is never stored.
+    conversion_outcome = Column(JSONB(none_as_null=True), nullable=True)
 
 
 class GoldSchemaRecord(Base):

@@ -1,6 +1,18 @@
 from .policy import GovernancePolicy
 from .selector import RepairSelector
-from .manifest import HealingManifest
+from .manifest import ConversionOutcomeMetadata, HealingManifest
+from .conversion_safety import (
+    ConversionApprovalBlockedError,
+    ConversionGovernanceError,
+    InvalidCastActionError,
+    ParsedCastAction,
+    StaleConversionDecisionError,
+    analyze_cast_plan,
+    build_conversion_metadata,
+    is_cast_action,
+    parse_cast_action,
+    require_safe_conversion_decision,
+)
 from .approval import (
     ApprovalQueue,
     ApprovalTicket,
@@ -12,6 +24,17 @@ __all__ = [
     "GovernancePolicy",
     "RepairSelector",
     "HealingManifest",
+    "ConversionOutcomeMetadata",
+    "ConversionGovernanceError",
+    "ConversionApprovalBlockedError",
+    "InvalidCastActionError",
+    "StaleConversionDecisionError",
+    "ParsedCastAction",
+    "is_cast_action",
+    "parse_cast_action",
+    "build_conversion_metadata",
+    "analyze_cast_plan",
+    "require_safe_conversion_decision",
     "ApprovalQueue",
     "ApprovalTicket",
     "TicketNotFoundError",
@@ -22,9 +45,6 @@ __all__ = [
 # re-exported here. Doing so would make `governance/__init__.py` --
 # and therefore every plain `from governance.x import y`, including
 # ones that have nothing to do with persistence -- import sqlalchemy
-# transitively. That broke test_selector.py and test_approval.py the
-# first time I wrote this (sqlalchemy isn't installed in every
-# environment that just wants RepairSelector or GovernancePolicy).
-# Import them directly where needed instead:
+# transitively. Import them directly where needed instead:
 #   from src.governance.approval_repository import PostgresApprovalRepository
 #   from src.governance.manifest_repository import save_manifest

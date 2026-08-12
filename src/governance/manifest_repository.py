@@ -80,6 +80,11 @@ def save_manifest(
         source_row_count=source_row_count,
         source_schema_fingerprint=source_schema_fingerprint,
         source_dataset_fingerprint=source_dataset_fingerprint,
+        conversion_outcome=(
+            manifest.conversion_outcome.to_dict()
+            if manifest.conversion_outcome is not None
+            else None
+        ),
     )
     db.add(record)
     if commit:
