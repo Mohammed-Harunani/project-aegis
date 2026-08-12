@@ -4,6 +4,7 @@ from src.ingestion.models import (
     CapturedSimulation,
     DatasetSnapshot,
     IngestionRun,
+    RevalidationObservation,
     SimulationReplay,
 )
 from src.ingestion.repository import (
@@ -31,6 +32,7 @@ __all__ = [
     "IngestionService",
     "InvalidIngestionRunError",
     "InvalidSnapshotError",
+    "RevalidationObservation",
     "SimulationReplay",
     "SnapshotConflictError",
     "compute_snapshot_provenance_fingerprint",

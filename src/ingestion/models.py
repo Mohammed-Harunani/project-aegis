@@ -51,3 +51,14 @@ class SimulationReplay:
 class CapturedSimulation:
     snapshot: DatasetSnapshot
     run: IngestionRun
+
+
+@dataclass(frozen=True)
+class RevalidationObservation:
+    snapshot: DatasetSnapshot
+    run: IngestionRun
+    mismatch_categories: tuple[str, ...]
+
+    @property
+    def matched(self) -> bool:
+        return self.run.outcome == "MATCHED"

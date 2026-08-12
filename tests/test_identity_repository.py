@@ -65,6 +65,29 @@ def test_same_source_key_and_binding_resolve_same_identity():
     assert first == second
 
 
+def test_live_source_binding_verification_requires_exact_captured_identity():
+    with TestSessionLocal() as db:
+        repository = IdentityRepository(db)
+        system = repository.resolve_source_system("erp-source", _binding("erp"))
+        assert repository.verify_source_system_binding(
+            system.source_system_id,
+            "erp-source",
+            _binding("erp"),
+        ) == system
+        with pytest.raises(SystemBindingConflictError):
+            repository.verify_source_system_binding(
+                system.source_system_id,
+                "other-source",
+                _binding("erp"),
+            )
+        with pytest.raises(SystemBindingConflictError):
+            repository.verify_source_system_binding(
+                system.source_system_id,
+                "erp-source",
+                _binding("other"),
+            )
+
+
 def test_source_key_rebinding_is_rejected_without_overwrite():
     with TestSessionLocal() as db:
         repository = IdentityRepository(db)
@@ -106,6 +129,10 @@ def test_source_dataset_identity_is_stable_and_relation_scoped():
         )
     assert first == same
     assert other.source_dataset_id != first.source_dataset_id
+    with TestSessionLocal() as db:
+        assert IdentityRepository(db).get_source_dataset(
+            first.source_dataset_id
+        ) == first
 
 
 def test_publication_target_identity_is_stable_and_target_scoped():

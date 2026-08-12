@@ -287,10 +287,13 @@ def upgrade() -> None:
         "approval_tickets",
         "target_dataset IS NOT NULL OR source_ingestion_run_id IS NOT NULL",
     )
-    # The approved future-write live-lineage NOT VALID constraint is added
-    # with Phase 3.2.3, in the same change that makes the source-backed API
-    # create ingestion runs. Adding it before that writer exists would make
-    # this intermediate migration reject the still-supported source path.
+    # NOT VALID preserves historical live-eligible rows without inventing
+    # lineage, while PostgreSQL still enforces the check for every new row.
+    op.execute(
+        "ALTER TABLE approval_tickets "
+        "ADD CONSTRAINT ck_approval_tickets_live_eligible_ingestion_lineage "
+        "CHECK (NOT live_eligible OR source_ingestion_run_id IS NOT NULL) NOT VALID"
+    )
     op.add_column(
         "healing_manifests",
         sa.Column("source_ingestion_run_id", postgresql.UUID(as_uuid=True), nullable=True),
@@ -409,6 +412,11 @@ def downgrade() -> None:
     )
     op.drop_column("healing_manifests", "source_ingestion_run_id")
 
+    op.drop_constraint(
+        "ck_approval_tickets_live_eligible_ingestion_lineage",
+        "approval_tickets",
+        type_="check",
+    )
     op.drop_constraint("ck_approval_tickets_replay_source", "approval_tickets")
     op.alter_column(
         "approval_tickets",

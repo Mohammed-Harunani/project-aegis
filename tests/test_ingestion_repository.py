@@ -296,63 +296,50 @@ def test_matching_and_drifted_revalidations_link_to_captured_baseline():
         dataset = _identity(db)
         captured = _capture(db, dataset.source_dataset_id)
         repository = IngestionRepository(db)
-        matched = repository.append_run(
+        service = IngestionService(repository)
+        matched = service.record_live_revalidation(
             source_dataset_id=dataset.source_dataset_id,
-            dataset_snapshot_id=captured.snapshot.dataset_snapshot_id,
             baseline_ingestion_run_id=captured.run.ingestion_run_id,
-            purpose="LIVE_REVALIDATION",
-            outcome="MATCHED",
+            source_read=_source_read(_frame()),
             requested_by="operator-one",
-            started_at=datetime.datetime(2026, 8, 12, 13, tzinfo=datetime.UTC),
-            completed_at=datetime.datetime(2026, 8, 12, 13, 1, tzinfo=datetime.UTC),
+            started_at=datetime.datetime(2020, 8, 12, 13, tzinfo=datetime.UTC),
         )
 
         changed_frame = _frame().copy()
         changed_frame.loc[100, "amount"] = decimal.Decimal("999.99")
-        changed_snapshot = repository.resolve_snapshot(
+        drifted = service.record_live_revalidation(
             source_dataset_id=dataset.source_dataset_id,
-            dataframe=changed_frame,
-            source_primary_key=["customer_id"],
-            source_row_count=len(changed_frame),
-            source_schema_fingerprint="a" * 64,
-            source_dataset_fingerprint=compute_dataframe_fingerprint(changed_frame),
-            column_metadata=_metadata(changed_frame),
-        )
-        drifted = repository.append_run(
-            source_dataset_id=dataset.source_dataset_id,
-            dataset_snapshot_id=changed_snapshot.dataset_snapshot_id,
             baseline_ingestion_run_id=captured.run.ingestion_run_id,
-            purpose="LIVE_REVALIDATION",
-            outcome="DRIFTED",
+            source_read=_source_read(changed_frame),
             requested_by="operator-one",
-            started_at=datetime.datetime(2026, 8, 12, 14, tzinfo=datetime.UTC),
-            completed_at=datetime.datetime(2026, 8, 12, 14, 1, tzinfo=datetime.UTC),
+            started_at=datetime.datetime(2020, 8, 12, 14, tzinfo=datetime.UTC),
         )
         db.commit()
 
-    assert matched.baseline_ingestion_run_id == captured.run.ingestion_run_id
-    assert drifted.baseline_ingestion_run_id == captured.run.ingestion_run_id
-    assert drifted.dataset_snapshot_id != matched.dataset_snapshot_id
+    assert matched.matched
+    assert matched.mismatch_categories == ()
+    assert matched.run.baseline_ingestion_run_id == captured.run.ingestion_run_id
+    assert not drifted.matched
+    assert drifted.mismatch_categories == ("DATASET_FINGERPRINT",)
+    assert drifted.run.baseline_ingestion_run_id == captured.run.ingestion_run_id
+    assert drifted.run.dataset_snapshot_id != matched.run.dataset_snapshot_id
 
 
 def test_failed_simulation_persists_only_stable_redacted_diagnostics():
     with TestSessionLocal() as db:
         dataset = _identity(db)
-        failed = IngestionRepository(db).append_run(
+        failed = IngestionService(IngestionRepository(db)).record_failed_run(
             source_dataset_id=dataset.source_dataset_id,
             purpose="SIMULATION",
-            outcome="FAILED",
             failure_code="SOURCE_READ_FAILED",
-            failure_reason="Trusted source could not be read.",
-            started_at=datetime.datetime(2026, 8, 12, 15, tzinfo=datetime.UTC),
-            completed_at=datetime.datetime(2026, 8, 12, 15, 1, tzinfo=datetime.UTC),
+            started_at=datetime.datetime(2020, 8, 12, 15, tzinfo=datetime.UTC),
         )
         db.commit()
         restored = IngestionRepository(db).get_run(failed.ingestion_run_id)
 
     assert restored.dataset_snapshot_id is None
     assert restored.failure_code == "SOURCE_READ_FAILED"
-    assert restored.failure_reason == "Trusted source could not be read."
+    assert restored.failure_reason == "Complete source observation could not be read."
 
 
 @pytest.mark.parametrize(

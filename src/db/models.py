@@ -316,6 +316,10 @@ class ApprovalTicketRecord(Base):
             "target_dataset IS NOT NULL OR source_ingestion_run_id IS NOT NULL",
             name="ck_approval_tickets_replay_source",
         ),
+        CheckConstraint(
+            "NOT live_eligible OR source_ingestion_run_id IS NOT NULL",
+            name="ck_approval_tickets_live_eligible_ingestion_lineage",
+        ),
     )
 
     ticket_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

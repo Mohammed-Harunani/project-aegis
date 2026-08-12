@@ -17,6 +17,7 @@ TEST_DATABASE_URL = get_verified_test_database_url()
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, inspect as sa_inspect, text
+from sqlalchemy.exc import IntegrityError
 
 from src.db.models import Base
 
@@ -41,6 +42,7 @@ def _reset_database() -> None:
 def test_0005_upgrade_preserves_history_and_downgrade_restores_replay_payload():
     config = _alembic_config()
     legacy_ticket_id = uuid.uuid4()
+    historical_live_ticket_id = uuid.uuid4()
     phase_3_2_ticket_id = uuid.uuid4()
     source_system_id = uuid.uuid4()
     source_dataset_id = uuid.uuid4()
@@ -78,6 +80,37 @@ def test_0005_upgrade_preserves_history_and_downgrade_restores_replay_payload():
                     "target_dataset": json.dumps(legacy_payload),
                 },
             )
+            connection.execute(
+                text(
+                    """
+                    INSERT INTO approval_tickets (
+                        ticket_id, proposed_action, confidence, explanation,
+                        status, created_at, observed_schema, gold_schema,
+                        target_dataset, live_eligible, source_schema,
+                        source_table, source_primary_key, source_row_count,
+                        source_schema_fingerprint, source_dataset_fingerprint
+                    ) VALUES (
+                        :ticket_id, 'RENAME_COLUMN:id->customer_id', 0.95,
+                        'historical live ticket', 'APPROVED', :created_at,
+                        CAST(:observed_schema AS jsonb),
+                        CAST(:gold_schema AS jsonb),
+                        CAST(:target_dataset AS jsonb), true, 'public',
+                        'customers', CAST(:primary_key AS jsonb), 1,
+                        :schema_fingerprint, :dataset_fingerprint
+                    )
+                    """
+                ),
+                {
+                    "ticket_id": historical_live_ticket_id,
+                    "created_at": now,
+                    "observed_schema": json.dumps({}),
+                    "gold_schema": json.dumps({}),
+                    "target_dataset": json.dumps(legacy_payload),
+                    "primary_key": json.dumps(["id"]),
+                    "schema_fingerprint": "e" * 64,
+                    "dataset_fingerprint": "f" * 64,
+                },
+            )
 
         command.upgrade(config, "head")
 
@@ -101,6 +134,10 @@ def test_0005_upgrade_preserves_history_and_downgrade_restores_replay_payload():
             for constraint in inspector.get_check_constraints("approval_tickets")
         }
         assert "ck_approval_tickets_replay_source" in approval_checks
+        assert (
+            "ck_approval_tickets_live_eligible_ingestion_lineage"
+            in approval_checks
+        )
 
         with engine.begin() as connection:
             historical_lineage = connection.execute(
@@ -111,6 +148,15 @@ def test_0005_upgrade_preserves_history_and_downgrade_restores_replay_payload():
                 {"ticket_id": legacy_ticket_id},
             ).scalar_one()
             assert historical_lineage is None
+
+            retained_live_lineage = connection.execute(
+                text(
+                    "SELECT source_ingestion_run_id FROM approval_tickets "
+                    "WHERE ticket_id = :ticket_id"
+                ),
+                {"ticket_id": historical_live_ticket_id},
+            ).scalar_one()
+            assert retained_live_lineage is None
 
             connection.execute(
                 text(
@@ -218,6 +264,40 @@ def test_0005_upgrade_preserves_history_and_downgrade_restores_replay_payload():
                     "run_id": ingestion_run_id,
                 },
             )
+
+        with pytest.raises(IntegrityError):
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO approval_tickets (
+                            ticket_id, proposed_action, confidence, explanation,
+                            status, created_at, observed_schema, gold_schema,
+                            target_dataset, live_eligible, source_schema,
+                            source_table, source_primary_key, source_row_count,
+                            source_schema_fingerprint, source_dataset_fingerprint
+                        ) VALUES (
+                            :ticket_id, 'RENAME_COLUMN:id->customer_id', 0.95,
+                            'new live ticket without lineage', 'PENDING', :created_at,
+                            CAST(:observed_schema AS jsonb),
+                            CAST(:gold_schema AS jsonb),
+                            CAST(:target_dataset AS jsonb), true, 'public',
+                            'customers', CAST(:primary_key AS jsonb), 1,
+                            :schema_fingerprint, :dataset_fingerprint
+                        )
+                        """
+                    ),
+                    {
+                        "ticket_id": uuid.uuid4(),
+                        "created_at": now,
+                        "observed_schema": json.dumps({}),
+                        "gold_schema": json.dumps({}),
+                        "target_dataset": json.dumps(legacy_payload),
+                        "primary_key": json.dumps(["id"]),
+                        "schema_fingerprint": "1" * 64,
+                        "dataset_fingerprint": "2" * 64,
+                    },
+                )
 
         command.downgrade(config, "0004")
 

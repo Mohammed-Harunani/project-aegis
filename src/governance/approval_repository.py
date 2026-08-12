@@ -205,6 +205,10 @@ class PostgresApprovalRepository:
                 "Submit exactly one replay source: target_dataset or "
                 "source_ingestion_run_id."
             )
+        if live_eligible and not has_ingestion_lineage:
+            raise ApprovalReplayError(
+                "New live-eligible tickets require captured simulation lineage."
+            )
         if has_embedded_dataset:
             if not isinstance(target_dataset, pd.DataFrame):
                 raise ApprovalReplayError("target_dataset must be a pandas DataFrame.")

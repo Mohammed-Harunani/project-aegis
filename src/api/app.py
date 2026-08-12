@@ -4,6 +4,8 @@ from pydantic import BaseModel, Field, model_validator, field_validator
 from typing import Dict, List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import DBAPIError
+from datetime import UTC, datetime
+import os
 import uuid
 import pandas as pd
 
@@ -13,7 +15,10 @@ from src.surgeon import AegisSurgeon
 from src.governance.policy import GovernancePolicy
 from src.governance.selector import RepairSelector
 from src.governance.approval import TicketNotFoundError, TicketNotPendingError
-from src.governance.approval_repository import PostgresApprovalRepository
+from src.governance.approval_repository import (
+    ApprovalReplayError,
+    PostgresApprovalRepository,
+)
 from src.governance.manifest_repository import save_manifest
 from src.governance.conversion_safety import (
     ConversionApprovalBlockedError,
@@ -79,6 +84,24 @@ from src.live_execution.cast_allowlist import (
     configured_live_cast_allowlist,
     require_live_cast_pair_allowed,
 )
+from src.identity.binding import (
+    IdentityConfigurationError,
+    UnsafeDatabaseTopologyError,
+    configured_binding,
+    ensure_distinct_bindings,
+)
+from src.identity.repository import (
+    EndpointBindingAlreadyRegisteredError,
+    IdentityNotFoundError,
+    IdentityRepository,
+    SystemBindingConflictError,
+)
+from src.ingestion.repository import (
+    IngestionRepository,
+    IngestionRepositoryError,
+)
+from src.ingestion.service import IngestionService
+from src.live_execution.identifiers import InvalidIdentifierError
 
 
 app = FastAPI(
@@ -231,6 +254,71 @@ def _build_gold_schema(gold_schema: Dict[str, str]) -> ObservedSchema:
 def _public_conversion_metadata(metadata):
     """Expose only the reviewed redacted conversion metadata shape."""
     return metadata.to_dict() if metadata is not None else None
+
+
+def _configured_source_binding():
+    return configured_binding(
+        key_env="AEGIS_SOURCE_SYSTEM_KEY",
+        url_env="SOURCE_DATABASE_URL",
+    )
+
+
+def _verify_optional_source_publication_separation(source_binding) -> None:
+    # Publication configuration stays lazy: source-only simulation does not
+    # require it, but when both server-controlled values exist the unsafe
+    # same-database topology is rejected before source data is captured.
+    if (
+        os.environ.get("AEGIS_PUBLICATION_SYSTEM_KEY") is not None
+        and os.environ.get("LIVE_DATABASE_URL") is not None
+    ):
+        _, publication_binding = configured_binding(
+            key_env="AEGIS_PUBLICATION_SYSTEM_KEY",
+            url_env="LIVE_DATABASE_URL",
+        )
+        ensure_distinct_bindings(source_binding, publication_binding)
+
+
+def _simulation_lineage(source_system, source_dataset, captured) -> dict:
+    return {
+        "source_system_id": str(source_system.source_system_id),
+        "source_dataset_id": str(source_dataset.source_dataset_id),
+        "dataset_snapshot_id": str(captured.snapshot.dataset_snapshot_id),
+        "ingestion_run_id": str(captured.run.ingestion_run_id),
+    }
+
+
+def _public_ingestion_run(db: Session, run) -> dict:
+    snapshot = None
+    if run.dataset_snapshot_id is not None:
+        snapshot = IngestionRepository(db).get_snapshot(run.dataset_snapshot_id)
+    return {
+        "ingestion_run_id": str(run.ingestion_run_id),
+        "source_dataset_id": str(run.source_dataset_id),
+        "dataset_snapshot_id": (
+            str(run.dataset_snapshot_id)
+            if run.dataset_snapshot_id is not None
+            else None
+        ),
+        "purpose": run.purpose,
+        "outcome": run.outcome,
+        "baseline_ingestion_run_id": (
+            str(run.baseline_ingestion_run_id)
+            if run.baseline_ingestion_run_id is not None
+            else None
+        ),
+        "requested_by": run.requested_by,
+        "started_at": run.started_at.isoformat(),
+        "completed_at": run.completed_at.isoformat(),
+        "failure_code": run.failure_code,
+        "failure_reason": run.failure_reason,
+        "source_row_count": snapshot.source_row_count if snapshot else None,
+        "source_schema_fingerprint": (
+            snapshot.source_schema_fingerprint if snapshot else None
+        ),
+        "source_dataset_fingerprint": (
+            snapshot.source_dataset_fingerprint if snapshot else None
+        ),
+    }
 
 
 @app.get("/")
@@ -428,6 +516,34 @@ def simulate_migration_from_source(
     governance = GovernancePolicy()
     approvals = PostgresApprovalRepository(db)
 
+    identities = IdentityRepository(db)
+    try:
+        source_system_key, source_binding = _configured_source_binding()
+        _verify_optional_source_publication_separation(source_binding)
+        source_system = identities.resolve_source_system(
+            source_system_key, source_binding
+        )
+        source_dataset = identities.resolve_source_dataset(
+            source_system.source_system_id,
+            request.source_schema,
+            request.source_table,
+        )
+    except IdentityConfigurationError as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    except (
+        EndpointBindingAlreadyRegisteredError,
+        SystemBindingConflictError,
+    ) as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=str(e))
+    except UnsafeDatabaseTopologyError as e:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+    except InvalidIdentifierError as e:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
+
     registry = SchemaRegistryRepository(db)
     try:
         if request.schema_version is not None:
@@ -435,19 +551,72 @@ def simulate_migration_from_source(
         else:
             version = registry.get_latest(request.schema_name)
     except SchemaNotFoundError:
-        raise HTTPException(status_code=404, detail=f"Schema {request.schema_name!r} not found.")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Schema {request.schema_name!r} not found.",
+        )
     except SchemaVersionNotFoundError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
     schema_version_id = str(version.schema_version_id)
     gold_schema_dict = to_gold_schema_dict(version.schema_definition["columns"])
 
+    ingestion = IngestionService(IngestionRepository(db))
+    observation_started_at = datetime.now(UTC)
+
+    def persist_failed_simulation(failure_code: str) -> None:
+        try:
+            ingestion.record_failed_run(
+                source_dataset_id=source_dataset.source_dataset_id,
+                purpose="SIMULATION",
+                started_at=observation_started_at,
+                failure_code=failure_code,
+            )
+            db.commit()
+        except Exception as persistence_error:
+            db.rollback()
+            raise HTTPException(
+                status_code=500,
+                detail=(
+                    "Source observation failed and its redacted terminal ingestion "
+                    "record could not be persisted. No approval ticket was created."
+                ),
+            ) from persistence_error
+
     try:
         source_read = read_complete_source_table(
             source_engine, request.source_schema, request.source_table
         )
     except SourceValidationError as e:
+        persist_failed_simulation("SOURCE_VALIDATION_FAILED")
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        persist_failed_simulation("SOURCE_READ_FAILED")
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The trusted source could not be read. A redacted FAILED "
+                "ingestion run was recorded and no approval ticket was created."
+            ),
+        ) from e
+
+    try:
+        captured = ingestion.record_captured_simulation(
+            source_dataset_id=source_dataset.source_dataset_id,
+            source_read=source_read,
+            started_at=observation_started_at,
+        )
+    except IngestionRepositoryError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "The complete source observation could not be persisted. "
+                "No approval ticket was created."
+            ),
+        ) from e
+
+    lineage = _simulation_lineage(source_system, source_dataset, captured)
 
     df_observed = source_read["dataframe"]
 
@@ -464,6 +633,7 @@ def simulate_migration_from_source(
     try:
         observed_schema_obj = build_source_observed_schema(df_observed, source_read["column_types"])
     except UnsupportedSourceTypeError as e:
+        db.commit()
         raise HTTPException(status_code=422, detail=str(e))
 
     gold_schema_obj = _build_gold_schema(gold_schema_dict)
@@ -483,6 +653,7 @@ def simulate_migration_from_source(
         if not is_publishable_dtype(stats.dtype)
     ]
     if unpublishable:
+        db.commit()
         raise HTTPException(
             status_code=422,
             detail=(
@@ -498,10 +669,12 @@ def simulate_migration_from_source(
     repair_plans = consultant.propose_repairs(delta, observed_schema_obj, gold_schema_obj)
 
     if not repair_plans:
+        db.commit()
         return {
             "schema_delta": str(delta),
             "schema_version_id": schema_version_id,
             "source_row_count": source_read["row_count"],
+            **lineage,
             "message": "No repair plans proposed.",
         }
 
@@ -509,10 +682,12 @@ def simulate_migration_from_source(
     selected_plan = selector.choose_best(repair_plans)
 
     if selected_plan is None:
+        db.commit()
         return {
             "schema_delta": str(delta),
             "schema_version_id": schema_version_id,
             "source_row_count": source_read["row_count"],
+            **lineage,
             "message": "No repair plan survived governance review; all candidates quarantined.",
         }
 
@@ -530,6 +705,7 @@ def simulate_migration_from_source(
                 observed_schema_obj,
             )
         except (ConversionGovernanceError, LiveCastAllowlistError) as e:
+            db.commit()
             raise HTTPException(
                 status_code=422,
                 detail=(
@@ -551,7 +727,7 @@ def simulate_migration_from_source(
         repair_plan=selected_plan,
         observed_schema=observed_schema_obj,
         gold_schema=gold_schema_obj,
-        target_dataset=df_observed,
+        target_dataset=None,
         schema_version_id=schema_version_id,
         source_schema=request.source_schema,
         source_table=request.source_table,
@@ -561,6 +737,7 @@ def simulate_migration_from_source(
         source_dataset_fingerprint=source_read["dataset_fingerprint"],
         live_eligible=True,
         conversion_decision=conversion_decision,
+        source_ingestion_run_id=str(captured.run.ingestion_run_id),
     )
     return {
         "schema_delta": str(delta),
@@ -574,6 +751,7 @@ def simulate_migration_from_source(
         "status": "PENDING_APPROVAL",
         "ticket_id": ticket.ticket_id,
         "live_eligible": True,
+        **lineage,
         "conversion_decision": _public_conversion_metadata(
             ticket.conversion_decision
         ),
@@ -589,7 +767,10 @@ def simulate_migration_from_source(
 @app.get("/approvals")
 def list_pending_approvals(db: Session = Depends(get_db)):
     approvals = PostgresApprovalRepository(db)
-    tickets = approvals.list_pending()
+    try:
+        tickets = approvals.list_pending()
+    except ApprovalReplayError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     return {
         "pending_count": len(tickets),
         "tickets": [
@@ -617,6 +798,8 @@ def get_approval(ticket_id: str, db: Session = Depends(get_db)):
         t = approvals.get(ticket_id)
     except TicketNotFoundError:
         raise HTTPException(status_code=404, detail="Ticket not found.")
+    except ApprovalReplayError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     return {
         "ticket_id": t.ticket_id,
@@ -655,6 +838,9 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
                 f"the ticket remains PENDING. {e}"
             ),
         )
+    except ApprovalReplayError as e:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=str(e))
 
     try:
         require_safe_conversion_decision(
@@ -720,6 +906,7 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
             source_row_count=ticket.source_row_count,
             source_schema_fingerprint=ticket.source_schema_fingerprint,
             source_dataset_fingerprint=ticket.source_dataset_fingerprint,
+            source_ingestion_run_id=ticket.source_ingestion_run_id,
             commit=False,
         )
 
@@ -918,6 +1105,49 @@ def get_latest_schema_version(schema_name: str, db: Session = Depends(get_db)):
     }
 
 
+@app.get("/source-datasets/{source_dataset_id}")
+def get_source_dataset(source_dataset_id: str, db: Session = Depends(get_db)):
+    try:
+        dataset = IdentityRepository(db).get_source_dataset(source_dataset_id)
+    except IdentityNotFoundError:
+        raise HTTPException(status_code=404, detail="Source dataset not found.")
+    return {
+        "source_dataset_id": str(dataset.source_dataset_id),
+        "source_system_id": str(dataset.source_system_id),
+        "source_schema": dataset.source_schema,
+        "source_table": dataset.source_table,
+        "created_at": dataset.created_at.isoformat(),
+    }
+
+
+@app.get("/source-datasets/{source_dataset_id}/ingestion-runs")
+def list_source_dataset_ingestion_runs(
+    source_dataset_id: str, db: Session = Depends(get_db)
+):
+    try:
+        IdentityRepository(db).get_source_dataset(source_dataset_id)
+        runs = IngestionRepository(db).list_runs(source_dataset_id)
+        public_runs = [_public_ingestion_run(db, run) for run in runs]
+    except IdentityNotFoundError:
+        raise HTTPException(status_code=404, detail="Source dataset not found.")
+    except IngestionRepositoryError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    return {
+        "source_dataset_id": source_dataset_id,
+        "run_count": len(public_runs),
+        "ingestion_runs": public_runs,
+    }
+
+
+@app.get("/ingestion-runs/{ingestion_run_id}")
+def get_ingestion_run(ingestion_run_id: str, db: Session = Depends(get_db)):
+    try:
+        run = IngestionRepository(db).get_run(ingestion_run_id)
+        return _public_ingestion_run(db, run)
+    except IngestionRepositoryError:
+        raise HTTPException(status_code=404, detail="Ingestion run not found.")
+
+
 @app.post("/approvals/{ticket_id}/execute-live")
 def execute_live(
     ticket_id: str,
@@ -945,6 +1175,8 @@ def execute_live(
         ticket = approvals.lock_for_live_execution(ticket_id)
     except TicketNotFoundError:
         raise HTTPException(status_code=404, detail="Ticket not found.")
+    except ApprovalReplayError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     if ticket.status != "APPROVED":
         raise HTTPException(
@@ -1050,6 +1282,48 @@ def execute_live(
         raise HTTPException(
             status_code=422, detail="Manifest ticket_id does not match (should be unreachable)."
         )
+    if (
+        str(manifest_record.source_ingestion_run_id)
+        if manifest_record.source_ingestion_run_id is not None
+        else None
+    ) != ticket.source_ingestion_run_id:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Manifest simulation ingestion lineage does not match the ticket."
+            ),
+        )
+
+    simulation_replay = None
+    if ticket.source_ingestion_run_id is not None:
+        try:
+            simulation_replay = IngestionRepository(db).load_simulation_replay(
+                ticket.source_ingestion_run_id
+            )
+        except IngestionRepositoryError as e:
+            raise HTTPException(
+                status_code=422,
+                detail="Ticket simulation ingestion lineage is invalid.",
+            ) from e
+        try:
+            source_system_key, source_binding = _configured_source_binding()
+            _verify_optional_source_publication_separation(source_binding)
+            IdentityRepository(db).verify_source_system_binding(
+                simulation_replay.source_system_id,
+                source_system_key,
+                source_binding,
+            )
+        except IdentityConfigurationError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        except SystemBindingConflictError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except UnsafeDatabaseTopologyError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except IdentityNotFoundError as e:
+            raise HTTPException(
+                status_code=422,
+                detail="Ticket source-system lineage is invalid.",
+            ) from e
 
     live_repo = LiveExecutionRepository(db)
 
@@ -1107,6 +1381,7 @@ def execute_live(
                     source_row_count=ticket.source_row_count,
                     source_schema_fingerprint=ticket.source_schema_fingerprint,
                     source_dataset_fingerprint=ticket.source_dataset_fingerprint,
+                    simulation_ingestion_run_id=ticket.source_ingestion_run_id,
                 )
             except LiveExecutionConflictError as e:
                 raise HTTPException(status_code=409, detail=str(e))
@@ -1129,13 +1404,98 @@ def execute_live(
                 # so "verified unchanged" and "what actually gets
                 # corrected" are provably the same data, not two
                 # things that merely happen to share a fingerprint.
-                fresh_source = verify_source_unchanged(
-                    source_engine, ticket.source_schema, ticket.source_table,
-                    expected_primary_key=ticket.source_primary_key,
-                    expected_row_count=ticket.source_row_count,
-                    expected_schema_fingerprint=ticket.source_schema_fingerprint,
-                    expected_dataset_fingerprint=ticket.source_dataset_fingerprint,
-                )
+                if simulation_replay is not None:
+                    revalidation_started_at = datetime.now(UTC)
+                    ingestion_service = IngestionService(IngestionRepository(db))
+                    try:
+                        fresh_source = read_complete_source_table(
+                            source_engine,
+                            ticket.source_schema,
+                            ticket.source_table,
+                        )
+                    except SourceValidationError:
+                        try:
+                            failed_run = ingestion_service.record_failed_run(
+                                source_dataset_id=(
+                                    simulation_replay.run.source_dataset_id
+                                ),
+                                purpose="LIVE_REVALIDATION",
+                                baseline_ingestion_run_id=(
+                                    ticket.source_ingestion_run_id
+                                ),
+                                requested_by=request.operator,
+                                started_at=revalidation_started_at,
+                                failure_code="SOURCE_VALIDATION_FAILED",
+                            )
+                            live_repo.attach_revalidation(
+                                live_record.live_execution_id,
+                                failed_run.ingestion_run_id,
+                            )
+                        except Exception as persistence_error:
+                            db.rollback()
+                            raise RuntimeError(
+                                "Live source validation failed and its redacted "
+                                "terminal ingestion record could not be persisted."
+                            ) from persistence_error
+                        raise
+                    except Exception as source_error:
+                        try:
+                            failed_run = ingestion_service.record_failed_run(
+                                source_dataset_id=(
+                                    simulation_replay.run.source_dataset_id
+                                ),
+                                purpose="LIVE_REVALIDATION",
+                                baseline_ingestion_run_id=(
+                                    ticket.source_ingestion_run_id
+                                ),
+                                requested_by=request.operator,
+                                started_at=revalidation_started_at,
+                                failure_code="SOURCE_READ_FAILED",
+                            )
+                            live_repo.attach_revalidation(
+                                live_record.live_execution_id,
+                                failed_run.ingestion_run_id,
+                            )
+                        except Exception as persistence_error:
+                            db.rollback()
+                            raise RuntimeError(
+                                "Live source read failed and its redacted terminal "
+                                "ingestion record could not be persisted."
+                            ) from persistence_error
+                        raise RuntimeError(
+                            "Trusted source read failed during live revalidation."
+                        ) from source_error
+
+                    revalidation = ingestion_service.record_live_revalidation(
+                        source_dataset_id=simulation_replay.run.source_dataset_id,
+                        baseline_ingestion_run_id=ticket.source_ingestion_run_id,
+                        source_read=fresh_source,
+                        started_at=revalidation_started_at,
+                        requested_by=request.operator,
+                    )
+                    live_repo.attach_revalidation(
+                        live_record.live_execution_id,
+                        revalidation.run.ingestion_run_id,
+                    )
+                    if not revalidation.matched:
+                        categories = ", ".join(
+                            revalidation.mismatch_categories
+                        )
+                        raise SourceChangedError(
+                            "Trusted source provenance changed after approval "
+                            f"({categories}). A new simulation and approval are required."
+                        )
+                else:
+                    # Historical live-eligible tickets retain their existing
+                    # copied-provenance verification path; no lineage is
+                    # fabricated for rows created before Phase 3.2.
+                    fresh_source = verify_source_unchanged(
+                        source_engine, ticket.source_schema, ticket.source_table,
+                        expected_primary_key=ticket.source_primary_key,
+                        expected_row_count=ticket.source_row_count,
+                        expected_schema_fingerprint=ticket.source_schema_fingerprint,
+                        expected_dataset_fingerprint=ticket.source_dataset_fingerprint,
+                    )
 
                 surgeon = AegisSurgeon()
                 working_copy = fresh_source["dataframe"].copy()
@@ -1247,16 +1607,19 @@ def execute_live(
                 # Surgeon/source/application error as an ambiguous
                 # publication outcome.
                 if not publication_attempted:
+                    db.rollback()
                     live_repo.mark_failed(
                         live_record.live_execution_id,
-                        failure_reason=str(e),
+                        failure_reason=(
+                            "Live execution failed before target publication began."
+                        ),
                     )
                     raise HTTPException(
                         status_code=500,
                         detail=(
                             "Live execution failed before target publication began. "
                             "No target transaction was attempted and the execution "
-                            f"has been recorded as FAILED. Reason: {e}"
+                            "has been recorded as FAILED."
                         ),
                     )
 
@@ -1285,6 +1648,21 @@ def execute_live(
                         "previous_physical_table": previous_physical_table,
                         "final_row_count": manifest_record.final_row_count,
                         "live_cast_pair": live_cast_pair.token if live_cast_pair else None,
+                        "simulation_ingestion_run_id": (
+                            str(live_record.simulation_ingestion_run_id)
+                            if live_record.simulation_ingestion_run_id is not None
+                            else None
+                        ),
+                        "revalidation_ingestion_run_id": (
+                            str(live_record.revalidation_ingestion_run_id)
+                            if live_record.revalidation_ingestion_run_id is not None
+                            else None
+                        ),
+                        "publication_target_id": (
+                            str(live_record.publication_target_id)
+                            if live_record.publication_target_id is not None
+                            else None
+                        ),
                         "note": (
                             "The original response to this request was lost, but "
                             "the target-side marker confirms the publication "
@@ -1355,6 +1733,21 @@ def execute_live(
                 "previous_physical_table": result["previous_physical_table"],
                 "final_row_count": result["final_row_count"],
                 "live_cast_pair": live_cast_pair.token if live_cast_pair else None,
+                "simulation_ingestion_run_id": (
+                    str(live_record.simulation_ingestion_run_id)
+                    if live_record.simulation_ingestion_run_id is not None
+                    else None
+                ),
+                "revalidation_ingestion_run_id": (
+                    str(live_record.revalidation_ingestion_run_id)
+                    if live_record.revalidation_ingestion_run_id is not None
+                    else None
+                ),
+                "publication_target_id": (
+                    str(live_record.publication_target_id)
+                    if live_record.publication_target_id is not None
+                    else None
+                ),
             }
     except TargetLockUnavailableError as e:
         # Raised entering hold_target_lock() itself, before
@@ -1412,6 +1805,21 @@ def get_live_execution(
         "source_row_count": record.source_row_count,
         "source_schema_fingerprint": record.source_schema_fingerprint,
         "source_dataset_fingerprint": record.source_dataset_fingerprint,
+        "simulation_ingestion_run_id": (
+            str(record.simulation_ingestion_run_id)
+            if record.simulation_ingestion_run_id is not None
+            else None
+        ),
+        "revalidation_ingestion_run_id": (
+            str(record.revalidation_ingestion_run_id)
+            if record.revalidation_ingestion_run_id is not None
+            else None
+        ),
+        "publication_target_id": (
+            str(record.publication_target_id)
+            if record.publication_target_id is not None
+            else None
+        ),
     }
 
 

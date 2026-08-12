@@ -124,6 +124,10 @@ def test_existing_tables_have_nullable_historical_lineage():
     assert "ck_approval_tickets_replay_source" in _constraint_names(
         "approval_tickets"
     )
+    assert (
+        "ck_approval_tickets_live_eligible_ingestion_lineage"
+        in _constraint_names("approval_tickets")
+    )
     assert manifest.c.source_ingestion_run_id.nullable is True
     assert live.c.simulation_ingestion_run_id.nullable is True
     assert live.c.revalidation_ingestion_run_id.nullable is True

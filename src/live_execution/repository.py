@@ -37,7 +37,7 @@ from typing import Optional
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.db.models import LiveExecutionRecord
+from src.db.models import IngestionRunRecord, LiveExecutionRecord
 from src.live_execution.safety import LiveExecutionConflictError
 
 
@@ -139,6 +139,7 @@ class LiveExecutionRepository:
         source_row_count: int,
         source_schema_fingerprint: str,
         source_dataset_fingerprint: str,
+        simulation_ingestion_run_id: Optional[str] = None,
     ) -> LiveExecutionRecord:
         """
         Creates the record already RUNNING, in one committed insert.
@@ -170,6 +171,11 @@ class LiveExecutionRepository:
             source_row_count=source_row_count,
             source_schema_fingerprint=source_schema_fingerprint,
             source_dataset_fingerprint=source_dataset_fingerprint,
+            simulation_ingestion_run_id=(
+                uuid.UUID(str(simulation_ingestion_run_id))
+                if simulation_ingestion_run_id is not None
+                else None
+            ),
         )
         self.db.add(record)
         try:
@@ -182,6 +188,50 @@ class LiveExecutionRepository:
                 "a race between two concurrent requests, not just the pre-flight check."
             )
         self.db.refresh(record)
+        return record
+
+    def attach_revalidation(
+        self,
+        live_execution_id,
+        revalidation_ingestion_run_id,
+        *,
+        commit: bool = True,
+    ) -> LiveExecutionRecord:
+        """Link one terminal revalidation run to its RUNNING execution."""
+        record = self._get(live_execution_id)
+        if record.status != "RUNNING":
+            raise LiveExecutionInvalidStateError(
+                "Revalidation lineage can only be attached to a RUNNING execution."
+            )
+        try:
+            run_uuid = uuid.UUID(str(revalidation_ingestion_run_id))
+        except (TypeError, ValueError) as exc:
+            raise LiveExecutionInvalidStateError(
+                "Revalidation ingestion-run identity is invalid."
+            ) from exc
+        run = self.db.get(IngestionRunRecord, run_uuid)
+        if run is None or run.purpose != "LIVE_REVALIDATION":
+            raise LiveExecutionInvalidStateError(
+                "Live execution requires a terminal live-revalidation run."
+            )
+        if record.simulation_ingestion_run_id is None:
+            raise LiveExecutionInvalidStateError(
+                "Live execution has no captured simulation lineage."
+            )
+        if run.baseline_ingestion_run_id != record.simulation_ingestion_run_id:
+            raise LiveExecutionInvalidStateError(
+                "Revalidation baseline does not match the live execution simulation."
+            )
+        if record.revalidation_ingestion_run_id not in (None, run_uuid):
+            raise LiveExecutionInvalidStateError(
+                "Live execution already references a different revalidation run."
+            )
+        record.revalidation_ingestion_run_id = run_uuid
+        if commit:
+            self.db.commit()
+            self.db.refresh(record)
+        else:
+            self.db.flush()
         return record
 
     def _get(self, live_execution_id) -> LiveExecutionRecord:

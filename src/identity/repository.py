@@ -57,6 +57,13 @@ class IdentityRepository:
         )
 
     @staticmethod
+    def _identity_uuid(value, label: str) -> uuid.UUID:
+        try:
+            return uuid.UUID(str(value))
+        except (TypeError, ValueError) as exc:
+            raise IdentityNotFoundError(f"Unknown {label} identity.") from exc
+
+    @staticmethod
     def _source_system(record: SourceSystemRecord) -> SourceSystemIdentity:
         return SourceSystemIdentity(
             source_system_id=record.source_system_id,
@@ -162,6 +169,39 @@ class IdentityRepository:
         except Exception:
             self.db.rollback()
             raise
+
+    def get_source_system(self, source_system_id) -> SourceSystemIdentity:
+        source_system_uuid = self._identity_uuid(
+            source_system_id, "source system"
+        )
+        record = self.db.get(SourceSystemRecord, source_system_uuid)
+        if record is None:
+            raise IdentityNotFoundError("Unknown source system identity.")
+        return self._source_system(record)
+
+    def verify_source_system_binding(
+        self,
+        source_system_id,
+        system_key: str,
+        binding: EndpointBinding,
+    ) -> SourceSystemIdentity:
+        """Verify live configuration still names the exact captured source."""
+        system_key = validate_system_key(
+            system_key, setting_name="AEGIS_SOURCE_SYSTEM_KEY"
+        )
+        binding = validate_endpoint_binding(binding)
+        system = self.get_source_system(source_system_id)
+        if system.system_key != system_key:
+            raise SystemBindingConflictError(
+                "Configured source system key does not match the approved "
+                "simulation lineage."
+            )
+        if system.endpoint_binding_fingerprint != binding.fingerprint:
+            raise SystemBindingConflictError(
+                "Configured source endpoint binding does not match the approved "
+                "simulation lineage."
+            )
+        return system
 
     def resolve_publication_system(
         self, system_key: str, binding: EndpointBinding
@@ -272,6 +312,15 @@ class IdentityRepository:
         except Exception:
             self.db.rollback()
             raise
+
+    def get_source_dataset(self, source_dataset_id) -> SourceDatasetIdentity:
+        source_dataset_uuid = self._identity_uuid(
+            source_dataset_id, "source dataset"
+        )
+        record = self.db.get(SourceDatasetRecord, source_dataset_uuid)
+        if record is None:
+            raise IdentityNotFoundError("Unknown source dataset identity.")
+        return self._source_dataset(record)
 
     def resolve_publication_target(
         self, publication_system_id, logical_target: str
