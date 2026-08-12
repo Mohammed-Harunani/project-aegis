@@ -152,6 +152,61 @@ def test_publication_target_identity_is_stable_and_target_scoped():
         )
     assert first == same
     assert other.publication_target_id != first.publication_target_id
+    with TestSessionLocal() as db:
+        assert IdentityRepository(db).get_publication_target(
+            first.publication_target_id
+        ) == first
+
+
+def test_live_publication_binding_verification_requires_exact_registered_identity():
+    with TestSessionLocal() as db:
+        repository = IdentityRepository(db)
+        system = repository.resolve_publication_system(
+            "aegis-publish", _binding("publish")
+        )
+        assert repository.get_publication_system(
+            system.publication_system_id
+        ) == system
+        assert repository.verify_publication_system_binding(
+            system.publication_system_id,
+            "aegis-publish",
+            _binding("publish"),
+        ) == system
+        with pytest.raises(SystemBindingConflictError):
+            repository.verify_publication_system_binding(
+                system.publication_system_id,
+                "other-publish",
+                _binding("publish"),
+            )
+        with pytest.raises(SystemBindingConflictError):
+            repository.verify_publication_system_binding(
+                system.publication_system_id,
+                "aegis-publish",
+                _binding("other-publish"),
+            )
+
+
+def test_publication_identity_resolution_can_join_live_record_transaction():
+    with TestSessionLocal() as db:
+        repository = IdentityRepository(db)
+        system = repository.resolve_publication_system(
+            "aegis-publish",
+            _binding("publish"),
+            commit=False,
+        )
+        target = repository.resolve_publication_target(
+            system.publication_system_id,
+            "customer_master",
+            commit=False,
+        )
+        assert db.get(
+            PublicationTargetRecord, target.publication_target_id
+        ) is not None
+        db.rollback()
+
+    with TestSessionLocal() as db:
+        assert db.query(PublicationSystemRecord).count() == 0
+        assert db.query(PublicationTargetRecord).count() == 0
 
 
 def test_unknown_parent_identity_is_rejected():

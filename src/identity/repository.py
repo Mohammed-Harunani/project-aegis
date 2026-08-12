@@ -204,7 +204,11 @@ class IdentityRepository:
         return system
 
     def resolve_publication_system(
-        self, system_key: str, binding: EndpointBinding
+        self,
+        system_key: str,
+        binding: EndpointBinding,
+        *,
+        commit: bool = True,
     ) -> PublicationSystemIdentity:
         system_key = validate_system_key(system_key)
         binding = validate_endpoint_binding(binding)
@@ -225,7 +229,8 @@ class IdentityRepository:
                         f"Publication system key {system_key!r} is already bound "
                         "to a different endpoint."
                     )
-                self.db.commit()
+                if commit:
+                    self.db.commit()
                 return self._publication_system(existing)
 
             duplicate = (
@@ -260,12 +265,50 @@ class IdentityRepository:
                 created_at=datetime.now(UTC),
             )
             self.db.add(record)
-            self.db.commit()
-            self.db.refresh(record)
+            if commit:
+                self.db.commit()
+                self.db.refresh(record)
+            else:
+                self.db.flush()
             return self._publication_system(record)
         except Exception:
             self.db.rollback()
             raise
+
+    def get_publication_system(
+        self, publication_system_id
+    ) -> PublicationSystemIdentity:
+        publication_system_uuid = self._identity_uuid(
+            publication_system_id, "publication system"
+        )
+        record = self.db.get(PublicationSystemRecord, publication_system_uuid)
+        if record is None:
+            raise IdentityNotFoundError("Unknown publication system identity.")
+        return self._publication_system(record)
+
+    def verify_publication_system_binding(
+        self,
+        publication_system_id,
+        system_key: str,
+        binding: EndpointBinding,
+    ) -> PublicationSystemIdentity:
+        """Verify live configuration still names the registered target system."""
+        system_key = validate_system_key(
+            system_key, setting_name="AEGIS_PUBLICATION_SYSTEM_KEY"
+        )
+        binding = validate_endpoint_binding(binding)
+        system = self.get_publication_system(publication_system_id)
+        if system.system_key != system_key:
+            raise SystemBindingConflictError(
+                "Configured publication system key does not match the registered "
+                "publication target."
+            )
+        if system.endpoint_binding_fingerprint != binding.fingerprint:
+            raise SystemBindingConflictError(
+                "Configured publication endpoint binding does not match the "
+                "registered publication target."
+            )
+        return system
 
     def resolve_source_dataset(
         self, source_system_id, source_schema: str, source_table: str
@@ -323,7 +366,11 @@ class IdentityRepository:
         return self._source_dataset(record)
 
     def resolve_publication_target(
-        self, publication_system_id, logical_target: str
+        self,
+        publication_system_id,
+        logical_target: str,
+        *,
+        commit: bool = True,
     ) -> PublicationTargetIdentity:
         validate_identifier(logical_target, "logical target")
         try:
@@ -351,7 +398,8 @@ class IdentityRepository:
                 .one_or_none()
             )
             if existing is not None:
-                self.db.commit()
+                if commit:
+                    self.db.commit()
                 return self._publication_target(existing)
 
             record = PublicationTargetRecord(
@@ -361,9 +409,23 @@ class IdentityRepository:
                 created_at=datetime.now(UTC),
             )
             self.db.add(record)
-            self.db.commit()
-            self.db.refresh(record)
+            if commit:
+                self.db.commit()
+                self.db.refresh(record)
+            else:
+                self.db.flush()
             return self._publication_target(record)
         except Exception:
             self.db.rollback()
             raise
+
+    def get_publication_target(
+        self, publication_target_id
+    ) -> PublicationTargetIdentity:
+        publication_target_uuid = self._identity_uuid(
+            publication_target_id, "publication target"
+        )
+        record = self.db.get(PublicationTargetRecord, publication_target_uuid)
+        if record is None:
+            raise IdentityNotFoundError("Unknown publication target identity.")
+        return self._publication_target(record)

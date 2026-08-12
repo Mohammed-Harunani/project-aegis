@@ -168,22 +168,53 @@ class PostgresPublicationWriter:
             except Exception:
                 pass
 
-    def check_operation_outcome(self, execution_id, operation: str) -> str:
+    @staticmethod
+    def marker_matches_publication_target(marker, publication_target_id) -> bool:
+        marker_target_id = marker.get("publication_target_id")
+        if marker_target_id is None or publication_target_id is None:
+            return marker_target_id is None and publication_target_id is None
+        return str(marker_target_id) == str(publication_target_id)
+
+    @classmethod
+    def _operation_marker_outcome(
+        cls, markers: list, operation: str, publication_target_id
+    ) -> str:
+        operation_markers = [m for m in markers if m["operation"] == operation]
+        if any(
+            cls.marker_matches_publication_target(marker, publication_target_id)
+            for marker in operation_markers
+        ):
+            return "completed"
+        if operation_markers:
+            return "identity_mismatch"
+        return "not_committed"
+
+    def check_operation_outcome(
+        self, execution_id, operation: str, publication_target_id=None
+    ) -> str:
         """
         Marker-only check, with NO lock acquisition -- for use when the
         CALLER already holds the target's session-level lock. Returns
-        "completed" if a matching marker exists, "not_committed" if
-        the marker table is reachable and doesn't, "unknown" if the
-        marker table itself couldn't be checked.
+        "completed" if a matching marker exists, "identity_mismatch"
+        if the execution/operation marker names different target lineage,
+        "not_committed" if the marker table is reachable and has no such
+        operation, or "unknown" if the marker table couldn't be checked.
         """
         try:
             markers = self.get_marker_for_execution(execution_id)
         except Exception:
             return "unknown"
-        has_marker = any(m["operation"] == operation for m in markers)
-        return "completed" if has_marker else "not_committed"
+        return self._operation_marker_outcome(
+            markers, operation, publication_target_id
+        )
 
-    def determine_outcome_under_lock(self, logical_target: str, execution_id, operation: str) -> str:
+    def determine_outcome_under_lock(
+        self,
+        logical_target: str,
+        execution_id,
+        operation: str,
+        publication_target_id=None,
+    ) -> str:
         """
         The definitive way to resolve an ambiguous or stale execution's
         true outcome -- for reconciliation from a SEPARATE, later
@@ -193,8 +224,10 @@ class PostgresPublicationWriter:
         holds it), "not_committed" (lock acquired, no matching marker
         -- provably safe, since nothing else can be running against
         this target while we hold the lock), "completed" (lock
-        acquired, matching marker exists), "unknown" (lock acquired,
-        marker table itself unreachable). The marker lookup happens
+        acquired, matching marker exists), "identity_mismatch" (the
+        operation marker exists for different target lineage), or
+        "unknown" (lock acquired, marker table itself unreachable). The
+        marker lookup happens
         WHILE holding the lock, closing the window where a different
         operation could start between testing the lock and checking
         the marker.
@@ -212,8 +245,9 @@ class PostgresPublicationWriter:
                     markers = self.get_marker_for_execution(execution_id)
                 except Exception:
                     return "unknown"
-                has_marker = any(m["operation"] == operation for m in markers)
-                return "completed" if has_marker else "not_committed"
+                return self._operation_marker_outcome(
+                    markers, operation, publication_target_id
+                )
             finally:
                 conn.execute(
                     text("SELECT pg_advisory_unlock(hashtext(:target))"),
@@ -280,16 +314,48 @@ class PostgresPublicationWriter:
             f'recorded_at TIMESTAMPTZ NOT NULL DEFAULT now()'
             f')'
         ))
+        # Additive target-side evolution. Existing Phase 2.5/3.1 marker
+        # tables and their rows remain intact; historical rows read as
+        # NULL, while every new lineage-aware operation records the
+        # immutable governance-side publication target identity.
+        conn.execute(text(
+            f'ALTER TABLE "{AEGIS_PUBLISH_DATA_SCHEMA}"."{_EXECUTION_LOG_TABLE}" '
+            f'ADD COLUMN IF NOT EXISTS publication_target_id UUID'
+        ))
+
+    def _execution_log_has_publication_target_id(self, conn) -> bool:
+        return bool(conn.execute(
+            text(
+                "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                "WHERE table_schema = :schema AND table_name = :table "
+                "AND column_name = 'publication_target_id')"
+            ),
+            {"schema": AEGIS_PUBLISH_DATA_SCHEMA, "table": _EXECUTION_LOG_TABLE},
+        ).scalar())
+
+    def _publication_target_select_expression(self, conn) -> str:
+        if self._execution_log_has_publication_target_id(conn):
+            return "publication_target_id"
+        # Read-only compatibility with a pre-Phase-3.2 target database.
+        return "NULL::uuid AS publication_target_id"
 
     def _record_marker(
-        self, conn, execution_id, logical_target, physical_table, previous_physical_table, operation
+        self,
+        conn,
+        execution_id,
+        logical_target,
+        physical_table,
+        previous_physical_table,
+        operation,
+        publication_target_id=None,
     ) -> None:
         conn.execute(
             text(
                 f'INSERT INTO "{AEGIS_PUBLISH_DATA_SCHEMA}"."{_EXECUTION_LOG_TABLE}" '
                 f'(marker_id, live_execution_id, logical_target, physical_table, '
-                f'previous_physical_table, operation) '
-                f'VALUES (:marker_id, :execution_id, :target, :physical, :previous, :operation)'
+                f'previous_physical_table, operation, publication_target_id) '
+                f'VALUES (:marker_id, :execution_id, :target, :physical, :previous, '
+                f':operation, :publication_target_id)'
             ),
             {
                 "marker_id": str(uuid_module.uuid4()),
@@ -298,6 +364,11 @@ class PostgresPublicationWriter:
                 "physical": physical_table,
                 "previous": previous_physical_table,
                 "operation": operation,
+                "publication_target_id": (
+                    str(publication_target_id)
+                    if publication_target_id is not None
+                    else None
+                ),
             },
         )
 
@@ -311,10 +382,13 @@ class PostgresPublicationWriter:
         with self.engine.connect() as conn:
             if not self._table_exists(conn, AEGIS_PUBLISH_DATA_SCHEMA, _EXECUTION_LOG_TABLE):
                 return []
+            publication_target_expression = (
+                self._publication_target_select_expression(conn)
+            )
             rows = conn.execute(
                 text(
                     f'SELECT logical_target, physical_table, previous_physical_table, '
-                    f'operation, recorded_at '
+                    f'operation, recorded_at, {publication_target_expression} '
                     f'FROM "{AEGIS_PUBLISH_DATA_SCHEMA}"."{_EXECUTION_LOG_TABLE}" '
                     f'WHERE live_execution_id = :id ORDER BY recorded_at'
                 ),
@@ -334,10 +408,13 @@ class PostgresPublicationWriter:
         with self.engine.connect() as conn:
             if not self._table_exists(conn, AEGIS_PUBLISH_DATA_SCHEMA, _EXECUTION_LOG_TABLE):
                 return None
+            publication_target_expression = (
+                self._publication_target_select_expression(conn)
+            )
             row = conn.execute(
                 text(
                     f'SELECT live_execution_id, physical_table, previous_physical_table, '
-                    f'operation, recorded_at '
+                    f'operation, recorded_at, {publication_target_expression} '
                     f'FROM "{AEGIS_PUBLISH_DATA_SCHEMA}"."{_EXECUTION_LOG_TABLE}" '
                     f'WHERE logical_target = :target ORDER BY recorded_at DESC LIMIT 1'
                 ),
@@ -403,6 +480,7 @@ class PostgresPublicationWriter:
         execution_id,
         expected_row_count: int,
         gold_schema,
+        publication_target_id=None,
     ) -> dict:
         """
         Creates a new immutable physical version table and repoints the
@@ -501,7 +579,7 @@ class PostgresPublicationWriter:
             # committed.
             self._record_marker(
                 conn, execution_id, logical_target, physical_table,
-                previous_physical_table, "PUBLISH",
+                previous_physical_table, "PUBLISH", publication_target_id,
             )
 
         return {
@@ -510,7 +588,14 @@ class PostgresPublicationWriter:
             "final_row_count": expected_row_count,
         }
 
-    def rollback_to_previous(self, conn, logical_target: str, execution_id, previous_physical_table) -> None:
+    def rollback_to_previous(
+        self,
+        conn,
+        logical_target: str,
+        execution_id,
+        previous_physical_table,
+        publication_target_id=None,
+    ) -> None:
         """
         Repoints the stable view back to the execution's own recorded
         previous_physical_table -- or removes the view entirely if
@@ -532,7 +617,8 @@ class PostgresPublicationWriter:
 
             latest_marker = conn.execute(
                 text(
-                    f'SELECT live_execution_id, physical_table, operation '
+                    f'SELECT live_execution_id, physical_table, operation, '
+                    f'publication_target_id '
                     f'FROM "{AEGIS_PUBLISH_DATA_SCHEMA}"."{_EXECUTION_LOG_TABLE}" '
                     f'WHERE logical_target = :target ORDER BY recorded_at DESC LIMIT 1'
                 ),
@@ -543,6 +629,9 @@ class PostgresPublicationWriter:
                 latest_marker is None
                 or str(latest_marker["live_execution_id"]) != str(execution_id)
                 or latest_marker["operation"] != "PUBLISH"
+                or not self.marker_matches_publication_target(
+                    latest_marker, publication_target_id
+                )
             )
             if stale:
                 raise StaleRollbackError(
@@ -568,5 +657,5 @@ class PostgresPublicationWriter:
 
             self._record_marker(
                 conn, execution_id, logical_target, previous_physical_table,
-                current_physical_table, "ROLLBACK",
+                current_physical_table, "ROLLBACK", publication_target_id,
             )

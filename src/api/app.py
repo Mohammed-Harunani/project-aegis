@@ -263,6 +263,13 @@ def _configured_source_binding():
     )
 
 
+def _configured_publication_binding():
+    return configured_binding(
+        key_env="AEGIS_PUBLICATION_SYSTEM_KEY",
+        url_env="LIVE_DATABASE_URL",
+    )
+
+
 def _verify_optional_source_publication_separation(source_binding) -> None:
     # Publication configuration stays lazy: source-only simulation does not
     # require it, but when both server-controlled values exist the unsafe
@@ -276,6 +283,28 @@ def _verify_optional_source_publication_separation(source_binding) -> None:
             url_env="LIVE_DATABASE_URL",
         )
         ensure_distinct_bindings(source_binding, publication_binding)
+
+
+def _verify_registered_publication_target(
+    db: Session, publication_target_id, logical_target: str
+):
+    """Verify a persisted target still matches server-controlled live config."""
+    identities = IdentityRepository(db)
+    target = identities.get_publication_target(publication_target_id)
+    if target.logical_target != logical_target:
+        raise SystemBindingConflictError(
+            "Registered publication target does not match the live execution's "
+            "logical target."
+        )
+    publication_system_key, publication_binding = (
+        _configured_publication_binding()
+    )
+    identities.verify_publication_system_binding(
+        target.publication_system_id,
+        publication_system_key,
+        publication_binding,
+    )
+    return target
 
 
 def _simulation_lineage(source_system, source_dataset, captured) -> dict:
@@ -1120,6 +1149,24 @@ def get_source_dataset(source_dataset_id: str, db: Session = Depends(get_db)):
     }
 
 
+@app.get("/publication-targets/{publication_target_id}")
+def get_publication_target(
+    publication_target_id: str, db: Session = Depends(get_db)
+):
+    try:
+        target = IdentityRepository(db).get_publication_target(
+            publication_target_id
+        )
+    except IdentityNotFoundError:
+        raise HTTPException(status_code=404, detail="Publication target not found.")
+    return {
+        "publication_target_id": str(target.publication_target_id),
+        "publication_system_id": str(target.publication_system_id),
+        "logical_target": target.logical_target,
+        "created_at": target.created_at.isoformat(),
+    }
+
+
 @app.get("/source-datasets/{source_dataset_id}/ingestion-runs")
 def list_source_dataset_ingestion_runs(
     source_dataset_id: str, db: Session = Depends(get_db)
@@ -1305,25 +1352,45 @@ def execute_live(
                 status_code=422,
                 detail="Ticket simulation ingestion lineage is invalid.",
             ) from e
-        try:
-            source_system_key, source_binding = _configured_source_binding()
-            _verify_optional_source_publication_separation(source_binding)
-            IdentityRepository(db).verify_source_system_binding(
+    identities = IdentityRepository(db)
+    try:
+        source_system_key, source_binding = _configured_source_binding()
+        publication_system_key, publication_binding = (
+            _configured_publication_binding()
+        )
+        ensure_distinct_bindings(source_binding, publication_binding)
+        if simulation_replay is not None:
+            identities.verify_source_system_binding(
                 simulation_replay.source_system_id,
                 source_system_key,
                 source_binding,
             )
-        except IdentityConfigurationError as e:
-            raise HTTPException(status_code=500, detail=str(e))
-        except SystemBindingConflictError as e:
-            raise HTTPException(status_code=409, detail=str(e))
-        except UnsafeDatabaseTopologyError as e:
-            raise HTTPException(status_code=422, detail=str(e))
-        except IdentityNotFoundError as e:
-            raise HTTPException(
-                status_code=422,
-                detail="Ticket source-system lineage is invalid.",
-            ) from e
+        publication_system = identities.resolve_publication_system(
+            publication_system_key,
+            publication_binding,
+            commit=False,
+        )
+        publication_target = identities.resolve_publication_target(
+            publication_system.publication_system_id,
+            request.logical_target,
+            commit=False,
+        )
+    except IdentityConfigurationError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    except (
+        EndpointBindingAlreadyRegisteredError,
+        SystemBindingConflictError,
+    ) as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except UnsafeDatabaseTopologyError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except IdentityNotFoundError as e:
+        raise HTTPException(
+            status_code=422,
+            detail="Ticket or publication identity lineage is invalid.",
+        ) from e
+    except InvalidIdentifierError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
     live_repo = LiveExecutionRepository(db)
 
@@ -1382,6 +1449,7 @@ def execute_live(
                     source_schema_fingerprint=ticket.source_schema_fingerprint,
                     source_dataset_fingerprint=ticket.source_dataset_fingerprint,
                     simulation_ingestion_run_id=ticket.source_ingestion_run_id,
+                    publication_target_id=publication_target.publication_target_id,
                 )
             except LiveExecutionConflictError as e:
                 raise HTTPException(status_code=409, detail=str(e))
@@ -1562,6 +1630,7 @@ def execute_live(
                     execution_id=live_record.live_execution_id,
                     expected_row_count=manifest_record.final_row_count,
                     gold_schema=ticket.gold_schema,
+                    publication_target_id=live_record.publication_target_id,
                 )
             except SourceChangedError as e:
                 # The world changed out from under the approval --
@@ -1628,12 +1697,47 @@ def execute_live(
                 # the case where the response/acknowledgement was lost
                 # after commit.
                 outcome = writer.check_operation_outcome(
-                    live_record.live_execution_id, "PUBLISH"
+                    live_record.live_execution_id,
+                    "PUBLISH",
+                    live_record.publication_target_id,
                 )
                 if outcome == "completed":
-                    marker = writer.get_latest_marker(request.logical_target)
-                    physical_table = marker["physical_table"] if marker else None
-                    previous_physical_table = marker["previous_physical_table"] if marker else None
+                    markers = writer.get_marker_for_execution(
+                        live_record.live_execution_id
+                    )
+                    marker = next(
+                        (
+                            candidate
+                            for candidate in markers
+                            if candidate["operation"] == "PUBLISH"
+                            and writer.marker_matches_publication_target(
+                                candidate,
+                                live_record.publication_target_id,
+                            )
+                        ),
+                        None,
+                    )
+                    if marker is None:
+                        live_repo.mark_outcome_unknown(
+                            live_record.live_execution_id,
+                            reason=(
+                                "A matching publication marker disappeared during "
+                                "ambiguous-outcome verification. Left RUNNING for "
+                                "manual investigation."
+                            ),
+                        )
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "Live execution outcome changed during target-marker "
+                                "verification. The execution remains RUNNING for "
+                                "manual investigation."
+                            ),
+                        )
+                    physical_table = marker["physical_table"]
+                    previous_physical_table = marker[
+                        "previous_physical_table"
+                    ]
                     live_repo.mark_completed(
                         live_record.live_execution_id,
                         physical_table=physical_table,
@@ -1677,7 +1781,10 @@ def execute_live(
                 # checked at all. In either case it would be unsafe to
                 # mark FAILED and permit a retry, because the original
                 # publication may still have committed.
-                if isinstance(e, DBAPIError) or outcome == "unknown":
+                if isinstance(e, DBAPIError) or outcome in (
+                    "unknown",
+                    "identity_mismatch",
+                ):
                     live_repo.mark_outcome_unknown(
                         live_record.live_execution_id,
                         reason=(
@@ -1766,6 +1873,21 @@ def get_live_execution(
     except LiveExecutionNotFoundError:
         raise HTTPException(status_code=404, detail="Live execution not found.")
 
+    if (
+        record.status in ("RUNNING", "ROLLING_BACK")
+        and record.publication_target_id is not None
+    ):
+        try:
+            _verify_registered_publication_target(
+                db, record.publication_target_id, record.logical_target
+            )
+        except IdentityConfigurationError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        except (SystemBindingConflictError, IdentityNotFoundError) as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except UnsafeDatabaseTopologyError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
     # Crash-recovery reconciliation: a record stuck RUNNING or
     # ROLLING_BACK means the API may have crashed between the target
     # transaction committing and the governance update running. The
@@ -1842,6 +1964,18 @@ def rollback_live_execution(
             detail=f"Cannot roll back a live execution with status {record.status!r}.",
         )
 
+    if record.publication_target_id is not None:
+        try:
+            _verify_registered_publication_target(
+                db, record.publication_target_id, record.logical_target
+            )
+        except IdentityConfigurationError as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        except (SystemBindingConflictError, IdentityNotFoundError) as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        except UnsafeDatabaseTopologyError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
     # Governance-side staleness check: has a NEWER execution completed
     # against this same logical target since? The target-side marker
     # check inside writer.rollback_to_previous() below is the other
@@ -1875,6 +2009,7 @@ def rollback_live_execution(
                     logical_target=record.logical_target,
                     execution_id=record.live_execution_id,
                     previous_physical_table=record.previous_physical_table,
+                    publication_target_id=record.publication_target_id,
                 )
             except StaleRollbackError as e:
                 # Left in ROLLING_BACK rather than reverted -- the
@@ -1892,7 +2027,9 @@ def rollback_live_execution(
                 # plain marker check, not a lock-testing one, since we
                 # already hold this target's lock ourselves right now.
                 outcome = writer.check_operation_outcome(
-                    record.live_execution_id, "ROLLBACK"
+                    record.live_execution_id,
+                    "ROLLBACK",
+                    record.publication_target_id,
                 )
                 if outcome == "completed":
                     updated = live_repo.mark_rolled_back(live_execution_id)
@@ -1901,6 +2038,11 @@ def rollback_live_execution(
                         "status": updated.status,
                         "rolled_back_by": updated.rolled_back_by,
                         "rolled_back_at": updated.rolled_back_at.isoformat(),
+                        "publication_target_id": (
+                            str(updated.publication_target_id)
+                            if updated.publication_target_id is not None
+                            else None
+                        ),
                         "note": (
                             "The original response to this request was lost to a "
                             "connection error, but the target-side marker confirms "
@@ -1964,6 +2106,11 @@ def rollback_live_execution(
                 "status": updated.status,
                 "rolled_back_by": updated.rolled_back_by,
                 "rolled_back_at": updated.rolled_back_at.isoformat(),
+                "publication_target_id": (
+                    str(updated.publication_target_id)
+                    if updated.publication_target_id is not None
+                    else None
+                ),
             }
     except TargetLockUnavailableError as e:
         # Raised entering hold_target_lock() itself, before

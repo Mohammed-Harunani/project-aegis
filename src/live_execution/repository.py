@@ -37,7 +37,11 @@ from typing import Optional
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from src.db.models import IngestionRunRecord, LiveExecutionRecord
+from src.db.models import (
+    IngestionRunRecord,
+    LiveExecutionRecord,
+    PublicationTargetRecord,
+)
 from src.live_execution.safety import LiveExecutionConflictError
 
 
@@ -140,6 +144,7 @@ class LiveExecutionRepository:
         source_schema_fingerprint: str,
         source_dataset_fingerprint: str,
         simulation_ingestion_run_id: Optional[str] = None,
+        publication_target_id: Optional[str] = None,
     ) -> LiveExecutionRecord:
         """
         Creates the record already RUNNING, in one committed insert.
@@ -150,6 +155,27 @@ class LiveExecutionRepository:
         account for what was revalidated immediately before
         publication.
         """
+        publication_target_uuid = None
+        if publication_target_id is not None:
+            try:
+                publication_target_uuid = uuid.UUID(str(publication_target_id))
+            except (TypeError, ValueError) as exc:
+                raise LiveExecutionConflictError(
+                    "Publication target identity is invalid."
+                ) from exc
+            publication_target = self.db.get(
+                PublicationTargetRecord, publication_target_uuid
+            )
+            if publication_target is None:
+                raise LiveExecutionConflictError(
+                    "Publication target identity does not exist."
+                )
+            if publication_target.logical_target != logical_target:
+                raise LiveExecutionConflictError(
+                    "Publication target identity does not match the requested "
+                    "logical target."
+                )
+
         record = LiveExecutionRecord(
             live_execution_id=uuid.uuid4(),
             ticket_id=uuid.UUID(ticket_id),
@@ -176,6 +202,7 @@ class LiveExecutionRepository:
                 if simulation_ingestion_run_id is not None
                 else None
             ),
+            publication_target_id=publication_target_uuid,
         )
         self.db.add(record)
         try:
@@ -363,27 +390,49 @@ class LiveExecutionRepository:
             return record
 
         outcome = writer.determine_outcome_under_lock(
-            record.logical_target, record.live_execution_id, "PUBLISH"
+            record.logical_target,
+            record.live_execution_id,
+            "PUBLISH",
+            record.publication_target_id,
         )
 
         if outcome == "active":
             return record
-        if outcome == "unknown":
+        if outcome in ("unknown", "identity_mismatch"):
             record.failure_reason = (
                 f"Reconciliation attempted after {age_seconds:.0f}s but the target-side "
-                f"marker could not be checked -- left RUNNING for a later attempt."
+                f"marker outcome was {outcome!r} -- left RUNNING for manual review "
+                f"or a later attempt."
             )
             self.db.commit()
             self.db.refresh(record)
             return record
         if outcome == "completed":
             markers = writer.get_marker_for_execution(record.live_execution_id)
-            publish_marker = next((m for m in markers if m["operation"] == "PUBLISH"), None)
-            record.status = "COMPLETED"
-            record.physical_table = publish_marker["physical_table"] if publish_marker else None
-            record.previous_physical_table = (
-                publish_marker["previous_physical_table"] if publish_marker else None
+            publish_marker = next(
+                (
+                    marker
+                    for marker in markers
+                    if marker["operation"] == "PUBLISH"
+                    and writer.marker_matches_publication_target(
+                        marker, record.publication_target_id
+                    )
+                ),
+                None,
             )
+            if publish_marker is None:
+                record.failure_reason = (
+                    "A matching publication marker disappeared during "
+                    "reconciliation. Left RUNNING for manual investigation."
+                )
+                self.db.commit()
+                self.db.refresh(record)
+                return record
+            record.status = "COMPLETED"
+            record.physical_table = publish_marker["physical_table"]
+            record.previous_physical_table = publish_marker[
+                "previous_physical_table"
+            ]
             record.completed_at = datetime.now(UTC)
         else:  # "not_committed"
             record.status = "FAILED"
@@ -413,15 +462,19 @@ class LiveExecutionRepository:
             return record
 
         outcome = writer.determine_outcome_under_lock(
-            record.logical_target, record.live_execution_id, "ROLLBACK"
+            record.logical_target,
+            record.live_execution_id,
+            "ROLLBACK",
+            record.publication_target_id,
         )
 
         if outcome == "active":
             return record
-        if outcome == "unknown":
+        if outcome in ("unknown", "identity_mismatch"):
             record.failure_reason = (
                 f"Reconciliation attempted after {age_seconds:.0f}s but the target-side "
-                f"marker could not be checked -- left ROLLING_BACK for a later attempt."
+                f"marker outcome was {outcome!r} -- left ROLLING_BACK for manual "
+                f"review or a later attempt."
             )
             self.db.commit()
             self.db.refresh(record)
