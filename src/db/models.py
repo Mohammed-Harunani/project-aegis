@@ -1,8 +1,9 @@
 """
 Aegis_DB_Models
 Phase 2.3 -- SQLAlchemy ORM models for durable approval and manifest
-storage. Phase 2.4 adds the schema registry (gold_schemas,
-schema_versions) and nullable lineage FKs on the two existing tables.
+storage. Later phases add the schema registry, live execution,
+verified conversion evidence, and Phase 3.2's source-ingestion and
+dataset-identity lineage.
 
 Postgres-specific types (UUID, JSONB) are used deliberately -- this
 targets PostgreSQL only, not a portable/SQLite-compatible schema.
@@ -12,11 +13,282 @@ models cannot be exercised against SQLite as a stand-in for testing.
 
 import uuid
 
-from sqlalchemy import Column, Text, Numeric, DateTime, Integer, ForeignKey, UniqueConstraint, Index, text, CheckConstraint, Boolean
+from sqlalchemy import (
+    Boolean,
+    CheckConstraint,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Numeric,
+    Text,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.orm import declarative_base
 
 Base = declarative_base()
+
+
+class SourceSystemRecord(Base):
+    """Immutable server-controlled identity for one trusted source binding."""
+
+    __tablename__ = "source_systems"
+    __table_args__ = (
+        UniqueConstraint("system_key", name="uq_source_systems_system_key"),
+        UniqueConstraint(
+            "endpoint_binding_fingerprint",
+            name="uq_source_systems_endpoint_binding_fingerprint",
+        ),
+        CheckConstraint("platform = 'POSTGRESQL'", name="ck_source_systems_platform"),
+        CheckConstraint("binding_version = 1", name="ck_source_systems_binding_version"),
+        CheckConstraint(
+            "system_key ~ '^[a-z][a-z0-9_-]{2,63}$'",
+            name="ck_source_systems_system_key",
+        ),
+        CheckConstraint(
+            "endpoint_binding_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="ck_source_systems_endpoint_binding_fingerprint",
+        ),
+    )
+
+    source_system_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    system_key = Column(Text, nullable=False)
+    platform = Column(Text, nullable=False)
+    binding_version = Column(Integer, nullable=False)
+    endpoint_binding_fingerprint = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class SourceDatasetRecord(Base):
+    """Stable identity for one source-system/schema/table combination."""
+
+    __tablename__ = "source_datasets"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_system_id",
+            "source_schema",
+            "source_table",
+            name="uq_source_datasets_system_relation",
+        ),
+        CheckConstraint(
+            "source_schema ~ '^[A-Za-z_][A-Za-z0-9_]{0,62}$'",
+            name="ck_source_datasets_source_schema",
+        ),
+        CheckConstraint(
+            "source_table ~ '^[A-Za-z_][A-Za-z0-9_]{0,62}$'",
+            name="ck_source_datasets_source_table",
+        ),
+    )
+
+    source_dataset_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_system_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "source_systems.source_system_id",
+            name="fk_source_datasets_source_system_id",
+        ),
+        nullable=False,
+    )
+    source_schema = Column(Text, nullable=False)
+    source_table = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class DatasetSnapshotRecord(Base):
+    """Dataset-scoped, deduplicated, replayable complete source snapshot."""
+
+    __tablename__ = "dataset_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_dataset_id",
+            "provenance_fingerprint",
+            name="uq_dataset_snapshots_dataset_provenance",
+        ),
+        CheckConstraint(
+            "provenance_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="ck_dataset_snapshots_provenance_fingerprint",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(source_primary_key) = 'array' "
+            "AND jsonb_array_length(source_primary_key) > 0",
+            name="ck_dataset_snapshots_primary_key_array",
+        ),
+        CheckConstraint("source_row_count >= 0", name="ck_dataset_snapshots_row_count"),
+        CheckConstraint(
+            "source_schema_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="ck_dataset_snapshots_schema_fingerprint",
+        ),
+        CheckConstraint(
+            "source_dataset_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="ck_dataset_snapshots_dataset_fingerprint",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(column_metadata) = 'array' "
+            "AND jsonb_array_length(column_metadata) > 0",
+            name="ck_dataset_snapshots_column_metadata_array",
+        ),
+        CheckConstraint(
+            "payload_format_version > 0",
+            name="ck_dataset_snapshots_payload_format_version",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(snapshot_payload) = 'object'",
+            name="ck_dataset_snapshots_payload_object",
+        ),
+        Index("ix_dataset_snapshots_dataset_created", "source_dataset_id", "created_at"),
+    )
+
+    dataset_snapshot_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_dataset_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "source_datasets.source_dataset_id",
+            name="fk_dataset_snapshots_source_dataset_id",
+        ),
+        nullable=False,
+    )
+    provenance_fingerprint = Column(Text, nullable=False)
+    source_primary_key = Column(JSONB, nullable=False)
+    source_row_count = Column(Integer, nullable=False)
+    source_schema_fingerprint = Column(Text, nullable=False)
+    source_dataset_fingerprint = Column(Text, nullable=False)
+    column_metadata = Column(JSONB, nullable=False)
+    payload_format_version = Column(Integer, nullable=False)
+    snapshot_payload = Column(JSONB, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class IngestionRunRecord(Base):
+    """Append-only terminal record of one trusted-source observation."""
+
+    __tablename__ = "ingestion_runs"
+    __table_args__ = (
+        CheckConstraint(
+            "purpose IN ('SIMULATION', 'LIVE_REVALIDATION')",
+            name="ck_ingestion_runs_purpose",
+        ),
+        CheckConstraint(
+            "outcome IN ('CAPTURED', 'MATCHED', 'DRIFTED', 'FAILED')",
+            name="ck_ingestion_runs_outcome",
+        ),
+        CheckConstraint(
+            "completed_at >= started_at",
+            name="ck_ingestion_runs_timestamp_order",
+        ),
+        CheckConstraint(
+            "(purpose = 'SIMULATION' AND outcome = 'CAPTURED' "
+            "AND dataset_snapshot_id IS NOT NULL AND baseline_ingestion_run_id IS NULL) OR "
+            "(purpose = 'SIMULATION' AND outcome = 'FAILED' "
+            "AND baseline_ingestion_run_id IS NULL) OR "
+            "(purpose = 'LIVE_REVALIDATION' AND outcome IN ('MATCHED', 'DRIFTED') "
+            "AND dataset_snapshot_id IS NOT NULL AND baseline_ingestion_run_id IS NOT NULL) OR "
+            "(purpose = 'LIVE_REVALIDATION' AND outcome = 'FAILED' "
+            "AND baseline_ingestion_run_id IS NOT NULL)",
+            name="ck_ingestion_runs_valid_combination",
+        ),
+        CheckConstraint(
+            "outcome <> 'FAILED' OR failure_code IS NOT NULL",
+            name="ck_ingestion_runs_failed_code",
+        ),
+        Index("ix_ingestion_runs_dataset_completed", "source_dataset_id", "completed_at"),
+        Index("ix_ingestion_runs_baseline", "baseline_ingestion_run_id"),
+    )
+
+    ingestion_run_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_dataset_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "source_datasets.source_dataset_id",
+            name="fk_ingestion_runs_source_dataset_id",
+        ),
+        nullable=False,
+    )
+    dataset_snapshot_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "dataset_snapshots.dataset_snapshot_id",
+            name="fk_ingestion_runs_dataset_snapshot_id",
+        ),
+        nullable=True,
+        index=True,
+    )
+    purpose = Column(Text, nullable=False)
+    outcome = Column(Text, nullable=False)
+    baseline_ingestion_run_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "ingestion_runs.ingestion_run_id",
+            name="fk_ingestion_runs_baseline_ingestion_run_id",
+        ),
+        nullable=True,
+    )
+    requested_by = Column(Text, nullable=True)
+    started_at = Column(DateTime(timezone=True), nullable=False)
+    completed_at = Column(DateTime(timezone=True), nullable=False)
+    failure_code = Column(Text, nullable=True)
+    failure_reason = Column(Text, nullable=True)
+
+
+class PublicationSystemRecord(Base):
+    """Immutable server-controlled identity for one publication binding."""
+
+    __tablename__ = "publication_systems"
+    __table_args__ = (
+        UniqueConstraint("system_key", name="uq_publication_systems_system_key"),
+        UniqueConstraint(
+            "endpoint_binding_fingerprint",
+            name="uq_publication_systems_endpoint_binding_fingerprint",
+        ),
+        CheckConstraint("platform = 'POSTGRESQL'", name="ck_publication_systems_platform"),
+        CheckConstraint("binding_version = 1", name="ck_publication_systems_binding_version"),
+        CheckConstraint(
+            "system_key ~ '^[a-z][a-z0-9_-]{2,63}$'",
+            name="ck_publication_systems_system_key",
+        ),
+        CheckConstraint(
+            "endpoint_binding_fingerprint ~ '^[0-9a-f]{64}$'",
+            name="ck_publication_systems_endpoint_binding_fingerprint",
+        ),
+    )
+
+    publication_system_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    system_key = Column(Text, nullable=False)
+    platform = Column(Text, nullable=False)
+    binding_version = Column(Integer, nullable=False)
+    endpoint_binding_fingerprint = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
+
+
+class PublicationTargetRecord(Base):
+    """Stable identity for one logical target within a publication system."""
+
+    __tablename__ = "publication_targets"
+    __table_args__ = (
+        UniqueConstraint(
+            "publication_system_id",
+            "logical_target",
+            name="uq_publication_targets_system_logical_target",
+        ),
+        CheckConstraint(
+            "logical_target ~ '^[A-Za-z_][A-Za-z0-9_]{0,62}$'",
+            name="ck_publication_targets_logical_target",
+        ),
+    )
+
+    publication_target_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    publication_system_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "publication_systems.publication_system_id",
+            name="fk_publication_targets_publication_system_id",
+        ),
+        nullable=False,
+    )
+    logical_target = Column(Text, nullable=False)
+    created_at = Column(DateTime(timezone=True), nullable=False)
 
 
 class ApprovalTicketRecord(Base):
@@ -40,6 +312,10 @@ class ApprovalTicketRecord(Base):
             "conversion_decision IS NULL OR jsonb_typeof(conversion_decision) = 'object'",
             name="ck_approval_tickets_conversion_decision_object",
         ),
+        CheckConstraint(
+            "target_dataset IS NOT NULL OR source_ingestion_run_id IS NOT NULL",
+            name="ck_approval_tickets_replay_source",
+        ),
     )
 
     ticket_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -55,7 +331,7 @@ class ApprovalTicketRecord(Base):
     # Stored as structured JSONB, never pickled/repr'd Python objects.
     observed_schema = Column(JSONB, nullable=False)
     gold_schema = Column(JSONB, nullable=False)
-    target_dataset = Column(JSONB, nullable=False)
+    target_dataset = Column(JSONB, nullable=True)
 
     # Phase 2.4 -- nullable so existing rows and legacy direct-schema
     # requests (which never reference the registry) are unaffected.
@@ -79,6 +355,19 @@ class ApprovalTicketRecord(Base):
     source_schema_fingerprint = Column(Text, nullable=True)
     source_dataset_fingerprint = Column(Text, nullable=True)
     live_eligible = Column(Boolean, nullable=False, default=False)
+
+    # Phase 3.2 -- nullable for historical and sample-data tickets.
+    # New source-backed tickets will use this lineage and load their
+    # replayable DataFrame from the linked immutable snapshot.
+    source_ingestion_run_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "ingestion_runs.ingestion_run_id",
+            name="fk_approval_tickets_source_ingestion_run_id",
+        ),
+        nullable=True,
+        index=True,
+    )
 
     # Phase 3.1.4 -- redacted verified CAST_COLUMN preflight decision.
     # None for RENAME_COLUMN tickets and all pre-Phase-3.1.4 rows.
@@ -142,6 +431,18 @@ class HealingManifestRecord(Base):
     # Phase 3.1.4 -- persisted redacted CAST_COLUMN execution outcome.
     # The corrected DataFrame itself remains ephemeral and is never stored.
     conversion_outcome = Column(JSONB(none_as_null=True), nullable=True)
+
+    # Phase 3.2 -- exact simulation observation used by the ticket.
+    # Nullable for historical, auto-approved, and sample-data rows.
+    source_ingestion_run_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "ingestion_runs.ingestion_run_id",
+            name="fk_healing_manifests_source_ingestion_run_id",
+        ),
+        nullable=True,
+        index=True,
+    )
 
 
 class GoldSchemaRecord(Base):
@@ -270,3 +571,34 @@ class LiveExecutionRecord(Base):
     source_row_count = Column(Integer, nullable=False)
     source_schema_fingerprint = Column(Text, nullable=False)
     source_dataset_fingerprint = Column(Text, nullable=False)
+
+    # Phase 3.2 lineage. Nullable at the schema level for historical
+    # rows and, for revalidation, the short RUNNING interval before
+    # the fresh observation becomes terminal and durable.
+    simulation_ingestion_run_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "ingestion_runs.ingestion_run_id",
+            name="fk_live_executions_simulation_ingestion_run_id",
+        ),
+        nullable=True,
+        index=True,
+    )
+    revalidation_ingestion_run_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "ingestion_runs.ingestion_run_id",
+            name="fk_live_executions_revalidation_ingestion_run_id",
+        ),
+        nullable=True,
+        index=True,
+    )
+    publication_target_id = Column(
+        UUID(as_uuid=True),
+        ForeignKey(
+            "publication_targets.publication_target_id",
+            name="fk_live_executions_publication_target_id",
+        ),
+        nullable=True,
+        index=True,
+    )
