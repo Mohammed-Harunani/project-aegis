@@ -889,6 +889,17 @@ def test_high_precision_numeric_and_temporal_types_survive_publication():
     result = read_complete_source_table(source_engine, "public", "financial_precision_test")
     df = result["dataframe"]
 
+    assert [item["column_name"] for item in result["column_metadata"]] == list(
+        df.columns
+    )
+    amount_metadata = next(
+        item
+        for item in result["column_metadata"]
+        if item["column_name"] == "amount"
+    )
+    assert amount_metadata["numeric_precision"] == 20
+    assert amount_metadata["numeric_scale"] == 9
+
     amount = df["amount"].iloc[0]
     assert isinstance(amount, decimal.Decimal), f"amount should be Decimal, got {type(amount)}"
     assert str(amount) == "12345678901.123456789", f"NUMERIC precision was not preserved: {amount}"

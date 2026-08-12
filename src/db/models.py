@@ -331,7 +331,10 @@ class ApprovalTicketRecord(Base):
     # Stored as structured JSONB, never pickled/repr'd Python objects.
     observed_schema = Column(JSONB, nullable=False)
     gold_schema = Column(JSONB, nullable=False)
-    target_dataset = Column(JSONB, nullable=True)
+    # none_as_null=True is required for new snapshot-backed tickets: Python
+    # None must become SQL NULL, not a JSONB literal null that would satisfy
+    # `target_dataset IS NOT NULL` while containing no replayable payload.
+    target_dataset = Column(JSONB(none_as_null=True), nullable=True)
 
     # Phase 2.4 -- nullable so existing rows and legacy direct-schema
     # requests (which never reference the registry) are unaffected.

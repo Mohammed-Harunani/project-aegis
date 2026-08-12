@@ -600,6 +600,7 @@ def list_pending_approvals(db: Session = Depends(get_db)):
                 "status": t.status,
                 "created_at": t.created_at,
                 "schema_version_id": t.schema_version_id,
+                "source_ingestion_run_id": t.source_ingestion_run_id,
                 "conversion_decision": _public_conversion_metadata(
                     t.conversion_decision
                 ),
@@ -627,6 +628,7 @@ def get_approval(ticket_id: str, db: Session = Depends(get_db)):
         "decided_at": t.decided_at,
         "decision_note": t.decision_note,
         "schema_version_id": t.schema_version_id,
+        "source_ingestion_run_id": t.source_ingestion_run_id,
         "conversion_decision": _public_conversion_metadata(
             t.conversion_decision
         ),

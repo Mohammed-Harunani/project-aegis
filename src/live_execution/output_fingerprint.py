@@ -18,16 +18,12 @@ import json
 
 import pandas as pd
 
-# Deliberately reusing approval_repository's private scalar sanitizer
-# rather than duplicating it or refactoring it out into a shared
-# module: it's already proven correct for Decimal/Timestamp/date/
-# infinity through three rounds of live Postgres verification in
-# Phase 2.3, and that code is closed -- touching it now to extract a
-# "clean" shared utility would risk regressing already-verified,
-# closed work for a cosmetic gain. Two copies of this logic drifting
-# apart over time would be worse than this one clearly-commented
-# exception to normal module encapsulation.
-from src.governance.approval_repository import _sanitize_scalar as _sanitize_value_for_fingerprint
+# Phase 3.2 moved the already-proven scalar codec to a shared module because
+# immutable snapshots and approval replay now require the exact same encoder.
+# Fingerprinting continues to reuse that single implementation.
+from src.governance.dataset_codec import (
+    sanitize_scalar as _sanitize_value_for_fingerprint,
+)
 
 
 def compute_dataframe_fingerprint(df: pd.DataFrame) -> str:
