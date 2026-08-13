@@ -59,10 +59,16 @@ from src.db.source_session import get_source_engine
 from src.db.models import (
     Base,
     ApprovalTicketRecord,
+    DatasetSnapshotRecord,
     HealingManifestRecord,
+    IngestionRunRecord,
     GoldSchemaRecord,
     SchemaVersionRecord,
     LiveExecutionRecord,
+    PublicationSystemRecord,
+    PublicationTargetRecord,
+    SourceDatasetRecord,
+    SourceSystemRecord,
 )
 from src.live_execution.repository import LiveExecutionRepository
 from src.live_execution.writer import PostgresPublicationWriter, AEGIS_PUBLISH_SCHEMA, AEGIS_PUBLISH_DATA_SCHEMA
@@ -102,8 +108,14 @@ def setup_function(_):
     os.environ["AEGIS_LIVE_CAST_ALLOWLIST"] = ""
     with engine.begin() as conn:
         conn.execute(LiveExecutionRecord.__table__.delete())
+        conn.execute(PublicationTargetRecord.__table__.delete())
+        conn.execute(PublicationSystemRecord.__table__.delete())
         conn.execute(HealingManifestRecord.__table__.delete())
         conn.execute(ApprovalTicketRecord.__table__.delete())
+        conn.execute(IngestionRunRecord.__table__.delete())
+        conn.execute(DatasetSnapshotRecord.__table__.delete())
+        conn.execute(SourceDatasetRecord.__table__.delete())
+        conn.execute(SourceSystemRecord.__table__.delete())
         conn.execute(SchemaVersionRecord.__table__.delete())
         conn.execute(GoldSchemaRecord.__table__.delete())
     with live_target_engine.begin() as conn:
@@ -370,6 +382,50 @@ def test_live_cast_republish_and_rollback_preserve_immutable_versions():
 
 # ---- Trusted source ----
 
+
+def test_source_simulation_requires_server_controlled_source_system_key():
+    schema_name = _register_schema("missing_source_key_schema")
+    original_key = os.environ.pop("AEGIS_SOURCE_SYSTEM_KEY")
+    try:
+        response = client.post(
+            "/simulate-migration-from-source",
+            json={
+                "schema_name": schema_name,
+                "source_schema": "public",
+                "source_table": "customers",
+            },
+        )
+    finally:
+        os.environ["AEGIS_SOURCE_SYSTEM_KEY"] = original_key
+
+    assert response.status_code == 500
+    assert "AEGIS_SOURCE_SYSTEM_KEY" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        assert db.query(SourceSystemRecord).count() == 0
+
+
+def test_source_and_publication_configured_to_same_binding_are_rejected():
+    schema_name = _register_schema("unsafe_topology_schema")
+    original_live_url = os.environ["LIVE_DATABASE_URL"]
+    os.environ["LIVE_DATABASE_URL"] = os.environ["SOURCE_DATABASE_URL"]
+    try:
+        response = client.post(
+            "/simulate-migration-from-source",
+            json={
+                "schema_name": schema_name,
+                "source_schema": "public",
+                "source_table": "customers",
+            },
+        )
+    finally:
+        os.environ["LIVE_DATABASE_URL"] = original_live_url
+
+    assert response.status_code == 422
+    assert "same database binding" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        assert db.query(SourceSystemRecord).count() == 0
+
+
 def test_source_table_without_primary_key_rejected():
     with source_engine.begin() as conn:
         conn.execute(text('CREATE TABLE customers_no_pk (customer_id BIGINT, name TEXT)'))
@@ -378,6 +434,45 @@ def test_source_table_without_primary_key_rejected():
         "schema_name": schema_name, "source_schema": "public", "source_table": "customers_no_pk",
     })
     assert response.status_code == 422
+    with TestSessionLocal() as db:
+        run = db.query(IngestionRunRecord).one()
+        assert run.purpose == "SIMULATION"
+        assert run.outcome == "FAILED"
+        assert run.failure_code == "SOURCE_VALIDATION_FAILED"
+        assert run.failure_reason == (
+            "Complete source observation failed validation."
+        )
+        assert run.dataset_snapshot_id is None
+
+
+def test_source_read_failure_is_redacted_and_creates_no_ticket():
+    schema_name = _register_schema("source_read_failure_schema")
+    with patch(
+        "src.api.app.read_complete_source_table",
+        side_effect=RuntimeError(
+            "postgresql://admin:raw-password@secret-host/private"
+        ),
+    ):
+        response = client.post(
+            "/simulate-migration-from-source",
+            json={
+                "schema_name": schema_name,
+                "source_schema": "public",
+                "source_table": "customers",
+            },
+        )
+
+    assert response.status_code == 500
+    assert "raw-password" not in response.text
+    assert "secret-host" not in response.text
+    with TestSessionLocal() as db:
+        assert db.query(ApprovalTicketRecord).count() == 0
+        run = db.query(IngestionRunRecord).one()
+        assert run.outcome == "FAILED"
+        assert run.failure_code == "SOURCE_READ_FAILED"
+        assert run.failure_reason == (
+            "Complete source observation could not be read."
+        )
 
 
 def test_cast_to_uncastable_extended_dtype_rejected_before_ticket_creation():
@@ -475,6 +570,37 @@ def test_source_backed_simulation_records_provenance():
         assert record.source_table == "customers"
         assert record.source_row_count == 3
         assert record.source_dataset_fingerprint is not None
+        assert record.target_dataset is None
+        assert record.source_ingestion_run_id is not None
+
+        run = db.get(IngestionRunRecord, record.source_ingestion_run_id)
+        snapshot = db.get(DatasetSnapshotRecord, run.dataset_snapshot_id)
+        manifest = db.query(HealingManifestRecord).filter_by(
+            ticket_id=record.ticket_id
+        ).one()
+        assert run.purpose == "SIMULATION"
+        assert run.outcome == "CAPTURED"
+        assert snapshot.source_row_count == 3
+        assert manifest.source_ingestion_run_id == record.source_ingestion_run_id
+
+    dataset_response = client.get(
+        f"/source-datasets/{run.source_dataset_id}"
+    )
+    assert dataset_response.status_code == 200
+    assert dataset_response.json()["source_table"] == "customers"
+
+    runs_response = client.get(
+        f"/source-datasets/{run.source_dataset_id}/ingestion-runs"
+    )
+    assert runs_response.status_code == 200
+    public_run = runs_response.json()["ingestion_runs"][0]
+    assert public_run["outcome"] == "CAPTURED"
+    assert public_run["source_row_count"] == 3
+    assert "snapshot_payload" not in public_run
+
+    run_response = client.get(f"/ingestion-runs/{run.ingestion_run_id}")
+    assert run_response.status_code == 200
+    assert "snapshot_payload" not in run_response.json()
 
 
 def test_execute_live_disabled_by_default_returns_403():
@@ -522,6 +648,39 @@ def test_execute_live_succeeds_and_publishes_a_stable_view():
     assert body["status"] == "COMPLETED"
     assert body["previous_physical_table"] is None
     assert body["physical_table"].startswith("customer_master_4__")
+    assert body["simulation_ingestion_run_id"] is not None
+    assert body["revalidation_ingestion_run_id"] is not None
+    assert body["publication_target_id"] is not None
+
+    with TestSessionLocal() as db:
+        live_record = db.get(
+            LiveExecutionRecord,
+            __import__("uuid").UUID(body["live_execution_id"]),
+        )
+        revalidation = db.get(
+            IngestionRunRecord,
+            live_record.revalidation_ingestion_run_id,
+        )
+        assert revalidation.purpose == "LIVE_REVALIDATION"
+        assert revalidation.outcome == "MATCHED"
+        assert (
+            revalidation.baseline_ingestion_run_id
+            == live_record.simulation_ingestion_run_id
+        )
+        assert str(live_record.publication_target_id) == body["publication_target_id"]
+        target = db.get(
+            PublicationTargetRecord,
+            live_record.publication_target_id,
+        )
+        assert target.logical_target == "customer_master_4"
+
+    with live_target_engine.connect() as conn:
+        marker_target_id = conn.execute(text(
+            f'SELECT publication_target_id '
+            f'FROM "{AEGIS_PUBLISH_DATA_SCHEMA}"."_aegis_execution_log" '
+            f'WHERE live_execution_id = :execution_id AND operation = \'PUBLISH\''
+        ), {"execution_id": body["live_execution_id"]}).scalar_one()
+        assert str(marker_target_id) == body["publication_target_id"]
 
     rows = _view_rows("customer_master_4")
     assert len(rows) == 3
@@ -531,6 +690,143 @@ def test_execute_live_succeeds_and_publishes_a_stable_view():
     assert fetched["schema_version_id"] == schema_version_id
     assert fetched["source_schema"] == "public"
     assert fetched["source_table"] == "customers"
+    assert fetched["publication_target_id"] == body["publication_target_id"]
+
+    target_response = client.get(
+        f"/publication-targets/{body['publication_target_id']}"
+    )
+    assert target_response.status_code == 200
+    target_body = target_response.json()
+    assert target_body["publication_target_id"] == body["publication_target_id"]
+    assert target_body["logical_target"] == "customer_master_4"
+
+
+def test_unknown_publication_target_inspection_returns_404():
+    response = client.get(
+        "/publication-targets/00000000-0000-0000-0000-000000000000"
+    )
+    assert response.status_code == 404
+
+
+def test_missing_publication_system_key_blocks_before_live_record():
+    ticket_id, _ = _register_and_approve_source_ticket()
+    original_key = os.environ.pop("AEGIS_PUBLICATION_SYSTEM_KEY")
+    try:
+        response = client.post(
+            f"/approvals/{ticket_id}/execute-live",
+            json=_execute_live_body("customer_master_missing_publication_key"),
+        )
+    finally:
+        os.environ["AEGIS_PUBLICATION_SYSTEM_KEY"] = original_key
+
+    assert response.status_code == 500
+    assert "AEGIS_PUBLICATION_SYSTEM_KEY is not set" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        assert db.query(LiveExecutionRecord).count() == 0
+        assert db.query(PublicationTargetRecord).count() == 0
+
+
+def test_equal_source_and_publication_bindings_block_live_execution():
+    ticket_id, _ = _register_and_approve_source_ticket()
+    original_url = os.environ["LIVE_DATABASE_URL"]
+    os.environ["LIVE_DATABASE_URL"] = os.environ["SOURCE_DATABASE_URL"]
+    try:
+        response = client.post(
+            f"/approvals/{ticket_id}/execute-live",
+            json=_execute_live_body("customer_master_equal_binding"),
+        )
+    finally:
+        os.environ["LIVE_DATABASE_URL"] = original_url
+
+    assert response.status_code == 422
+    assert "same database binding" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        assert db.query(LiveExecutionRecord).count() == 0
+
+
+def test_registered_publication_key_rebinding_is_rejected():
+    first_ticket, _ = _register_and_approve_source_ticket()
+    first = client.post(
+        f"/approvals/{first_ticket}/execute-live",
+        json=_execute_live_body("customer_master_registered_binding"),
+    )
+    assert first.status_code == 200, first.text
+
+    second_ticket, _ = _register_and_approve_source_ticket(
+        rows=((1, "alice"), (2, "bob"), (3, "carol"), (4, "dave"))
+    )
+    original_url = os.environ["LIVE_DATABASE_URL"]
+    os.environ["LIVE_DATABASE_URL"] = original_url.replace(
+        "/aegis_live_test", "/aegis_live_test_changed"
+    )
+    try:
+        response = client.post(
+            f"/approvals/{second_ticket}/execute-live",
+            json=_execute_live_body("customer_master_registered_binding"),
+        )
+    finally:
+        os.environ["LIVE_DATABASE_URL"] = original_url
+
+    assert response.status_code == 409
+    assert "different endpoint" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        assert db.query(LiveExecutionRecord).count() == 1
+
+
+def test_legacy_marker_table_is_upgraded_additively_on_publish():
+    historical_execution_id = str(__import__("uuid").uuid4())
+    with live_target_engine.begin() as conn:
+        conn.execute(text(
+            f'CREATE SCHEMA "{AEGIS_PUBLISH_DATA_SCHEMA}"'
+        ))
+        conn.execute(text(
+            f'CREATE TABLE "{AEGIS_PUBLISH_DATA_SCHEMA}"."_aegis_execution_log" ('
+            "marker_id UUID PRIMARY KEY, live_execution_id UUID NOT NULL, "
+            "logical_target TEXT NOT NULL, physical_table TEXT, "
+            "previous_physical_table TEXT, operation TEXT NOT NULL, "
+            "recorded_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+        ))
+        conn.execute(text(
+            f'INSERT INTO "{AEGIS_PUBLISH_DATA_SCHEMA}"."_aegis_execution_log" '
+            "(marker_id, live_execution_id, logical_target, physical_table, "
+            "previous_physical_table, operation) "
+            "VALUES (:marker_id, :execution_id, 'historical_target', "
+            "'historical_physical', NULL, 'PUBLISH')"
+        ), {
+            "marker_id": str(__import__("uuid").uuid4()),
+            "execution_id": historical_execution_id,
+        })
+
+    historical_markers = PostgresPublicationWriter(
+        live_target_engine
+    ).get_marker_for_execution(historical_execution_id)
+    assert len(historical_markers) == 1
+    assert historical_markers[0]["publication_target_id"] is None
+
+    ticket_id, _ = _register_and_approve_source_ticket()
+    response = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_legacy_marker_upgrade"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    with live_target_engine.connect() as conn:
+        column_exists = conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = :table "
+            "AND column_name = 'publication_target_id')"
+        ), {
+            "schema": AEGIS_PUBLISH_DATA_SCHEMA,
+            "table": "_aegis_execution_log",
+        }).scalar_one()
+        marker_target_id = conn.execute(text(
+            f'SELECT publication_target_id '
+            f'FROM "{AEGIS_PUBLISH_DATA_SCHEMA}"."_aegis_execution_log" '
+            "WHERE live_execution_id = :execution_id AND operation = 'PUBLISH'"
+        ), {"execution_id": body["live_execution_id"]}).scalar_one()
+    assert column_exists
+    assert str(marker_target_id) == body["publication_target_id"]
 
 
 def test_republish_creates_new_version_and_repoints_view_without_dropping_old():
@@ -550,6 +846,7 @@ def test_republish_creates_new_version_and_repoints_view_without_dropping_old():
     ).json()
     assert second["previous_physical_table"] == first_physical
     assert second["physical_table"] != first_physical
+    assert second["publication_target_id"] == first["publication_target_id"]
 
     rows = _view_rows("customer_master_5")
     assert len(rows) == 4, "the view must show the NEW version's data"
@@ -599,6 +896,10 @@ def test_rollback_repoints_view_to_previous_version_without_dropping_current():
     )
     assert rollback.status_code == 200
     assert rollback.json()["status"] == "ROLLED_BACK"
+    assert (
+        rollback.json()["publication_target_id"]
+        == second["publication_target_id"]
+    )
 
     rows = _view_rows("customer_master_7")
     assert len(rows) == 3, "view must be repointed back to the first (3-row) version"
@@ -609,6 +910,47 @@ def test_rollback_repoints_view_to_previous_version_without_dropping_current():
             "WHERE table_schema = :schema AND table_name = :table)"
         ), {"schema": AEGIS_PUBLISH_DATA_SCHEMA, "table": second_physical}).scalar()
         assert second_still_exists, "rollback must never drop the physical version it's moving away from"
+        rollback_marker_target_id = conn.execute(text(
+            f'SELECT publication_target_id '
+            f'FROM "{AEGIS_PUBLISH_DATA_SCHEMA}"."_aegis_execution_log" '
+            "WHERE live_execution_id = :execution_id AND operation = 'ROLLBACK'"
+        ), {"execution_id": second["live_execution_id"]}).scalar_one()
+        assert str(rollback_marker_target_id) == second["publication_target_id"]
+
+
+def test_rollback_rejects_marker_publication_target_mismatch():
+    ticket_id, _ = _register_and_approve_source_ticket()
+    executed_response = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_marker_mismatch"),
+    )
+    assert executed_response.status_code == 200, executed_response.text
+    executed = executed_response.json()
+
+    with live_target_engine.begin() as conn:
+        conn.execute(text(
+            f'UPDATE "{AEGIS_PUBLISH_DATA_SCHEMA}"."_aegis_execution_log" '
+            "SET publication_target_id = :wrong_target_id "
+            "WHERE live_execution_id = :execution_id AND operation = 'PUBLISH'"
+        ), {
+            "wrong_target_id": "00000000-0000-0000-0000-000000000001",
+            "execution_id": executed["live_execution_id"],
+        })
+
+    rollback = client.post(
+        f"/live-executions/{executed['live_execution_id']}/rollback",
+        json={"operator": "mo"},
+    )
+    assert rollback.status_code == 409
+    assert "not the current publish" in rollback.json()["detail"]
+    assert len(_view_rows("customer_master_marker_mismatch")) == 3
+
+    with TestSessionLocal() as db:
+        record = db.get(
+            LiveExecutionRecord,
+            __import__("uuid").UUID(executed["live_execution_id"]),
+        )
+        assert record.status == "ROLLING_BACK"
 
 
 def test_rollback_of_first_ever_publish_removes_the_view():
@@ -889,6 +1231,17 @@ def test_high_precision_numeric_and_temporal_types_survive_publication():
     result = read_complete_source_table(source_engine, "public", "financial_precision_test")
     df = result["dataframe"]
 
+    assert [item["column_name"] for item in result["column_metadata"]] == list(
+        df.columns
+    )
+    amount_metadata = next(
+        item
+        for item in result["column_metadata"]
+        if item["column_name"] == "amount"
+    )
+    assert amount_metadata["numeric_precision"] == 20
+    assert amount_metadata["numeric_scale"] == 9
+
     amount = df["amount"].iloc[0]
     assert isinstance(amount, decimal.Decimal), f"amount should be Decimal, got {type(amount)}"
     assert str(amount) == "12345678901.123456789", f"NUMERIC precision was not preserved: {amount}"
@@ -984,6 +1337,68 @@ def test_source_changed_since_approval_blocks_execution():
     assert response.status_code == 409
     assert "changed" in response.json()["detail"].lower()
 
+    with TestSessionLocal() as db:
+        live_record = db.query(LiveExecutionRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(ticket_id)
+        ).one()
+        revalidation = db.get(
+            IngestionRunRecord,
+            live_record.revalidation_ingestion_run_id,
+        )
+        assert live_record.status == "FAILED"
+        assert revalidation.outcome == "DRIFTED"
+        assert revalidation.dataset_snapshot_id is not None
+        assert (
+            revalidation.baseline_ingestion_run_id
+            == live_record.simulation_ingestion_run_id
+        )
+
+
+def test_live_source_validation_failure_persists_redacted_terminal_run():
+    ticket_id, _ = _register_and_approve_source_ticket()
+    with source_engine.begin() as conn:
+        conn.execute(text("DROP TABLE customers"))
+
+    response = client.post(
+        f"/approvals/{ticket_id}/execute-live",
+        json=_execute_live_body("customer_master_failed_read"),
+    )
+    assert response.status_code == 422
+
+    with TestSessionLocal() as db:
+        live_record = db.query(LiveExecutionRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(ticket_id)
+        ).one()
+        failed_run = db.get(
+            IngestionRunRecord,
+            live_record.revalidation_ingestion_run_id,
+        )
+        assert live_record.status == "FAILED"
+        assert failed_run.outcome == "FAILED"
+        assert failed_run.failure_code == "SOURCE_VALIDATION_FAILED"
+        assert failed_run.failure_reason == (
+            "Complete source observation failed validation."
+        )
+        assert failed_run.dataset_snapshot_id is None
+
+
+def test_source_binding_change_after_approval_is_rejected_before_live_record():
+    ticket_id, _ = _register_and_approve_source_ticket()
+    original_key = os.environ["AEGIS_SOURCE_SYSTEM_KEY"]
+    os.environ["AEGIS_SOURCE_SYSTEM_KEY"] = "changed-source-test"
+    try:
+        response = client.post(
+            f"/approvals/{ticket_id}/execute-live",
+            json=_execute_live_body("customer_master_binding_changed"),
+        )
+    finally:
+        os.environ["AEGIS_SOURCE_SYSTEM_KEY"] = original_key
+
+    assert response.status_code == 409
+    assert "approved simulation lineage" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        assert db.query(LiveExecutionRecord).count() == 0
+
 
 def test_surgeon_failure_during_execute_live_marks_failed_not_stuck_running():
     ticket_id, _ = _register_and_approve_source_ticket()
@@ -1045,6 +1460,36 @@ def test_ambiguous_commit_recovers_via_target_side_marker():
 
     rows = _view_rows("customer_master_16")
     assert len(rows) == 3
+
+
+def test_reconciliation_refuses_mismatched_publication_target_marker():
+    ticket_id, _ = _register_and_approve_source_ticket()
+    with patch(
+        "src.api.app.LiveExecutionRepository.mark_completed",
+        return_value=None,
+    ):
+        response = client.post(
+            f"/approvals/{ticket_id}/execute-live",
+            json=_execute_live_body("customer_master_reconcile_target_mismatch"),
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+
+    with live_target_engine.begin() as conn:
+        conn.execute(text(
+            f'UPDATE "{AEGIS_PUBLISH_DATA_SCHEMA}"."_aegis_execution_log" '
+            "SET publication_target_id = :wrong_target_id "
+            "WHERE live_execution_id = :execution_id AND operation = 'PUBLISH'"
+        ), {
+            "wrong_target_id": "00000000-0000-0000-0000-000000000002",
+            "execution_id": body["live_execution_id"],
+        })
+
+    fetched = client.get(f"/live-executions/{body['live_execution_id']}")
+    assert fetched.status_code == 200, fetched.text
+    fetched_body = fetched.json()
+    assert fetched_body["status"] == "RUNNING"
+    assert "identity_mismatch" in fetched_body["failure_reason"]
 
 
 def test_reconciliation_heals_a_stuck_running_record():
@@ -1135,6 +1580,7 @@ def test_reconciliation_heals_a_stuck_rolling_back_record():
                 logical_target="customer_master_18",
                 execution_id=record.live_execution_id,
                 previous_physical_table=record.previous_physical_table,
+                publication_target_id=record.publication_target_id,
             )
         stuck_id = str(record.live_execution_id)
 

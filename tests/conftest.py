@@ -12,6 +12,25 @@ sys.path.insert(0, str(SRC_DIR))
 sys.path.insert(0, str(PROJECT_ROOT))
 
 
+def _map_verified_test_system_key(test_setting: str, runtime_setting: str) -> str:
+    """Require an explicit non-secret test identity and map it to runtime."""
+    import os
+    import pytest
+
+    value = os.environ.get(test_setting)
+    if not value:
+        pytest.skip(
+            f"{test_setting} is not set. Phase 3.2 integration tests require "
+            "an explicit stable test-system identity.",
+            allow_module_level=True,
+        )
+    from src.identity.binding import validate_system_key
+
+    normalized = validate_system_key(value, setting_name=test_setting)
+    os.environ[runtime_setting] = normalized
+    return normalized
+
+
 def get_verified_test_database_url():
     """
     Shared guard for any test module that needs a live Postgres test
@@ -96,6 +115,10 @@ def get_verified_live_test_database_url():
         )
 
     os.environ["LIVE_DATABASE_URL"] = live_test_url
+    _map_verified_test_system_key(
+        "AEGIS_PUBLICATION_TEST_SYSTEM_KEY",
+        "AEGIS_PUBLICATION_SYSTEM_KEY",
+    )
     return live_test_url
 
 
@@ -137,4 +160,8 @@ def get_verified_source_test_database_url():
         )
 
     os.environ["SOURCE_DATABASE_URL"] = source_test_url
+    _map_verified_test_system_key(
+        "AEGIS_SOURCE_TEST_SYSTEM_KEY",
+        "AEGIS_SOURCE_SYSTEM_KEY",
+    )
     return source_test_url

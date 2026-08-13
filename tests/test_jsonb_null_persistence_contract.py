@@ -19,6 +19,15 @@ def test_approval_conversion_decision_uses_sql_null_for_python_none():
     assert processor(None) is None
 
 
+def test_snapshot_backed_ticket_payload_uses_sql_null_for_python_none():
+    column_type = _column(ApprovalTicketRecord, "target_dataset").type
+    assert isinstance(column_type, JSONB)
+    assert column_type.none_as_null is True
+    processor = column_type.bind_processor(postgresql.dialect())
+    assert processor is not None
+    assert processor(None) is None
+
+
 def test_manifest_conversion_outcome_uses_sql_null_for_python_none():
     column_type = _column(HealingManifestRecord, "conversion_outcome").type
     assert isinstance(column_type, JSONB)

@@ -73,6 +73,11 @@ class ApprovalTicket:
     source_dataset_fingerprint: Optional[str] = None
     live_eligible: bool = False
 
+    # Phase 3.2 -- new source-backed tickets replay from the immutable
+    # snapshot linked through this captured simulation run. Historical and
+    # sample-data tickets retain their embedded target_dataset payload.
+    source_ingestion_run_id: Optional[str] = None
+
     # Phase 3.1.4 -- persisted, redacted CAST_COLUMN preflight decision.
     # None for non-cast tickets. Human approval may proceed only when this
     # decision exists, is SAFE, and matches a fresh deterministic analysis.

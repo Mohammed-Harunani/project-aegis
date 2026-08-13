@@ -178,10 +178,10 @@ def read_complete_source_table(engine: Engine, source_schema: str, source_table:
     Reads the ENTIRE source table in ONE read-only, REPEATABLE READ
     transaction and ONE connection -- table existence, primary-key
     metadata, column metadata, and the complete ordered read all come
-    from the exact same snapshot. Returns a dict: dataframe,
-    primary_key, row_count, schema_fingerprint, column_types (dict of
-    column_name -> Postgres data_type, as this exact snapshot saw it),
-    dataset_fingerprint.
+    from the exact same snapshot. Returns a dict: dataframe, primary_key,
+    row_count, schema_fingerprint, ordered column_metadata, column_types
+    (dict of column_name -> Postgres data_type, as this exact snapshot saw
+    it), and dataset_fingerprint.
 
     Raises SourceValidationError if the table doesn't exist or has no
     primary key.
@@ -243,6 +243,7 @@ def read_complete_source_table(engine: Engine, source_schema: str, source_table:
         "primary_key": primary_key,
         "row_count": len(dataframe),
         "schema_fingerprint": schema_fingerprint,
+        "column_metadata": column_metadata,
         "column_types": {m["column_name"]: m["data_type"] for m in column_metadata},
         "dataset_fingerprint": dataset_fingerprint,
     }

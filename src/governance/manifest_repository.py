@@ -14,7 +14,7 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 
-from src.db.models import HealingManifestRecord
+from src.db.models import ApprovalTicketRecord, HealingManifestRecord
 from src.governance.manifest import HealingManifest
 
 
@@ -30,6 +30,7 @@ def save_manifest(
     source_row_count: Optional[int] = None,
     source_schema_fingerprint: Optional[str] = None,
     source_dataset_fingerprint: Optional[str] = None,
+    source_ingestion_run_id: Optional[str] = None,
     commit: bool = True,
 ) -> HealingManifestRecord:
     """
@@ -49,9 +50,26 @@ def save_manifest(
     independent of whatever the ticket looks like later. None for
     sample_data-derived manifests.
     """
+    ticket_uuid = uuid.UUID(ticket_id) if ticket_id else None
+    ingestion_run_uuid = (
+        uuid.UUID(str(source_ingestion_run_id))
+        if source_ingestion_run_id is not None
+        else None
+    )
+    if ingestion_run_uuid is not None:
+        if ticket_uuid is None:
+            raise ValueError(
+                "Source-backed manifest lineage requires an approval ticket."
+            )
+        ticket = db.get(ApprovalTicketRecord, ticket_uuid)
+        if ticket is None or ticket.source_ingestion_run_id != ingestion_run_uuid:
+            raise ValueError(
+                "Manifest simulation ingestion lineage must match its ticket."
+            )
+
     record = HealingManifestRecord(
         manifest_id=uuid.uuid4(),
-        ticket_id=uuid.UUID(ticket_id) if ticket_id else None,
+        ticket_id=ticket_uuid,
         timestamp=datetime.fromisoformat(manifest.timestamp),
         repair_plan={
             "proposed_action": manifest.repair_plan.proposed_action,
@@ -80,6 +98,7 @@ def save_manifest(
         source_row_count=source_row_count,
         source_schema_fingerprint=source_schema_fingerprint,
         source_dataset_fingerprint=source_dataset_fingerprint,
+        source_ingestion_run_id=ingestion_run_uuid,
         conversion_outcome=(
             manifest.conversion_outcome.to_dict()
             if manifest.conversion_outcome is not None
