@@ -1,6 +1,12 @@
 from dataclasses import dataclass
 from typing import List
 
+from src.column_order import (
+    COLUMN_ORDER_CONFIDENCE,
+    analyze_reorder_only_eligibility,
+    serialize_column_order_action,
+)
+
 
 @dataclass(frozen=True)
 class RepairPlan:
@@ -23,6 +29,32 @@ class AegisConsultant:
     ) -> List[RepairPlan]:
 
         repair_plans = []
+
+        # ----------------------------
+        # Verified Column Order Repair
+        # ----------------------------
+        # Phase 3.3.2 does not trust reorder_event alone. The pure
+        # eligibility proof independently rejects missing/new columns,
+        # type mismatches, duplicate/invalid labels, unequal membership,
+        # inconsistent schema metadata, and already-correct order.
+        order_eligibility = analyze_reorder_only_eligibility(
+            schema_delta,
+            observed_schema,
+            gold_schema,
+        )
+        if order_eligibility.eligible:
+            repair_plans.append(
+                RepairPlan(
+                    proposed_action=serialize_column_order_action(
+                        order_eligibility.gold_order
+                    ),
+                    confidence=COLUMN_ORDER_CONFIDENCE,
+                    explanation=(
+                        "Identical columns and dtypes detected in a different "
+                        "order. Exact Gold schema order proposed."
+                    ),
+                )
+            )
 
         # ----------------------------
         # Rename Detection

@@ -125,6 +125,7 @@ def setup_function(_):
         conn.execute(text("DROP TABLE IF EXISTS customers"))
         conn.execute(text("DROP TABLE IF EXISTS customers_no_pk"))
         conn.execute(text("DROP TABLE IF EXISTS orders_cast"))
+        conn.execute(text("DROP TABLE IF EXISTS customers_reorder"))
 
 
 def _create_source_table(rows=((1, "alice"), (2, "bob"), (3, "carol"))):
@@ -199,6 +200,69 @@ def _create_cast_source_table(rows=((1, "10"), (2, "20"), (3, "-30"))):
                 text("INSERT INTO orders_cast VALUES (:pk, :amount)"),
                 {"pk": pk, "amount": amount},
             )
+
+
+def _create_reorder_source_table(
+    rows=((100, 1), (200, 2), (300, 3)),
+):
+    with source_engine.begin() as conn:
+        conn.execute(text("DROP TABLE IF EXISTS customers_reorder"))
+        conn.execute(text(
+            "CREATE TABLE customers_reorder ("
+            "balance BIGINT, customer_id BIGINT PRIMARY KEY)"
+        ))
+        for balance, customer_id in rows:
+            conn.execute(
+                text(
+                    "INSERT INTO customers_reorder "
+                    "(balance, customer_id) VALUES (:balance, :customer_id)"
+                ),
+                {"balance": balance, "customer_id": customer_id},
+            )
+
+
+def _register_reorder_schema(schema_name="customer_reorder_schema"):
+    response = client.post(f"/schemas/{schema_name}/versions", json={
+        "format_version": 1,
+        "created_by": "mo",
+        "columns": [
+            {"name": "customer_id", "dtype": "int64"},
+            {"name": "balance", "dtype": "int64"},
+        ],
+    })
+    assert response.status_code == 200, response.text
+    return schema_name
+
+
+def _submit_source_reorder(
+    schema_name="customer_reorder_schema",
+    rows=((100, 1), (200, 2), (300, 3)),
+):
+    _register_reorder_schema(schema_name)
+    _create_reorder_source_table(rows=rows)
+    response = client.post("/simulate-migration-from-source", json={
+        "schema_name": schema_name,
+        "source_schema": "public",
+        "source_table": "customers_reorder",
+    })
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def _submit_and_approve_reorder_ticket(
+    schema_name="customer_reorder_schema",
+    rows=((100, 1), (200, 2), (300, 3)),
+):
+    submit = _submit_source_reorder(schema_name, rows=rows)
+    response = client.post(
+        f"/approvals/{submit['ticket_id']}/approve",
+        json={"operator": "mo", "note": "verified source order"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["column_order_evidence"] == (
+        submit["column_order_evidence"]
+    )
+    return submit
 
 
 def _register_cast_schema(schema_name="orders_cast_schema"):
@@ -381,6 +445,162 @@ def test_live_cast_republish_and_rollback_preserve_immutable_versions():
 
 
 # ---- Trusted source ----
+
+
+# ---- Phase 3.3.4 source-backed reorder governance ----
+
+
+def test_source_reorder_submission_preserves_lineage_and_redacted_evidence():
+    body = _submit_source_reorder("source_reorder_lineage")
+
+    assert body["status"] == "PENDING_APPROVAL"
+    assert body["live_eligible"] is True
+    assert body["proposed_action"] == (
+        'REORDER_COLUMNS TO ["customer_id","balance"]'
+    )
+    assert body["column_order_evidence"] == {
+        "canonical_action": 'REORDER_COLUMNS TO ["customer_id","balance"]',
+        "observed_order": ["balance", "customer_id"],
+        "gold_order": ["customer_id", "balance"],
+        "column_count": 2,
+        "reorder_only": True,
+    }
+    assert body["conversion_decision"] is None
+
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(body["ticket_id"])
+        ).one()
+        assert ticket.schema_version_id is not None
+        assert ticket.source_ingestion_run_id is not None
+        assert ticket.source_schema == "public"
+        assert ticket.source_table == "customers_reorder"
+        assert ticket.source_primary_key == ["customer_id"]
+        assert ticket.source_row_count == 3
+        assert ticket.target_dataset is None
+        assert ticket.conversion_decision is None
+
+
+def test_source_reorder_approval_persists_matching_lineage_and_manifest():
+    submitted = _submit_source_reorder("source_reorder_approval")
+    ticket_id = submitted["ticket_id"]
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo", "note": "source order verified"},
+    )
+    body = response.json()
+
+    assert response.status_code == 200, response.text
+    assert body["status"] == "APPROVED"
+    assert body["column_order_evidence"] == (
+        submitted["column_order_evidence"]
+    )
+    assert body["conversion_decision"] is None
+    assert body["conversion_outcome"] is None
+
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(ticket_id)
+        ).one()
+        manifest = db.query(HealingManifestRecord).filter_by(
+            ticket_id=ticket.ticket_id
+        ).one()
+        assert ticket.status == "APPROVED"
+        assert manifest.schema_version_id == ticket.schema_version_id
+        assert manifest.source_ingestion_run_id == (
+            ticket.source_ingestion_run_id
+        )
+        assert manifest.source_schema == ticket.source_schema
+        assert manifest.source_table == ticket.source_table
+        assert manifest.source_primary_key == ticket.source_primary_key
+        assert manifest.source_row_count == ticket.source_row_count
+        assert manifest.source_schema_fingerprint == (
+            ticket.source_schema_fingerprint
+        )
+        assert manifest.source_dataset_fingerprint == (
+            ticket.source_dataset_fingerprint
+        )
+        assert manifest.corrected_output_fingerprint is not None
+        assert manifest.conversion_outcome is None
+
+
+def test_tampered_source_reorder_gold_order_blocks_approval():
+    submitted = _submit_source_reorder("source_reorder_tamper")
+    ticket_id = submitted["ticket_id"]
+
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(ticket_id)
+        ).one()
+        tampered_gold = dict(ticket.gold_schema)
+        tampered_gold["column_order"] = ["balance", "customer_id"]
+        ticket.gold_schema = tampered_gold
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo"},
+    )
+
+    assert response.status_code == 422
+    assert "immutable schema version" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(ticket_id)
+        ).one()
+        assert ticket.status == "PENDING"
+        assert db.query(HealingManifestRecord).count() == 0
+
+
+def test_tampered_source_reorder_observed_schema_blocks_snapshot_replay():
+    submitted = _submit_source_reorder("source_reorder_observed_tamper")
+    ticket_id = submitted["ticket_id"]
+
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(ticket_id)
+        ).one()
+        tampered_observed = dict(ticket.observed_schema)
+        tampered_columns = dict(tampered_observed["columns"])
+        tampered_customer = dict(tampered_columns["customer_id"])
+        tampered_customer["dtype"] = "float64"
+        tampered_columns["customer_id"] = tampered_customer
+        tampered_observed["columns"] = tampered_columns
+        ticket.observed_schema = tampered_observed
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo"},
+    )
+
+    assert response.status_code == 422
+    assert "immutable snapshot" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(ticket_id)
+        ).one()
+        assert ticket.status == "PENDING"
+        assert db.query(HealingManifestRecord).count() == 0
+
+
+def test_source_request_cannot_supply_target_order():
+    schema_name = _register_reorder_schema("source_reorder_target_input")
+    _create_reorder_source_table()
+
+    response = client.post("/simulate-migration-from-source", json={
+        "schema_name": schema_name,
+        "source_schema": "public",
+        "source_table": "customers_reorder",
+        "target_order": ["balance", "customer_id"],
+    })
+
+    assert response.status_code == 422
+    assert "Gold schema" in response.text
+    with TestSessionLocal() as db:
+        assert db.query(ApprovalTicketRecord).count() == 0
+        assert db.query(IngestionRunRecord).count() == 0
 
 
 def test_source_simulation_requires_server_controlled_source_system_key():
@@ -636,6 +856,261 @@ def test_execute_live_rejects_missing_confirmation():
 
 
 # ---- Stable-view publication ----
+
+
+# ---- Phase 3.3.5 controlled live column-order publication ----
+
+
+def test_live_reorder_publishes_exact_gold_order_values_types_and_lineage():
+    submit = _submit_and_approve_reorder_ticket("live_reorder_success")
+
+    response = client.post(
+        f"/approvals/{submit['ticket_id']}/execute-live",
+        json=_execute_live_body("live_reorder_target"),
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "COMPLETED"
+    assert body["previous_physical_table"] is None
+    assert body["simulation_ingestion_run_id"] is not None
+    assert body["revalidation_ingestion_run_id"] is not None
+    assert body["publication_target_id"] is not None
+
+    with live_target_engine.connect() as conn:
+        view_columns = conn.execute(text(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = :table "
+            "ORDER BY ordinal_position"
+        ), {
+            "schema": AEGIS_PUBLISH_SCHEMA,
+            "table": "live_reorder_target",
+        }).fetchall()
+        physical_columns = conn.execute(text(
+            "SELECT column_name, data_type FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = :table "
+            "ORDER BY ordinal_position"
+        ), {
+            "schema": AEGIS_PUBLISH_DATA_SCHEMA,
+            "table": body["physical_table"],
+        }).fetchall()
+        rows = conn.execute(text(
+            f'SELECT customer_id, balance FROM "{AEGIS_PUBLISH_SCHEMA}".'
+            '"live_reorder_target" ORDER BY customer_id'
+        )).fetchall()
+
+    assert view_columns == [
+        ("customer_id", "bigint"),
+        ("balance", "bigint"),
+    ]
+    assert physical_columns == view_columns
+    assert rows == [(1, 100), (2, 200), (3, 300)]
+
+    with source_engine.connect() as conn:
+        source_columns = conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = 'public' "
+            "AND table_name = 'customers_reorder' "
+            "ORDER BY ordinal_position"
+        )).scalars().all()
+    assert source_columns == ["balance", "customer_id"]
+
+    with TestSessionLocal() as db:
+        record = db.get(
+            LiveExecutionRecord,
+            __import__("uuid").UUID(body["live_execution_id"]),
+        )
+        target = db.get(
+            PublicationTargetRecord,
+            record.publication_target_id,
+        )
+        revalidation = db.get(
+            IngestionRunRecord,
+            record.revalidation_ingestion_run_id,
+        )
+        assert target.logical_target == "live_reorder_target"
+        assert revalidation.purpose == "LIVE_REVALIDATION"
+        assert revalidation.outcome == "MATCHED"
+
+
+def test_live_reorder_source_drift_after_approval_blocks_publication():
+    submit = _submit_and_approve_reorder_ticket("live_reorder_source_drift")
+    with source_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO customers_reorder (balance, customer_id) "
+            "VALUES (400, 4)"
+        ))
+
+    response = client.post(
+        f"/approvals/{submit['ticket_id']}/execute-live",
+        json=_execute_live_body("live_reorder_drift_target"),
+    )
+    assert response.status_code == 409
+    assert "changed" in response.json()["detail"].lower()
+
+    with TestSessionLocal() as db:
+        record = db.query(LiveExecutionRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(submit["ticket_id"])
+        ).one()
+        assert record.status == "FAILED"
+        revalidation = db.get(
+            IngestionRunRecord,
+            record.revalidation_ingestion_run_id,
+        )
+        assert revalidation.outcome == "DRIFTED"
+
+
+def test_live_reorder_requires_fresh_execution_time_eligibility_proof():
+    submit = _submit_and_approve_reorder_ticket(
+        "live_reorder_fresh_proof"
+    )
+
+    with patch(
+        "src.api.app.build_source_observed_schema",
+        return_value=None,
+    ):
+        response = client.post(
+            f"/approvals/{submit['ticket_id']}/execute-live",
+            json=_execute_live_body("live_reorder_fresh_proof_target"),
+        )
+
+    assert response.status_code == 422
+    assert "fresh source" in response.json()["detail"].lower()
+    assert "reorder-only" in response.json()["detail"].lower()
+
+    with TestSessionLocal() as db:
+        record = db.query(LiveExecutionRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(submit["ticket_id"])
+        ).one()
+        assert record.status == "FAILED"
+
+
+def test_live_reorder_approved_fingerprint_mismatch_blocks_publication():
+    submit = _submit_and_approve_reorder_ticket(
+        "live_reorder_fingerprint_drift"
+    )
+    with TestSessionLocal() as db:
+        manifest = db.query(HealingManifestRecord).filter_by(
+            ticket_id=__import__("uuid").UUID(submit["ticket_id"])
+        ).one()
+        manifest.corrected_output_fingerprint = "0" * 64
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{submit['ticket_id']}/execute-live",
+        json=_execute_live_body("live_reorder_fingerprint_target"),
+    )
+    assert response.status_code == 422
+    assert "does not match" in response.json()["detail"]
+
+    with live_target_engine.connect() as conn:
+        view_exists = conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.views "
+            "WHERE table_schema = :schema AND table_name = :table)"
+        ), {
+            "schema": AEGIS_PUBLISH_SCHEMA,
+            "table": "live_reorder_fingerprint_target",
+        }).scalar_one()
+    assert view_exists is False
+
+
+def test_live_reorder_is_one_shot_and_first_rollback_removes_only_view():
+    submit = _submit_and_approve_reorder_ticket("live_reorder_one_shot")
+    first = client.post(
+        f"/approvals/{submit['ticket_id']}/execute-live",
+        json=_execute_live_body("live_reorder_one_shot_target"),
+    )
+    assert first.status_code == 200, first.text
+    body = first.json()
+
+    repeat = client.post(
+        f"/approvals/{submit['ticket_id']}/execute-live",
+        json=_execute_live_body("live_reorder_repeat_target"),
+    )
+    assert repeat.status_code == 409
+
+    rollback = client.post(
+        f"/live-executions/{body['live_execution_id']}/rollback",
+        json={"operator": "mo"},
+    )
+    assert rollback.status_code == 200, rollback.text
+
+    with live_target_engine.connect() as conn:
+        view_exists = conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.views "
+            "WHERE table_schema = :schema AND table_name = :table)"
+        ), {
+            "schema": AEGIS_PUBLISH_SCHEMA,
+            "table": "live_reorder_one_shot_target",
+        }).scalar_one()
+        physical_exists = conn.execute(text(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = :schema AND table_name = :table)"
+        ), {
+            "schema": AEGIS_PUBLISH_DATA_SCHEMA,
+            "table": body["physical_table"],
+        }).scalar_one()
+    assert view_exists is False
+    assert physical_exists is True
+
+
+def test_live_reorder_republish_creates_immutable_version_and_rolls_back_order():
+    first_submit = _submit_and_approve_reorder_ticket(
+        "live_reorder_version_one"
+    )
+    first_response = client.post(
+        f"/approvals/{first_submit['ticket_id']}/execute-live",
+        json=_execute_live_body("live_reorder_versioned_target"),
+    )
+    assert first_response.status_code == 200, first_response.text
+    first = first_response.json()
+
+    second_submit = _submit_and_approve_reorder_ticket(
+        "live_reorder_version_two",
+        rows=((111, 1), (222, 2), (333, 3)),
+    )
+    second_response = client.post(
+        f"/approvals/{second_submit['ticket_id']}/execute-live",
+        json=_execute_live_body("live_reorder_versioned_target"),
+    )
+    assert second_response.status_code == 200, second_response.text
+    second = second_response.json()
+    assert second["previous_physical_table"] == first["physical_table"]
+    assert _view_rows(
+        "live_reorder_versioned_target"
+    ) == [(1, 111), (2, 222), (3, 333)]
+
+    rollback = client.post(
+        f"/live-executions/{second['live_execution_id']}/rollback",
+        json={"operator": "mo"},
+    )
+    assert rollback.status_code == 200, rollback.text
+    assert _view_rows(
+        "live_reorder_versioned_target"
+    ) == [(1, 100), (2, 200), (3, 300)]
+
+    with live_target_engine.connect() as conn:
+        physical_tables = conn.execute(text(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = :schema "
+            "AND table_name IN (:first, :second)"
+        ), {
+            "schema": AEGIS_PUBLISH_DATA_SCHEMA,
+            "first": first["physical_table"],
+            "second": second["physical_table"],
+        }).scalars().all()
+        view_columns = conn.execute(text(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = :schema AND table_name = :table "
+            "ORDER BY ordinal_position"
+        ), {
+            "schema": AEGIS_PUBLISH_SCHEMA,
+            "table": "live_reorder_versioned_target",
+        }).scalars().all()
+    assert set(physical_tables) == {
+        first["physical_table"],
+        second["physical_table"],
+    }
+    assert view_columns == ["customer_id", "balance"]
 
 def test_execute_live_succeeds_and_publishes_a_stable_view():
     ticket_id, schema_version_id = _register_and_approve_source_ticket()

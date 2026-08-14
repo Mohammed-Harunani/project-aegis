@@ -91,6 +91,8 @@ from src.db.models import Base, ApprovalTicketRecord, HealingManifestRecord
 from src.consultant.consultant import RepairPlan
 from src.governance.approval import TicketNotPendingError
 from src.governance.approval_repository import PostgresApprovalRepository, _dataset_to_json
+from src.governance.column_order_safety import InvalidColumnOrderEvidenceError
+from src.governance.conversion_safety import analyze_cast_plan
 from src.inspector import AegisInspector
 
 
@@ -134,6 +136,22 @@ def _submit_rename_scenario():
     )
 
 
+def _submit_reorder_scenario():
+    return client.post(
+        "/simulate-migration",
+        json={
+            "gold_schema": {
+                "customer_id": "int64",
+                "balance": "int64",
+            },
+            "sample_data": {
+                "balance": [100, 200, 300],
+                "customer_id": [1, 2, 3],
+            },
+        },
+    )
+
+
 
 
 def _submit_safe_cast_scenario():
@@ -164,6 +182,235 @@ def test_requires_human_approval_creates_pending_ticket_not_execution():
     assert body["status"] == "PENDING_APPROVAL"
     assert body["governance_decision"] == "REQUIRES_HUMAN_APPROVAL"
     assert "ticket_id" in body
+
+
+# ---- Phase 3.3.4 verified column-order governance and API ----
+
+
+def test_sample_reorder_submission_is_pending_and_gold_authoritative():
+    response = _submit_reorder_scenario()
+    body = response.json()
+
+    assert response.status_code == 200, response.text
+    assert body["status"] == "PENDING_APPROVAL"
+    assert body["governance_decision"] == "REQUIRES_HUMAN_APPROVAL"
+    assert body["proposed_action"] == (
+        'REORDER_COLUMNS TO ["customer_id","balance"]'
+    )
+    assert body["column_order_evidence"] == {
+        "canonical_action": 'REORDER_COLUMNS TO ["customer_id","balance"]',
+        "observed_order": ["balance", "customer_id"],
+        "gold_order": ["customer_id", "balance"],
+        "column_count": 2,
+        "reorder_only": True,
+    }
+    assert body["conversion_decision"] is None
+
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).one()
+        assert ticket.live_eligible is False
+        assert ticket.conversion_decision is None
+        assert ticket.source_ingestion_run_id is None
+
+
+def test_reorder_evidence_round_trips_through_ticket_reads():
+    submitted = _submit_reorder_scenario().json()
+    ticket_id = submitted["ticket_id"]
+
+    fetched = client.get(f"/approvals/{ticket_id}")
+    listed = client.get("/approvals")
+
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["proposed_action"] == submitted["proposed_action"]
+    assert fetched.json()["column_order_evidence"] == (
+        submitted["column_order_evidence"]
+    )
+    listed_ticket = next(
+        item for item in listed.json()["tickets"]
+        if item["ticket_id"] == ticket_id
+    )
+    assert listed_ticket["proposed_action"] == submitted["proposed_action"]
+    assert listed_ticket["column_order_evidence"] == (
+        submitted["column_order_evidence"]
+    )
+
+
+def test_reorder_approval_persists_manifest_with_sql_null_conversion_metadata():
+    submitted = _submit_reorder_scenario().json()
+    ticket_id = submitted["ticket_id"]
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo", "note": "verified order"},
+    )
+    body = response.json()
+
+    assert response.status_code == 200, response.text
+    assert body["status"] == "APPROVED"
+    assert body["proposed_action"] == submitted["proposed_action"]
+    assert body["column_order_evidence"] == submitted["column_order_evidence"]
+    assert body["conversion_decision"] is None
+    assert body["conversion_outcome"] is None
+
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=ticket_id
+        ).one()
+        manifest = db.query(HealingManifestRecord).filter_by(
+            ticket_id=ticket_id
+        ).one()
+        assert ticket.status == "APPROVED"
+        assert ticket.conversion_decision is None
+        assert manifest.conversion_outcome is None
+        assert manifest.corrected_output_fingerprint is not None
+        assert manifest.original_row_count == manifest.final_row_count == 3
+        assert manifest.component_versions["column_order"] == (
+            "phase3.3-policy-v1"
+        )
+
+
+def test_tampered_reorder_action_blocks_approval_and_rolls_back_status():
+    ticket_id = _submit_reorder_scenario().json()["ticket_id"]
+
+    with TestSessionLocal() as db:
+        record = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=ticket_id
+        ).one()
+        record.proposed_action = (
+            'REORDER_COLUMNS TO ["balance","customer_id"]'
+        )
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo"},
+    )
+
+    assert response.status_code == 422
+    assert "column-order governance" in response.json()["detail"]
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=ticket_id
+        ).one()
+        assert ticket.status == "PENDING"
+        assert db.query(HealingManifestRecord).count() == 0
+
+
+def test_tampered_reorder_replay_blocks_approval_and_manifest():
+    ticket_id = _submit_reorder_scenario().json()["ticket_id"]
+
+    with TestSessionLocal() as db:
+        record = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=ticket_id
+        ).one()
+        record.target_dataset = _dataset_to_json(
+            pd.DataFrame(
+                {
+                    "customer_id": [1, 2, 3],
+                    "balance": [100, 200, 300],
+                }
+            )
+        )
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo"},
+    )
+
+    assert response.status_code == 422
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=ticket_id
+        ).one()
+        assert ticket.status == "PENDING"
+        assert db.query(HealingManifestRecord).count() == 0
+
+
+def test_reorder_ticket_with_conversion_metadata_is_rejected():
+    ticket_id = _submit_reorder_scenario().json()["ticket_id"]
+    cast_plan = RepairPlan("CAST_COLUMN amount TO int64", 0.85, "cast")
+    safe_conversion = analyze_cast_plan(
+        cast_plan,
+        pd.DataFrame({"amount": ["1", "2", "3"]}),
+    )
+
+    with TestSessionLocal() as db:
+        record = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=ticket_id
+        ).one()
+        record.conversion_decision = safe_conversion.to_dict()
+        db.commit()
+
+    response = client.post(
+        f"/approvals/{ticket_id}/approve",
+        json={"operator": "mo"},
+    )
+
+    assert response.status_code == 422
+    with TestSessionLocal() as db:
+        ticket = db.query(ApprovalTicketRecord).filter_by(
+            ticket_id=ticket_id
+        ).one()
+        assert ticket.status == "PENDING"
+        assert db.query(HealingManifestRecord).count() == 0
+
+
+def test_sample_request_cannot_supply_a_target_order():
+    response = client.post(
+        "/simulate-migration",
+        json={
+            "gold_schema": {"customer_id": "int64", "balance": "int64"},
+            "sample_data": {"balance": [100], "customer_id": [1]},
+            "target_order": ["balance", "customer_id"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "Gold schema" in response.text
+    with TestSessionLocal() as db:
+        assert db.query(ApprovalTicketRecord).count() == 0
+
+
+def test_already_ordered_sample_creates_no_ticket():
+    response = client.post(
+        "/simulate-migration",
+        json={
+            "gold_schema": {"customer_id": "int64", "balance": "int64"},
+            "sample_data": {"customer_id": [1], "balance": [100]},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message"] == "No repair plans proposed."
+    with TestSessionLocal() as db:
+        assert db.query(ApprovalTicketRecord).count() == 0
+
+
+def test_repository_rejects_noncanonical_reorder_before_insert():
+    observed = AegisInspector().generate_observed_schema(
+        pd.DataFrame({"balance": [100], "customer_id": [1]})
+    )
+    gold = AegisInspector().generate_observed_schema(
+        pd.DataFrame({"customer_id": [1], "balance": [100]})
+    )
+    plan = RepairPlan(
+        'REORDER_COLUMNS TO [ "customer_id", "balance" ]',
+        0.90,
+        "noncanonical",
+    )
+
+    with TestSessionLocal() as db:
+        with pytest.raises(InvalidColumnOrderEvidenceError, match="canonical"):
+            PostgresApprovalRepository(db).submit(
+                repair_plan=plan,
+                observed_schema=observed,
+                gold_schema=gold,
+                target_dataset=pd.DataFrame(
+                    {"balance": [100], "customer_id": [1]}
+                ),
+            )
+        assert db.query(ApprovalTicketRecord).count() == 0
 
 
 def test_pending_ticket_survives_a_fresh_session():

@@ -24,6 +24,9 @@ import pandas as pd
 
 from src.consultant.consultant import RepairPlan
 from src.governance.manifest import ConversionOutcomeMetadata
+from src.governance.column_order_safety import (
+    require_valid_column_order_evidence,
+)
 
 
 ApprovalStatus = Literal["PENDING", "APPROVED", "REJECTED"]
@@ -102,6 +105,13 @@ class ApprovalQueue:
         target_dataset: pd.DataFrame,
         conversion_decision: Optional[ConversionOutcomeMetadata] = None,
     ) -> ApprovalTicket:
+        require_valid_column_order_evidence(
+            repair_plan,
+            observed_schema,
+            gold_schema,
+            target_dataset,
+            conversion_decision,
+        )
         ticket = ApprovalTicket(
             ticket_id=str(uuid.uuid4()),
             repair_plan=repair_plan,
@@ -137,6 +147,13 @@ class ApprovalQueue:
 
         require_safe_conversion_decision(
             ticket.repair_plan,
+            ticket.target_dataset,
+            ticket.conversion_decision,
+        )
+        require_valid_column_order_evidence(
+            ticket.repair_plan,
+            ticket.observed_schema,
+            ticket.gold_schema,
             ticket.target_dataset,
             ticket.conversion_decision,
         )
