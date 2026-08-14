@@ -4,6 +4,11 @@ from typing import Iterable, Optional, Tuple
 
 import pandas as pd
 
+from src.column_order import (
+    InvalidColumnOrderActionError,
+    analyze_reorder_only_eligibility,
+    parse_column_order_action,
+)
 from src.governance.conversion_safety import (
     InvalidCastActionError,
     ParsedCastAction,
@@ -11,6 +16,7 @@ from src.governance.conversion_safety import (
     parse_cast_action,
 )
 from src.governance.manifest import ConversionOutcomeMetadata, HealingManifest
+from src.inspector import ColumnStats, ObservedSchema, SchemaDelta
 from src.live_execution.cast_allowlist import (
     LiveCastAllowlistError,
     LiveCastPair,
@@ -43,10 +49,12 @@ class AegisSurgeon:
     Phase 3.1.6 retains the verified sandbox CAST_COLUMN path and permits a
     live cast only when its trusted logical source-target pair is explicitly
     allowlisted by the caller. Destructive WITH_DROP_INVALID plans remain
-    refused. RENAME_COLUMN behavior is unchanged.
+    refused. Phase 3.3.3 adds sandbox-only verified REORDER_COLUMNS execution.
+    RENAME_COLUMN behavior is unchanged.
     """
 
-    _SURGEON_VERSION = "2.0"
+    _SURGEON_VERSION = "2.1"
+    _COLUMN_ORDER_POLICY_VERSION = "phase3.3-policy-v1"
     _DROP_INVALID_BLOCK_MESSAGE = (
         "WITH_DROP_INVALID is forbidden by the verified type-repair "
         "contract; row-dropping is not a type conversion."
@@ -124,6 +132,164 @@ class AegisSurgeon:
             and str(converted.dtype) == expected_dtype
         )
 
+    @staticmethod
+    def _derive_schema_delta(observed_schema, gold_schema) -> SchemaDelta:
+        """Build the complete delta used by the independent order proof."""
+
+        try:
+            observed_order = observed_schema.column_order
+            gold_order = gold_schema.column_order
+        except (AttributeError, TypeError):
+            return SchemaDelta([], [], {}, True)
+
+        # The policy layer owns validation of malformed and duplicate orders.
+        # Supply a neutral delta so those stable reason codes are not hidden by
+        # unsafe set/dict operations here.
+        if (
+            type(observed_order) not in (list, tuple)
+            or type(gold_order) not in (list, tuple)
+            or any(type(name) is not str for name in observed_order)
+            or any(type(name) is not str for name in gold_order)
+            or len(set(observed_order)) != len(observed_order)
+            or len(set(gold_order)) != len(gold_order)
+        ):
+            return SchemaDelta([], [], {}, True)
+
+        observed_names = set(observed_order)
+        gold_names = set(gold_order)
+        missing_columns = sorted(gold_names - observed_names)
+        new_columns = sorted(observed_names - gold_names)
+        type_mismatches = {}
+
+        try:
+            for name in observed_names.intersection(gold_names):
+                observed_dtype = observed_schema.columns[name].dtype
+                gold_dtype = gold_schema.columns[name].dtype
+                if observed_dtype != gold_dtype:
+                    type_mismatches[name] = {
+                        "observed": observed_dtype,
+                        "gold": gold_dtype,
+                    }
+        except Exception:
+            # Leave the summary empty. The policy independently inspects both
+            # schema mappings and will fail closed with its metadata reason.
+            type_mismatches = {}
+
+        return SchemaDelta(
+            missing_columns=missing_columns,
+            new_columns=new_columns,
+            type_mismatches=type_mismatches,
+            reorder_event=tuple(observed_order) != tuple(gold_order),
+        )
+
+    @classmethod
+    def _order_eligibility(cls, observed_schema, gold_schema):
+        return analyze_reorder_only_eligibility(
+            cls._derive_schema_delta(observed_schema, gold_schema),
+            observed_schema,
+            gold_schema,
+        )
+
+    @staticmethod
+    def _schema_matches_dataset(provided_schema, actual_schema) -> bool:
+        """Prove the supplied observed metadata describes this dataset."""
+
+        try:
+            if tuple(provided_schema.column_order) != tuple(
+                actual_schema.column_order
+            ):
+                return False
+            if set(provided_schema.columns) != set(actual_schema.columns):
+                return False
+            for name in actual_schema.column_order:
+                provided = provided_schema.columns[name]
+                actual = actual_schema.columns[name]
+                if (
+                    provided.dtype != actual.dtype
+                    or provided.null_count != actual.null_count
+                ):
+                    return False
+        except Exception:
+            return False
+        return True
+
+    @staticmethod
+    def _dataset_schema(dataframe: pd.DataFrame) -> ObservedSchema:
+        """Observe only execution-critical metadata without hashing values."""
+
+        columns = {
+            name: ColumnStats(
+                null_count=int(dataframe[name].isna().sum()),
+                # Eligibility never consumes unique_count. Avoid pandas
+                # nunique() here because valid nested objects are unhashable.
+                unique_count=0,
+                dtype=str(dataframe[name].dtype),
+            )
+            for name in dataframe.columns
+        }
+        return ObservedSchema(
+            columns=columns,
+            column_order=list(dataframe.columns),
+        )
+
+    @staticmethod
+    def _validate_reorder_candidate(
+        pristine: pd.DataFrame,
+        candidate: pd.DataFrame,
+        target_order: Tuple[str, ...],
+    ) -> Optional[str]:
+        """Return a redacted reason code, or None after the full proof."""
+
+        if tuple(candidate.columns) != target_order:
+            return "TARGET_ORDER_MISMATCH"
+        if len(candidate.columns) != len(pristine.columns):
+            return "COLUMN_COUNT_MISMATCH"
+        if set(candidate.columns) != set(pristine.columns):
+            return "COLUMN_MEMBERSHIP_MISMATCH"
+        if len(candidate) != len(pristine):
+            return "ROW_COUNT_MISMATCH"
+        if type(candidate.index) is not type(pristine.index):
+            return "INDEX_TYPE_MISMATCH"
+        if not candidate.index.equals(pristine.index):
+            return "INDEX_VALUE_OR_ORDER_MISMATCH"
+        if candidate.index.names != pristine.index.names:
+            return "INDEX_NAME_MISMATCH"
+        if str(candidate.index.dtype) != str(pristine.index.dtype):
+            return "INDEX_DTYPE_MISMATCH"
+
+        try:
+            for name in pristine.columns:
+                if str(candidate[name].dtype) != str(pristine[name].dtype):
+                    return "COLUMN_DTYPE_MISMATCH"
+                pd.testing.assert_series_equal(
+                    candidate[name],
+                    pristine[name],
+                    check_dtype=True,
+                    check_index_type=True,
+                    check_series_type=True,
+                    check_names=True,
+                    check_exact=True,
+                    check_categorical=True,
+                )
+
+            restored = candidate.loc[:, list(pristine.columns)]
+            pd.testing.assert_frame_equal(
+                restored,
+                pristine,
+                check_dtype=True,
+                check_index_type=True,
+                check_column_type=True,
+                check_frame_type=True,
+                check_names=True,
+                check_exact=True,
+                check_categorical=True,
+                check_like=False,
+            )
+        except (AssertionError, TypeError, ValueError):
+            return "VALUE_OR_NULL_MISMATCH"
+
+        return None
+
     def _compute_risk(
         self,
         execution_result: ExecutionResult,
@@ -171,6 +337,7 @@ class AegisSurgeon:
             raise ValueError("Execution mode not allowed.")
 
         original_row_count = len(target_dataset)
+        source_snapshot = target_dataset.copy(deep=True)
         working_df = (
             target_dataset.copy(deep=True)
             if execution_mode == "sandbox"
@@ -181,6 +348,7 @@ class AegisSurgeon:
         validation_success = False
         validation_message = "No operation performed."
         conversion_outcome = None
+        order_action_attempted = False
         rollback_df = working_df.copy(deep=True)
 
         try:
@@ -274,6 +442,103 @@ class AegisSurgeon:
                             # as it was before analysis.
                             applied = False
 
+            elif type(action) is str and action.startswith("REORDER_COLUMNS"):
+                order_action_attempted = True
+                try:
+                    order_action = parse_column_order_action(action)
+                except InvalidColumnOrderActionError:
+                    validation_message = "Invalid REORDER_COLUMNS action."
+                    order_action = None
+
+                if order_action is None:
+                    applied = False
+                elif execution_mode != "sandbox":
+                    # Live order execution is introduced only after the Phase
+                    # 3.3.5 source-revalidation and fingerprint gates exist.
+                    validation_message = (
+                        "REORDER_COLUMNS is not enabled for live execution."
+                    )
+                elif type(working_df) is not pd.DataFrame:
+                    validation_message = (
+                        "Column-order repair requires a pandas DataFrame."
+                    )
+                else:
+                    supplied_eligibility = self._order_eligibility(
+                        observed_schema,
+                        gold_schema,
+                    )
+                    if not supplied_eligibility.eligible:
+                        validation_message = (
+                            "Column-order repair is ineligible: "
+                            f"{supplied_eligibility.reason_code.value}."
+                        )
+                    elif order_action.target_order != supplied_eligibility.gold_order:
+                        validation_message = (
+                            "Column-order action does not match the Gold schema."
+                        )
+                    else:
+                        raw_columns = tuple(working_df.columns)
+                        if (
+                            any(type(name) is not str for name in raw_columns)
+                            or len(set(raw_columns)) != len(raw_columns)
+                        ):
+                            validation_message = (
+                                "Target dataset has invalid or duplicate columns."
+                            )
+                        else:
+                            actual_schema = self._dataset_schema(working_df)
+                            actual_eligibility = self._order_eligibility(
+                                actual_schema,
+                                gold_schema,
+                            )
+                            if not actual_eligibility.eligible:
+                                validation_message = (
+                                    "Target dataset is not reorder-only: "
+                                    f"{actual_eligibility.reason_code.value}."
+                                )
+                            elif not self._schema_matches_dataset(
+                                observed_schema,
+                                actual_schema,
+                            ):
+                                validation_message = (
+                                    "Observed schema does not match the target dataset."
+                                )
+                            else:
+                                candidate_df = working_df.loc[
+                                    :, list(order_action.target_order)
+                                ].copy(deep=True)
+                                preservation_failure = (
+                                    self._validate_reorder_candidate(
+                                        rollback_df,
+                                        candidate_df,
+                                        order_action.target_order,
+                                    )
+                                )
+                                source_unchanged_failure = (
+                                    self._validate_reorder_candidate(
+                                        source_snapshot,
+                                        target_dataset,
+                                        tuple(source_snapshot.columns),
+                                    )
+                                )
+                                if preservation_failure is not None:
+                                    validation_message = (
+                                        "Column-order preservation failed: "
+                                        f"{preservation_failure}."
+                                    )
+                                elif source_unchanged_failure is not None:
+                                    validation_message = (
+                                        "Column-order source isolation failed: "
+                                        f"{source_unchanged_failure}."
+                                    )
+                                else:
+                                    working_df = candidate_df
+                                    applied = True
+                                    validation_message = (
+                                        "Verified column-order repair preserved rows, "
+                                        "index, dtypes, values, and nulls."
+                                    )
+
             else:
                 validation_message = "Unsupported repair action."
 
@@ -313,8 +578,9 @@ class AegisSurgeon:
             # Sandbox execution is all-or-nothing even when an unexpected
             # exception occurs after a candidate transformation was built.
             # Restore the pristine sandbox snapshot before producing the
-            # manifest. Live CAST_COLUMN never reaches mutation in this stage;
-            # legacy live RENAME_COLUMN behavior remains unchanged.
+            # manifest. Live CAST_COLUMN and REORDER_COLUMNS never reach
+            # mutation in this stage; legacy live RENAME_COLUMN behavior
+            # remains unchanged.
             if execution_mode == "sandbox":
                 working_df = rollback_df
             validation_success = False
@@ -357,6 +623,10 @@ class AegisSurgeon:
         if conversion_outcome is not None:
             component_versions["type_repair"] = (
                 conversion_outcome.policy_version
+            )
+        if order_action_attempted:
+            component_versions["column_order"] = (
+                self._COLUMN_ORDER_POLICY_VERSION
             )
 
         manifest = HealingManifest(
