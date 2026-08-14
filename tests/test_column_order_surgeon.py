@@ -27,7 +27,16 @@ def _plan(order):
     )
 
 
-def _execute(source, gold, *, action=None, observed_schema=None, mode="sandbox"):
+def _execute(
+    source,
+    gold,
+    *,
+    action=None,
+    observed_schema=None,
+    mode="sandbox",
+    allow_live_column_order=False,
+    trusted_observed_schema=False,
+):
     return AegisSurgeon().execute(
         repair_plan=(
             RepairPlan(action, 0.90, "test order repair")
@@ -40,6 +49,8 @@ def _execute(source, gold, *, action=None, observed_schema=None, mode="sandbox")
         operator="test_user",
         execution_mode=mode,
         allowed_modes=["sandbox", "live"],
+        allow_live_column_order=allow_live_column_order,
+        trusted_observed_schema=trusted_observed_schema,
     )
 
 
@@ -72,7 +83,7 @@ def test_manifest_is_accurate_and_contains_no_conversion_metadata():
     assert manifest.integrity_status == "NO_VOLUME_CHANGE"
     assert manifest.risk_level == "LOW_RISK"
     assert manifest.conversion_outcome is None
-    assert manifest.component_versions["surgeon"] == "2.1"
+    assert manifest.component_versions["surgeon"] == "2.2"
     assert manifest.component_versions["column_order"] == "phase3.3-policy-v1"
     assert "type_repair" not in manifest.component_versions
     assert result.validation.message == (
@@ -423,6 +434,58 @@ def test_live_reorder_is_blocked_until_controlled_live_stage():
     assert manifest.conversion_outcome is None
     pd.testing.assert_frame_equal(source, pristine)
     pd.testing.assert_frame_equal(manifest.corrected_dataset, pristine)
+
+
+def test_live_reorder_requires_explicit_one_call_capability():
+    source = pd.DataFrame({"b": [2], "a": [1]})
+    pristine = source.copy(deep=True)
+    gold = source.loc[:, ["a", "b"]]
+
+    result, manifest = _execute(
+        source,
+        gold,
+        mode="live",
+        allow_live_column_order=True,
+    )
+
+    assert result.applied is True
+    assert result.validation.success is True
+    assert list(manifest.corrected_dataset.columns) == ["a", "b"]
+    assert manifest.execution_mode == "live"
+    assert manifest.conversion_outcome is None
+    pd.testing.assert_frame_equal(source, pristine)
+
+
+def test_live_reorder_capability_is_rejected_outside_live_mode():
+    source = pd.DataFrame({"b": [2], "a": [1]})
+    gold = source.loc[:, ["a", "b"]]
+
+    with pytest.raises(
+        ValueError,
+        match="valid only for live execution",
+    ):
+        _execute(
+            source,
+            gold,
+            allow_live_column_order=True,
+        )
+
+
+@pytest.mark.parametrize("invalid_value", [None, 1, "true"])
+def test_live_reorder_capability_requires_exact_bool(invalid_value):
+    source = pd.DataFrame({"b": [2], "a": [1]})
+    gold = source.loc[:, ["a", "b"]]
+
+    with pytest.raises(
+        ValueError,
+        match="allow_live_column_order must be a bool",
+    ):
+        _execute(
+            source,
+            gold,
+            mode="live",
+            allow_live_column_order=invalid_value,
+        )
 
 
 def _source_logical_schema(order, *, null_count=0):

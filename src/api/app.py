@@ -1363,9 +1363,20 @@ def execute_live(
         )
 
     is_live_cast = is_cast_action(ticket.repair_plan.proposed_action)
+    live_order_evidence = None
     allowed_live_cast_pairs = frozenset()
     live_cast_pair = None
     try:
+        # Revalidate the complete persisted approval replay before touching
+        # source or target databases. Reserved REORDER_COLUMNS-shaped actions
+        # fail closed here rather than falling through as an unrelated action.
+        live_order_evidence = require_valid_column_order_evidence(
+            ticket.repair_plan,
+            ticket.observed_schema,
+            ticket.gold_schema,
+            ticket.target_dataset,
+            ticket.conversion_decision,
+        )
         if is_live_cast:
             allowed_live_cast_pairs = configured_live_cast_allowlist()
             require_safe_conversion_decision(
@@ -1378,11 +1389,18 @@ def execute_live(
                 ticket.observed_schema,
                 allowed_live_cast_pairs,
             )
-        elif ticket.conversion_decision is not None:
+        elif (
+            live_order_evidence is None
+            and ticket.conversion_decision is not None
+        ):
             raise ConversionApprovalBlockedError(
                 "Non-CAST live ticket unexpectedly carries conversion metadata."
             )
-    except (ConversionGovernanceError, LiveCastAllowlistError) as e:
+    except (
+        ColumnOrderGovernanceError,
+        ConversionGovernanceError,
+        LiveCastAllowlistError,
+    ) as e:
         raise HTTPException(status_code=422, detail=str(e))
 
     manifest_record = (
@@ -1686,17 +1704,56 @@ def execute_live(
                         expected_dataset_fingerprint=ticket.source_dataset_fingerprint,
                     )
 
+                surgeon_observed_schema = ticket.observed_schema
+                allow_live_column_order = False
+                if live_order_evidence is not None:
+                    # Approval-time evidence is not execution-time evidence.
+                    # Rebuild the logical observed schema from this exact,
+                    # complete source read and independently prove that the
+                    # current drift is still one pure permutation of Gold.
+                    fresh_observed_schema = build_source_observed_schema(
+                        fresh_source["dataframe"],
+                        fresh_source["column_types"],
+                    )
+                    try:
+                        fresh_order_evidence = (
+                            require_valid_column_order_evidence(
+                                ticket.repair_plan,
+                                fresh_observed_schema,
+                                ticket.gold_schema,
+                                fresh_source["dataframe"],
+                                None,
+                            )
+                        )
+                    except ColumnOrderGovernanceError as exc:
+                        raise LiveExecutionNotAllowedError(
+                            "Fresh source no longer proves verified "
+                            f"reorder-only eligibility. {exc}"
+                        ) from exc
+                    if (
+                        fresh_order_evidence is None
+                        or fresh_order_evidence != live_order_evidence
+                    ):
+                        raise LiveExecutionNotAllowedError(
+                            "Fresh source column-order evidence does not match "
+                            "the approved reorder evidence."
+                        )
+                    surgeon_observed_schema = fresh_observed_schema
+                    allow_live_column_order = True
+
                 surgeon = AegisSurgeon()
                 working_copy = fresh_source["dataframe"].copy()
                 live_execution_result, _live_manifest = surgeon.execute(
                     repair_plan=ticket.repair_plan,
-                    observed_schema=ticket.observed_schema,
+                    observed_schema=surgeon_observed_schema,
                     gold_schema=ticket.gold_schema,
                     target_dataset=working_copy,
                     operator=request.operator,
                     execution_mode="live",
                     allowed_modes=["sandbox", "live"],
                     allowed_live_cast_pairs=allowed_live_cast_pairs,
+                    trusted_observed_schema=allow_live_column_order,
+                    allow_live_column_order=allow_live_column_order,
                 )
 
                 if not live_execution_result.applied or not live_execution_result.validation.success:
@@ -1718,6 +1775,19 @@ def execute_live(
                         raise LiveExecutionNotAllowedError(
                             "Fresh live CAST_COLUMN outcome does not match the sandbox manifest."
                         )
+                elif live_order_evidence is not None:
+                    if _live_manifest.conversion_outcome is not None:
+                        raise LiveExecutionNotAllowedError(
+                            "Fresh live REORDER_COLUMNS execution unexpectedly "
+                            "produced conversion metadata."
+                        )
+                    if tuple(_live_manifest.corrected_dataset.columns) != (
+                        live_order_evidence.gold_order
+                    ):
+                        raise LiveExecutionNotAllowedError(
+                            "Fresh live REORDER_COLUMNS output does not expose "
+                            "the exact approved Gold order."
+                        )
 
                 # For CAST_COLUMN, Surgeon applies to a candidate copy and returns
                 # the verified corrected dataset in its manifest. For RENAME_COLUMN
@@ -1733,8 +1803,11 @@ def execute_live(
                 # records the fresh Surgeon result for both legacy live
                 # RENAME_COLUMN and explicitly allowlisted live CAST_COLUMN.
                 verify_complete_schema_match(
-                    working_copy, ticket.observed_schema, ticket.repair_plan.proposed_action,
-                    ticket.gold_schema, repair_applied=live_execution_result.applied,
+                    working_copy,
+                    surgeon_observed_schema,
+                    ticket.repair_plan.proposed_action,
+                    ticket.gold_schema,
+                    repair_applied=live_execution_result.applied,
                 )
 
                 live_recomputed_fingerprint = compute_dataframe_fingerprint(working_copy)

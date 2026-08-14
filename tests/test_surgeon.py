@@ -84,7 +84,7 @@ def test_surgeon_emits_healing_manifest_for_rename_unchanged():
     assert manifest.operator == "test_user"
     assert manifest.component_versions["inspector"] == "1.0"
     assert manifest.component_versions["consultant"] == "1.2"
-    assert manifest.component_versions["surgeon"] == "2.1"
+    assert manifest.component_versions["surgeon"] == "2.2"
     assert "type_repair" not in manifest.component_versions
     assert manifest.conversion_outcome is None
     assert list(manifest.corrected_dataset.columns) == ["old_name"]

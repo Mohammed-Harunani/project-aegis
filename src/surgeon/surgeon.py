@@ -49,11 +49,12 @@ class AegisSurgeon:
     Phase 3.1.6 retains the verified sandbox CAST_COLUMN path and permits a
     live cast only when its trusted logical source-target pair is explicitly
     allowlisted by the caller. Destructive WITH_DROP_INVALID plans remain
-    refused. Phase 3.3.3 adds sandbox-only verified REORDER_COLUMNS execution.
-    RENAME_COLUMN behavior is unchanged.
+    refused. Phase 3.3.5 permits verified REORDER_COLUMNS execution in live
+    mode only when the caller grants the narrow one-call capability after
+    fresh source revalidation. RENAME_COLUMN behavior is unchanged.
     """
 
-    _SURGEON_VERSION = "2.1"
+    _SURGEON_VERSION = "2.2"
     _COLUMN_ORDER_POLICY_VERSION = "phase3.3-policy-v1"
     _DROP_INVALID_BLOCK_MESSAGE = (
         "WITH_DROP_INVALID is forbidden by the verified type-repair "
@@ -336,6 +337,7 @@ class AegisSurgeon:
         allowed_modes=None,
         allowed_live_cast_pairs: Optional[Iterable[LiveCastPair]] = None,
         trusted_observed_schema: bool = False,
+        allow_live_column_order: bool = False,
     ) -> Tuple[ExecutionResult, HealingManifest]:
 
         if allowed_modes is None:
@@ -345,6 +347,12 @@ class AegisSurgeon:
             raise ValueError("Execution mode not allowed.")
         if type(trusted_observed_schema) is not bool:
             raise ValueError("trusted_observed_schema must be a bool.")
+        if type(allow_live_column_order) is not bool:
+            raise ValueError("allow_live_column_order must be a bool.")
+        if allow_live_column_order and execution_mode != "live":
+            raise ValueError(
+                "allow_live_column_order is valid only for live execution."
+            )
 
         original_row_count = len(target_dataset)
         source_snapshot = target_dataset.copy(deep=True)
@@ -462,9 +470,14 @@ class AegisSurgeon:
 
                 if order_action is None:
                     applied = False
-                elif execution_mode != "sandbox":
-                    # Live order execution is introduced only after the Phase
-                    # 3.3.5 source-revalidation and fingerprint gates exist.
+                elif execution_mode != "sandbox" and not (
+                    execution_mode == "live"
+                    and allow_live_column_order
+                ):
+                    # A generic live call cannot enable order repair. The API
+                    # grants this one-call capability only after it has
+                    # reread the complete source and independently re-proved
+                    # reorder-only eligibility against persisted Gold.
                     validation_message = (
                         "REORDER_COLUMNS is not enabled for live execution."
                     )
@@ -595,9 +608,9 @@ class AegisSurgeon:
             # Sandbox execution is all-or-nothing even when an unexpected
             # exception occurs after a candidate transformation was built.
             # Restore the pristine sandbox snapshot before producing the
-            # manifest. Live CAST_COLUMN and REORDER_COLUMNS never reach
-            # mutation in this stage; legacy live RENAME_COLUMN behavior
-            # remains unchanged.
+            # manifest. Live CAST_COLUMN and REORDER_COLUMNS build candidate
+            # copies rather than mutating the caller's source; legacy live
+            # RENAME_COLUMN behavior remains unchanged.
             if execution_mode == "sandbox":
                 working_df = rollback_df
             validation_success = False
