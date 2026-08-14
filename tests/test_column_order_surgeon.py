@@ -9,7 +9,7 @@ import pandas as pd
 import pytest
 
 from consultant.consultant import RepairPlan
-from inspector import AegisInspector
+from inspector import AegisInspector, ColumnStats, ObservedSchema
 from src.column_order import serialize_column_order_action
 from src.live_execution.output_fingerprint import compute_dataframe_fingerprint
 from surgeon.surgeon import AegisSurgeon
@@ -423,3 +423,92 @@ def test_live_reorder_is_blocked_until_controlled_live_stage():
     assert manifest.conversion_outcome is None
     pd.testing.assert_frame_equal(source, pristine)
     pd.testing.assert_frame_equal(manifest.corrected_dataset, pristine)
+
+
+def _source_logical_schema(order, *, null_count=0):
+    return ObservedSchema(
+        columns={
+            name: ColumnStats(
+                null_count=(null_count if name == "customer_id" else 0),
+                unique_count=2,
+                dtype="int64",
+            )
+            for name in order
+        },
+        column_order=list(order),
+    )
+
+
+def test_verified_source_logical_dtypes_allow_object_replay_reorder():
+    source = pd.DataFrame(
+        {"balance": [100, 200], "customer_id": [1, 2]},
+        dtype=object,
+    )
+    observed = _source_logical_schema(("balance", "customer_id"))
+    gold = _source_logical_schema(("customer_id", "balance"))
+
+    result, manifest = AegisSurgeon().execute(
+        repair_plan=_plan(["customer_id", "balance"]),
+        observed_schema=observed,
+        gold_schema=gold,
+        target_dataset=source,
+        operator="test_user",
+        trusted_observed_schema=True,
+    )
+
+    assert result.applied is True
+    assert result.validation.success is True
+    assert list(manifest.corrected_dataset.columns) == [
+        "customer_id",
+        "balance",
+    ]
+    assert [str(dtype) for dtype in manifest.corrected_dataset.dtypes] == [
+        "object",
+        "object",
+    ]
+
+
+def test_unverified_logical_dtypes_do_not_override_replay_dtypes():
+    source = pd.DataFrame(
+        {"balance": [100, 200], "customer_id": [1, 2]},
+        dtype=object,
+    )
+
+    result, manifest = AegisSurgeon().execute(
+        repair_plan=_plan(["customer_id", "balance"]),
+        observed_schema=_source_logical_schema(("balance", "customer_id")),
+        gold_schema=_source_logical_schema(("customer_id", "balance")),
+        target_dataset=source,
+        operator="test_user",
+    )
+
+    assert result.applied is False
+    assert result.validation.message == (
+        "Observed schema does not match the target dataset."
+    )
+    pd.testing.assert_frame_equal(manifest.corrected_dataset, source)
+
+
+def test_trusted_logical_schema_still_rejects_snapshot_null_mismatch():
+    source = pd.DataFrame(
+        {"balance": [100, 200], "customer_id": [1, 2]},
+        dtype=object,
+    )
+
+    result, manifest = AegisSurgeon().execute(
+        repair_plan=_plan(["customer_id", "balance"]),
+        observed_schema=_source_logical_schema(
+            ("balance", "customer_id"),
+            null_count=1,
+        ),
+        gold_schema=_source_logical_schema(("customer_id", "balance")),
+        target_dataset=source,
+        operator="test_user",
+        trusted_observed_schema=True,
+    )
+
+    assert result.applied is False
+    assert result.validation.message == (
+        "Observed schema does not match the target dataset."
+    )
+    pd.testing.assert_frame_equal(manifest.corrected_dataset, source)

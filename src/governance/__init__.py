@@ -13,6 +13,13 @@ from .conversion_safety import (
     parse_cast_action,
     require_safe_conversion_decision,
 )
+from .column_order_safety import (
+    ColumnOrderApprovalBlockedError,
+    ColumnOrderGovernanceError,
+    ColumnOrderGovernanceEvidence,
+    InvalidColumnOrderEvidenceError,
+    require_valid_column_order_evidence,
+)
 from .approval import (
     ApprovalQueue,
     ApprovalTicket,
@@ -35,6 +42,11 @@ __all__ = [
     "build_conversion_metadata",
     "analyze_cast_plan",
     "require_safe_conversion_decision",
+    "ColumnOrderGovernanceError",
+    "ColumnOrderApprovalBlockedError",
+    "InvalidColumnOrderEvidenceError",
+    "ColumnOrderGovernanceEvidence",
+    "require_valid_column_order_evidence",
     "ApprovalQueue",
     "ApprovalTicket",
     "TicketNotFoundError",

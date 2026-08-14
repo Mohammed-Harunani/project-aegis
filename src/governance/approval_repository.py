@@ -20,9 +20,12 @@ from sqlalchemy.orm import Session
 
 from src.consultant.consultant import RepairPlan
 from src.inspector import ObservedSchema, ColumnStats
-from src.db.models import ApprovalTicketRecord
+from src.db.models import ApprovalTicketRecord, SchemaVersionRecord
 from src.governance.manifest import ConversionOutcomeMetadata
 from src.governance.conversion_safety import require_safe_conversion_decision
+from src.governance.column_order_safety import (
+    require_valid_column_order_evidence,
+)
 from src.governance.dataset_codec import (
     DATASET_FORMAT_VERSION,
     decode_dataset as _dataset_from_json,
@@ -35,6 +38,10 @@ from src.governance.approval import (
     TicketNotPendingError,
 )
 from src.ingestion.repository import IngestionRepository, IngestionRepositoryError
+from src.live_execution.logical_dtype import (
+    UnsupportedSourceTypeError,
+    build_source_observed_schema,
+)
 
 
 class ApprovalReplayError(Exception):
@@ -60,6 +67,64 @@ def _schema_from_json(data: dict) -> ObservedSchema:
     return ObservedSchema(columns=columns, column_order=data["column_order"])
 
 
+def _is_column_order_candidate(action: object) -> bool:
+    """Reserve the complete REORDER_COLUMNS namespace for strict handling."""
+    return type(action) is str and action.startswith("REORDER_COLUMNS")
+
+
+def _require_registered_gold_schema(
+    db: Session,
+    *,
+    schema_version_id,
+    gold_schema: ObservedSchema,
+    proposed_action: object,
+) -> None:
+    """Prove a registry-backed reorder still uses its immutable Gold version."""
+    if (
+        schema_version_id is None
+        or not _is_column_order_candidate(proposed_action)
+    ):
+        return
+
+    try:
+        version_uuid = uuid.UUID(str(schema_version_id))
+    except (TypeError, ValueError) as exc:
+        raise ApprovalReplayError(
+            "Ticket schema-version lineage is invalid."
+        ) from exc
+
+    version = db.get(SchemaVersionRecord, version_uuid)
+    if version is None:
+        raise ApprovalReplayError(
+            "Ticket schema-version lineage cannot be resolved."
+        )
+
+    try:
+        definition = version.schema_definition
+        declared_columns = definition["columns"]
+        expected_columns = {
+            item["name"]: ColumnStats(
+                null_count=0,
+                unique_count=0,
+                dtype=item["dtype"],
+            )
+            for item in declared_columns
+        }
+        expected_gold = ObservedSchema(
+            columns=expected_columns,
+            column_order=[item["name"] for item in declared_columns],
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ApprovalReplayError(
+            "Ticket schema-version lineage contains an invalid definition."
+        ) from exc
+
+    if _schema_to_json(gold_schema) != _schema_to_json(expected_gold):
+        raise ApprovalReplayError(
+            "Ticket Gold schema disagrees with its linked immutable schema version."
+        )
+
+
 def _snapshot_backed_dataset(
     db: Session,
     *,
@@ -70,6 +135,7 @@ def _snapshot_backed_dataset(
     source_row_count,
     source_schema_fingerprint,
     source_dataset_fingerprint,
+    observed_schema: Optional[ObservedSchema] = None,
 ) -> pd.DataFrame:
     try:
         replay = IngestionRepository(db).load_simulation_replay(
@@ -109,6 +175,26 @@ def _snapshot_backed_dataset(
             "Ticket source provenance disagrees with its linked immutable snapshot: "
             + ", ".join(mismatches)
         )
+
+    if observed_schema is not None:
+        try:
+            column_types = {
+                item["column_name"]: item["data_type"]
+                for item in replay.snapshot.column_metadata
+            }
+            captured_observed = build_source_observed_schema(
+                replay.dataframe,
+                column_types,
+            )
+        except (KeyError, TypeError, ValueError, UnsupportedSourceTypeError) as exc:
+            raise ApprovalReplayError(
+                "Ticket snapshot cannot reproduce its trusted logical schema."
+            ) from exc
+
+        if _schema_to_json(observed_schema) != _schema_to_json(captured_observed):
+            raise ApprovalReplayError(
+                "Ticket observed schema disagrees with its linked immutable snapshot."
+            )
     return replay.dataframe
 
 
@@ -120,6 +206,14 @@ def _record_to_ticket(record: ApprovalTicketRecord, db: Session) -> ApprovalTick
             "Ticket must have exactly one replay source: embedded dataset or "
             "captured simulation lineage."
         )
+    observed_schema = _schema_from_json(record.observed_schema)
+    gold_schema = _schema_from_json(record.gold_schema)
+    _require_registered_gold_schema(
+        db,
+        schema_version_id=record.schema_version_id,
+        gold_schema=gold_schema,
+        proposed_action=record.proposed_action,
+    )
     target_dataset = (
         _dataset_from_json(record.target_dataset)
         if has_embedded_dataset
@@ -132,6 +226,11 @@ def _record_to_ticket(record: ApprovalTicketRecord, db: Session) -> ApprovalTick
             source_row_count=record.source_row_count,
             source_schema_fingerprint=record.source_schema_fingerprint,
             source_dataset_fingerprint=record.source_dataset_fingerprint,
+            observed_schema=(
+                observed_schema
+                if _is_column_order_candidate(record.proposed_action)
+                else None
+            ),
         )
     )
     return ApprovalTicket(
@@ -144,8 +243,8 @@ def _record_to_ticket(record: ApprovalTicketRecord, db: Session) -> ApprovalTick
         confidence=float(record.confidence),
         status=record.status,
         created_at=record.created_at.isoformat(),
-        observed_schema=_schema_from_json(record.observed_schema),
-        gold_schema=_schema_from_json(record.gold_schema),
+        observed_schema=observed_schema,
+        gold_schema=gold_schema,
         target_dataset=target_dataset,
         decided_by=record.decided_by,
         decided_at=record.decided_at.isoformat() if record.decided_at else None,
@@ -213,6 +312,7 @@ class PostgresApprovalRepository:
             if not isinstance(target_dataset, pd.DataFrame):
                 raise ApprovalReplayError("target_dataset must be a pandas DataFrame.")
             target_payload = _dataset_to_json(target_dataset)
+            replay_dataset = target_dataset
             run_uuid = None
         else:
             try:
@@ -223,7 +323,7 @@ class PostgresApprovalRepository:
                 ) from exc
             # Validate the run, snapshot payload, dataset identity, and copied
             # provenance before the ticket is allowed to reference them.
-            _snapshot_backed_dataset(
+            replay_dataset = _snapshot_backed_dataset(
                 self.db,
                 source_ingestion_run_id=run_uuid,
                 source_schema=source_schema,
@@ -232,8 +332,28 @@ class PostgresApprovalRepository:
                 source_row_count=source_row_count,
                 source_schema_fingerprint=source_schema_fingerprint,
                 source_dataset_fingerprint=source_dataset_fingerprint,
+                observed_schema=(
+                    observed_schema
+                    if _is_column_order_candidate(repair_plan.proposed_action)
+                    else None
+                ),
             )
             target_payload = None
+
+        _require_registered_gold_schema(
+            self.db,
+            schema_version_id=schema_version_id,
+            gold_schema=gold_schema,
+            proposed_action=repair_plan.proposed_action,
+        )
+
+        require_valid_column_order_evidence(
+            repair_plan,
+            observed_schema,
+            gold_schema,
+            replay_dataset,
+            conversion_decision,
+        )
 
         record = ApprovalTicketRecord(
             ticket_id=uuid.uuid4(),
@@ -348,6 +468,13 @@ class PostgresApprovalRepository:
         ticket = _record_to_ticket(record, self.db)
         require_safe_conversion_decision(
             ticket.repair_plan,
+            ticket.target_dataset,
+            ticket.conversion_decision,
+        )
+        require_valid_column_order_evidence(
+            ticket.repair_plan,
+            ticket.observed_schema,
+            ticket.gold_schema,
             ticket.target_dataset,
             ticket.conversion_decision,
         )

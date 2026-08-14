@@ -28,6 +28,11 @@ from src.governance.conversion_safety import (
     is_cast_action,
     require_safe_conversion_decision,
 )
+from src.governance.column_order_safety import (
+    ColumnOrderApprovalBlockedError,
+    ColumnOrderGovernanceError,
+    require_valid_column_order_evidence,
+)
 from src.db.session import get_db
 from src.db.models import HealingManifestRecord
 from src.governance.manifest import ConversionOutcomeMetadata
@@ -134,6 +139,15 @@ class MigrationRequest(BaseModel):
     schema_version: Optional[int] = Field(default=None, gt=0)
     sample_data: Dict[str, list]
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_caller_target_order(cls, value):
+        if isinstance(value, dict) and "target_order" in value:
+            raise ValueError(
+                "target_order is derived exclusively from the selected Gold schema."
+            )
+        return value
+
     @model_validator(mode="after")
     def _exactly_one_schema_source(self):
         has_gold_schema = self.gold_schema is not None
@@ -159,6 +173,15 @@ class SimulateFromSourceRequest(BaseModel):
     schema_version: Optional[int] = Field(default=None, gt=0)
     source_schema: str
     source_table: str
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_caller_target_order(cls, value):
+        if isinstance(value, dict) and "target_order" in value:
+            raise ValueError(
+                "target_order is derived exclusively from the selected Gold schema."
+            )
+        return value
 
 
 class ApprovalDecisionRequest(BaseModel):
@@ -254,6 +277,18 @@ def _build_gold_schema(gold_schema: Dict[str, str]) -> ObservedSchema:
 def _public_conversion_metadata(metadata):
     """Expose only the reviewed redacted conversion metadata shape."""
     return metadata.to_dict() if metadata is not None else None
+
+
+def _public_column_order_evidence(ticket):
+    """Derive redacted order evidence from the ticket's persisted replay."""
+    evidence = require_valid_column_order_evidence(
+        ticket.repair_plan,
+        ticket.observed_schema,
+        ticket.gold_schema,
+        ticket.target_dataset,
+        ticket.conversion_decision,
+    )
+    return evidence.to_dict() if evidence is not None else None
 
 
 def _configured_source_binding():
@@ -486,18 +521,27 @@ def simulate_migration(request: MigrationRequest, db: Session = Depends(get_db))
         }
 
     if decision == "REQUIRES_HUMAN_APPROVAL":
-        ticket = approvals.submit(
-            repair_plan=selected_plan,
-            observed_schema=observed_schema_obj,
-            gold_schema=gold_schema_obj,
-            target_dataset=df_observed,
-            schema_version_id=schema_version_id,
-            live_eligible=False,
-            conversion_decision=conversion_decision,
-        )
+        try:
+            ticket = approvals.submit(
+                repair_plan=selected_plan,
+                observed_schema=observed_schema_obj,
+                gold_schema=gold_schema_obj,
+                target_dataset=df_observed,
+                schema_version_id=schema_version_id,
+                live_eligible=False,
+                conversion_decision=conversion_decision,
+            )
+            order_evidence = _public_column_order_evidence(ticket)
+        except ColumnOrderGovernanceError as e:
+            db.rollback()
+            raise HTTPException(
+                status_code=422,
+                detail=f"Column-order submission was rejected. {e}",
+            )
         return {
             "schema_delta": str(delta),
             "proposed_repair": str(selected_plan),
+            "proposed_action": ticket.repair_plan.proposed_action,
             "confidence": selected_plan.confidence,
             "governance_decision": decision,
             "schema_version_id": schema_version_id,
@@ -506,6 +550,7 @@ def simulate_migration(request: MigrationRequest, db: Session = Depends(get_db))
             "conversion_decision": _public_conversion_metadata(
                 ticket.conversion_decision
             ),
+            "column_order_evidence": order_evidence,
             "message": (
                 f"Repair requires human approval before execution. "
                 f"POST /approvals/{ticket.ticket_id}/approve to proceed, "
@@ -752,25 +797,36 @@ def simulate_migration_from_source(
     # sandbox-execute and then have no path to live execution at all.
     decision = "REQUIRES_HUMAN_APPROVAL"
 
-    ticket = approvals.submit(
-        repair_plan=selected_plan,
-        observed_schema=observed_schema_obj,
-        gold_schema=gold_schema_obj,
-        target_dataset=None,
-        schema_version_id=schema_version_id,
-        source_schema=request.source_schema,
-        source_table=request.source_table,
-        source_primary_key=source_read["primary_key"],
-        source_row_count=source_read["row_count"],
-        source_schema_fingerprint=source_read["schema_fingerprint"],
-        source_dataset_fingerprint=source_read["dataset_fingerprint"],
-        live_eligible=True,
-        conversion_decision=conversion_decision,
-        source_ingestion_run_id=str(captured.run.ingestion_run_id),
-    )
+    try:
+        ticket = approvals.submit(
+            repair_plan=selected_plan,
+            observed_schema=observed_schema_obj,
+            gold_schema=gold_schema_obj,
+            target_dataset=None,
+            schema_version_id=schema_version_id,
+            source_schema=request.source_schema,
+            source_table=request.source_table,
+            source_primary_key=source_read["primary_key"],
+            source_row_count=source_read["row_count"],
+            source_schema_fingerprint=source_read["schema_fingerprint"],
+            source_dataset_fingerprint=source_read["dataset_fingerprint"],
+            live_eligible=True,
+            conversion_decision=conversion_decision,
+            source_ingestion_run_id=str(captured.run.ingestion_run_id),
+        )
+        order_evidence = _public_column_order_evidence(ticket)
+    except ColumnOrderGovernanceError as e:
+        # The CAPTURED ingestion run remains valid audit evidence even when
+        # governance refuses to create a ticket from it.
+        db.commit()
+        raise HTTPException(
+            status_code=422,
+            detail=f"Column-order submission was rejected. {e}",
+        )
     return {
         "schema_delta": str(delta),
         "proposed_repair": str(selected_plan),
+        "proposed_action": ticket.repair_plan.proposed_action,
         "confidence": selected_plan.confidence,
         "governance_decision": decision,
         "schema_version_id": schema_version_id,
@@ -784,6 +840,7 @@ def simulate_migration_from_source(
         "conversion_decision": _public_conversion_metadata(
             ticket.conversion_decision
         ),
+        "column_order_evidence": order_evidence,
         "live_cast_pair": live_cast_pair.token if live_cast_pair else None,
         "message": (
             f"Repair requires human approval before execution. "
@@ -798,7 +855,11 @@ def list_pending_approvals(db: Session = Depends(get_db)):
     approvals = PostgresApprovalRepository(db)
     try:
         tickets = approvals.list_pending()
-    except ApprovalReplayError as e:
+        order_evidence = {
+            ticket.ticket_id: _public_column_order_evidence(ticket)
+            for ticket in tickets
+        }
+    except (ApprovalReplayError, ColumnOrderGovernanceError) as e:
         raise HTTPException(status_code=422, detail=str(e))
     return {
         "pending_count": len(tickets),
@@ -806,6 +867,7 @@ def list_pending_approvals(db: Session = Depends(get_db)):
             {
                 "ticket_id": t.ticket_id,
                 "proposed_repair": str(t.repair_plan),
+                "proposed_action": t.repair_plan.proposed_action,
                 "confidence": t.confidence,
                 "status": t.status,
                 "created_at": t.created_at,
@@ -814,6 +876,7 @@ def list_pending_approvals(db: Session = Depends(get_db)):
                 "conversion_decision": _public_conversion_metadata(
                     t.conversion_decision
                 ),
+                "column_order_evidence": order_evidence[t.ticket_id],
             }
             for t in tickets
         ],
@@ -825,14 +888,16 @@ def get_approval(ticket_id: str, db: Session = Depends(get_db)):
     approvals = PostgresApprovalRepository(db)
     try:
         t = approvals.get(ticket_id)
+        order_evidence = _public_column_order_evidence(t)
     except TicketNotFoundError:
         raise HTTPException(status_code=404, detail="Ticket not found.")
-    except ApprovalReplayError as e:
+    except (ApprovalReplayError, ColumnOrderGovernanceError) as e:
         raise HTTPException(status_code=422, detail=str(e))
 
     return {
         "ticket_id": t.ticket_id,
         "proposed_repair": str(t.repair_plan),
+        "proposed_action": t.repair_plan.proposed_action,
         "confidence": t.confidence,
         "status": t.status,
         "created_at": t.created_at,
@@ -844,6 +909,7 @@ def get_approval(ticket_id: str, db: Session = Depends(get_db)):
         "conversion_decision": _public_conversion_metadata(
             t.conversion_decision
         ),
+        "column_order_evidence": order_evidence,
     }
 
 
@@ -867,6 +933,15 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
                 f"the ticket remains PENDING. {e}"
             ),
         )
+    except ColumnOrderGovernanceError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Approval was blocked by verified column-order governance; "
+                f"the ticket remains PENDING. {e}"
+            ),
+        )
     except ApprovalReplayError as e:
         db.rollback()
         raise HTTPException(status_code=422, detail=str(e))
@@ -877,12 +952,28 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
             ticket.target_dataset,
             ticket.conversion_decision,
         )
+        order_evidence = require_valid_column_order_evidence(
+            ticket.repair_plan,
+            ticket.observed_schema,
+            ticket.gold_schema,
+            ticket.target_dataset,
+            ticket.conversion_decision,
+        )
     except ConversionGovernanceError as e:
         db.rollback()
         raise HTTPException(
             status_code=422,
             detail=(
                 "Approval was blocked by verified conversion governance; "
+                f"the ticket remains PENDING. {e}"
+            ),
+        )
+    except ColumnOrderGovernanceError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Approval was blocked by verified column-order governance; "
                 f"the ticket remains PENDING. {e}"
             ),
         )
@@ -902,6 +993,9 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
             target_dataset=ticket.target_dataset,
             operator=request.operator,
             execution_mode="sandbox",
+            trusted_observed_schema=(
+                ticket.source_ingestion_run_id is not None
+            ),
         )
 
         if ticket.conversion_decision is not None:
@@ -912,6 +1006,20 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
             if manifest.conversion_outcome != ticket.conversion_decision:
                 raise StaleConversionDecisionError(
                     "Sandbox conversion outcome does not match the approved decision."
+                )
+
+        if order_evidence is not None:
+            if not execution_result.applied or not execution_result.validation.success:
+                raise ColumnOrderApprovalBlockedError(
+                    "Verified reorder approval did not produce a successful sandbox execution."
+                )
+            if manifest.conversion_outcome is not None:
+                raise ColumnOrderApprovalBlockedError(
+                    "REORDER_COLUMNS manifest unexpectedly contains conversion metadata."
+                )
+            if tuple(manifest.corrected_dataset.columns) != order_evidence.gold_order:
+                raise ColumnOrderApprovalBlockedError(
+                    "Sandbox output does not match the approved Gold order."
                 )
 
         # Phase 2.5 correction: fingerprint the ACTUAL corrected output
@@ -966,6 +1074,15 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
                 f"the ticket remains PENDING. {e}"
             ),
         )
+    except ColumnOrderGovernanceError as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Approval execution was blocked by verified column-order governance; "
+                f"the ticket remains PENDING. {e}"
+            ),
+        )
     except LiveExecutionNotAllowedError as e:
         db.rollback()
         raise HTTPException(
@@ -992,6 +1109,7 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
 
     return {
         "ticket_id": ticket.ticket_id,
+        "proposed_action": ticket.repair_plan.proposed_action,
         "status": ticket.status,
         "decided_by": ticket.decided_by,
         "decided_at": ticket.decided_at,
@@ -1002,6 +1120,9 @@ def approve_ticket(ticket_id: str, request: ApprovalDecisionRequest, db: Session
         ),
         "conversion_outcome": _public_conversion_metadata(
             manifest.conversion_outcome
+        ),
+        "column_order_evidence": (
+            order_evidence.to_dict() if order_evidence is not None else None
         ),
     }
 

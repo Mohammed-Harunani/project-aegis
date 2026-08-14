@@ -191,7 +191,12 @@ class AegisSurgeon:
         )
 
     @staticmethod
-    def _schema_matches_dataset(provided_schema, actual_schema) -> bool:
+    def _schema_matches_dataset(
+        provided_schema,
+        actual_schema,
+        *,
+        trust_logical_dtypes: bool = False,
+    ) -> bool:
         """Prove the supplied observed metadata describes this dataset."""
 
         try:
@@ -204,9 +209,11 @@ class AegisSurgeon:
             for name in actual_schema.column_order:
                 provided = provided_schema.columns[name]
                 actual = actual_schema.columns[name]
+                if provided.null_count != actual.null_count:
+                    return False
                 if (
-                    provided.dtype != actual.dtype
-                    or provided.null_count != actual.null_count
+                    not trust_logical_dtypes
+                    and provided.dtype != actual.dtype
                 ):
                     return False
         except Exception:
@@ -328,6 +335,7 @@ class AegisSurgeon:
         execution_mode: str = "sandbox",
         allowed_modes=None,
         allowed_live_cast_pairs: Optional[Iterable[LiveCastPair]] = None,
+        trusted_observed_schema: bool = False,
     ) -> Tuple[ExecutionResult, HealingManifest]:
 
         if allowed_modes is None:
@@ -335,6 +343,8 @@ class AegisSurgeon:
 
         if execution_mode not in allowed_modes:
             raise ValueError("Execution mode not allowed.")
+        if type(trusted_observed_schema) is not bool:
+            raise ValueError("trusted_observed_schema must be a bool.")
 
         original_row_count = len(target_dataset)
         source_snapshot = target_dataset.copy(deep=True)
@@ -487,57 +497,64 @@ class AegisSurgeon:
                             )
                         else:
                             actual_schema = self._dataset_schema(working_df)
-                            actual_eligibility = self._order_eligibility(
-                                actual_schema,
-                                gold_schema,
-                            )
-                            if not actual_eligibility.eligible:
-                                validation_message = (
-                                    "Target dataset is not reorder-only: "
-                                    f"{actual_eligibility.reason_code.value}."
-                                )
-                            elif not self._schema_matches_dataset(
+                            if not self._schema_matches_dataset(
                                 observed_schema,
                                 actual_schema,
+                                trust_logical_dtypes=trusted_observed_schema,
                             ):
                                 validation_message = (
                                     "Observed schema does not match the target dataset."
                                 )
                             else:
-                                candidate_df = working_df.loc[
-                                    :, list(order_action.target_order)
-                                ].copy(deep=True)
-                                preservation_failure = (
-                                    self._validate_reorder_candidate(
-                                        rollback_df,
-                                        candidate_df,
-                                        order_action.target_order,
-                                    )
+                                eligibility_schema = (
+                                    observed_schema
+                                    if trusted_observed_schema
+                                    else actual_schema
                                 )
-                                source_unchanged_failure = (
-                                    self._validate_reorder_candidate(
-                                        source_snapshot,
-                                        target_dataset,
-                                        tuple(source_snapshot.columns),
-                                    )
+                                actual_eligibility = self._order_eligibility(
+                                    eligibility_schema,
+                                    gold_schema,
                                 )
-                                if preservation_failure is not None:
+                                if not actual_eligibility.eligible:
                                     validation_message = (
-                                        "Column-order preservation failed: "
-                                        f"{preservation_failure}."
-                                    )
-                                elif source_unchanged_failure is not None:
-                                    validation_message = (
-                                        "Column-order source isolation failed: "
-                                        f"{source_unchanged_failure}."
+                                        "Target dataset is not reorder-only: "
+                                        f"{actual_eligibility.reason_code.value}."
                                     )
                                 else:
-                                    working_df = candidate_df
-                                    applied = True
-                                    validation_message = (
-                                        "Verified column-order repair preserved rows, "
-                                        "index, dtypes, values, and nulls."
+                                    candidate_df = working_df.loc[
+                                        :, list(order_action.target_order)
+                                    ].copy(deep=True)
+                                    preservation_failure = (
+                                        self._validate_reorder_candidate(
+                                            rollback_df,
+                                            candidate_df,
+                                            order_action.target_order,
+                                        )
                                     )
+                                    source_unchanged_failure = (
+                                        self._validate_reorder_candidate(
+                                            source_snapshot,
+                                            target_dataset,
+                                            tuple(source_snapshot.columns),
+                                        )
+                                    )
+                                    if preservation_failure is not None:
+                                        validation_message = (
+                                            "Column-order preservation failed: "
+                                            f"{preservation_failure}."
+                                        )
+                                    elif source_unchanged_failure is not None:
+                                        validation_message = (
+                                            "Column-order source isolation failed: "
+                                            f"{source_unchanged_failure}."
+                                        )
+                                    else:
+                                        working_df = candidate_df
+                                        applied = True
+                                        validation_message = (
+                                            "Verified column-order repair preserved rows, "
+                                            "index, dtypes, values, and nulls."
+                                        )
 
             else:
                 validation_message = "Unsupported repair action."
